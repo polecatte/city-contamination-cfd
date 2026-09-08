@@ -1,0 +1,10 @@
+newmtl park
+Kd 0.180 0.550 0.340
+newmtl business
+Kd 0.120 0.230 0.580
+newmtl res_high
+Kd 0.900 0.490 0.130
+newmtl res_low
+Kd 0.950 0.760 0.310
+newmtl ground
+Kd 0.85 0.87 0.89

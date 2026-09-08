@@ -1,0 +1,75 @@
+% params_tables.tex — parameter tables for the density-field urban-LBM study.
+% Preamble requirement (ONLY this — no siunitx needed):
+%   \usepackage{booktabs}
+
+\begin{table}[htbp]
+\centering
+\caption{Density-field city parameter space (12 search dimensions). Samples are
+drawn from a $[0,1]^{12}$ unit cube and mapped to the physical ranges below.}
+\label{tab:paramspace}
+\begin{tabular}{@{}llll@{}}
+\toprule
+Parameter & Range & Units & Description \\
+\midrule
+\multicolumn{4}{@{}l}{\emph{Morphology (flow side --- shapes the concentration field $C$)}}\\
+\texttt{block\_w}          & $[15,\,50]$    & m   & Block footprint width; sets plan-area density $\lambda_p$ and canyon aspect \\
+\texttt{block\_d}          & $[15,\,45]$    & m   & Block footprint depth; sets $\lambda_p$ and aspect \\
+\texttt{street\_width}     & $[6,\,30]$     & m   & Canyon width; sets aspect ratio $H/W$ \\
+\texttt{roughness}         & $[0,\,0.8]$    & --- & Per-block height variance (downwash, turbulence) \\
+\texttt{wind\_angle\_deg}  & $[0,\,45]$     & deg & Approach-wind angle vs.\ grid (enters the CFD solve) \\
+\addlinespace
+\multicolumn{4}{@{}l}{\emph{Population distribution (receptor side --- sets $w$, and via heights also $C$)}}\\
+\texttt{peak\_height}      & $[30,\,90]$    & m   & Building height at the densest employment peak \\
+\texttt{emp\_centers}      & $[1,\,4]$      & int & Number of employment centres \\
+\texttt{emp\_centrality}   & $[0,\,1]$      & --- & Centres central ($1$) vs.\ outer ring ($0$) \\
+\texttt{emp\_concentration}& $[0,\,1]$      & --- & Employment peak sharpness: broad ($0$) vs.\ tight ($1$) \\
+\texttt{res\_gradient}     & $[0,\,3]$      & --- & Residential falloff $\exp(-b\,r/R)$; $0=$ uniform sprawl \\
+\texttt{jh\_mix}           & $[0,\,1]$      & --- & Jobs--housing mixing: segregated ($0$) vs.\ mixed-use ($1$) \\
+\texttt{park\_fraction}    & $[0.05,\,0.40]$& --- & Open-space share (ventilation openings + recreation receptor) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Fixed generator variables (held constant across the parameter space).}
+\label{tab:fixed}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Variable & Value & Description \\
+\midrule
+\texttt{city\_w}          & $600\,\mathrm{m}$ & City extent, streamwise ($x$) \\
+\texttt{city\_h}          & $600\,\mathrm{m}$ & City extent, lateral ($y$) \\
+\texttt{population\_total} & $20\,000$         & Total population distributed over the city \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
+\centering
+\caption{Solver and modelling constants held fixed in the \texttt{forward\_city}
+production run (not part of the search space; all environment-overridable).}
+\label{tab:solverconst}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Constant & Value & Description \\
+\midrule
+Grid resolution $\Delta x$             & $2.0\,\mathrm{m}$                       & Compile-time \texttt{CELL\_SIZE\_M} (voxel/LBM cell) \\
+Upwind buffer                          & $40\,\mathrm{m}$                        & Relaxed COST 732 upwind fetch \\
+Downwind buffer                        & $70\,\mathrm{m}$                        & Relaxed downwind wake \\
+Lateral buffer                         & $35\,\mathrm{m}$                        & Relaxed lateral margin \\
+Vertical headroom                      & $3H$                                    & Above tallest building height $H$ \\
+Inlet wind speed $U$                   & $4.0\,\mathrm{m\,s^{-1}}$               & Reference ABL speed at $z_\mathrm{ref}$ \\
+Collision / scalar scheme              & HRR / QUICK                             & $\sigma_\mathrm{HRR}=0.98$ \\
+Kinematic viscosity $\nu$              & $1.5\times10^{-5}\,\mathrm{m^2\,s^{-1}}$ & Air \\
+Turbulent Schmidt $\mathrm{Sc}_t$      & $0.7$                                   & Scalar gradient-diffusion closure \\
+Molecular diffusivity $D_\mathrm{mol}$ & $1\times10^{-5}\,\mathrm{m^2\,s^{-1}}$  & Passive tracer \\
+WALE constant $C_w$                    & $0.325$                                 & Sub-grid eddy-viscosity model \\
+Roughness length $z_0$                 & $0.045\,\mathrm{m}$                     & ABL log-law inlet \\
+Spin-up                                & 3 flow-throughs                         & Before burst release \\
+Infiltration factor $F_\mathrm{inf}$   & $0.62$                                  & Outdoor$\rightarrow$indoor \\
+Indoor time fraction $f_\mathrm{in}$   & $0.87$                                  & NHAPS time budget \\
+Outdoor time fraction $f_\mathrm{out}$ & $0.075$                                 & NHAPS time budget \\
+\bottomrule
+\end{tabular}
+\end{table}
