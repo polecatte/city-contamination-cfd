@@ -1,6 +1,17 @@
-# HANDOFF — Urban LBM Dispersion-Optimization (read this first)
+# HANDOFF — Urban LBM Dispersion-Optimization
 
-This is the single entry point for picking the project up cold. It summarizes what
+> ⚠ **OUT OF DATE — this file predates the OpenLB migration.** It describes the project at
+> v8.3, with the custom solver as *the* path and a 9-D search space, and it does not mention
+> OpenLB anywhere. It also cites four files that are not in this bundle (`bayesopt.py`,
+> `evaluate.cpp`, `evaluate.py`, `OVERNIGHT_DIAGNOSTIC_NOTE.md`) and several that moved into
+> `tests/`. **Start at `README.md`**, then `OPENLB_PORT_STATUS_AND_VERIFICATION.md` for the
+> port's real state and `CLEANUP.md` for where else the docs have drifted from the code.
+> What remains reliable here: the builder description (§4), the search-space reasoning (§5),
+> and the design-philosophy note on keeping population emergent.
+
+
+This was the single entry point for picking the project up cold (see the notice above —
+that role now belongs to `README.md`). It summarizes what
 the project is, how it's structured, how to build/run it, what has been verified vs.
 what is still untested, the known bugs/open questions, and where to go next. Deeper
 detail lives in `ARCHITECTURE.md` (math + structure) and the topic `*_NOTE.md` files

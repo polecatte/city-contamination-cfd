@@ -113,7 +113,8 @@ Docs (in root): `VALIDATION_ROSTER.md`, `TEST_SUITE.md`, `VERIFICATION_AUDIT.md`
 
 ## 6 · Build & run scripts (root)
 
-- **Build (custom engine):** `build.sh`, `build_diffusion.sh`, `build_gpu.sh`, `fix_gpu_build.sh`, `launch.sh`
+- **Build (custom engine):** `build_diffusion.sh`, `build_gpu.sh`, `fix_gpu_build.sh`, `launch.sh`
+  (`build.sh` retired to `_to_delete/` — it built the moved `lab_test.cpp`; see `CLEANUP.md`)
 - **Run (production):** `run_forward_city.sh`, `run_exposure.sh`
 - **Phase-0 cluster campaign:** `run_phase0.sh`, `submit_phase0.sh`, `phase0_aces.slurm`
 
@@ -124,16 +125,28 @@ Docs (in root): `VALIDATION_ROSTER.md`, `TEST_SUITE.md`, `VERIFICATION_AUDIT.md`
 
 ## Top-level docs
 
-`README.md`, `ARCHITECTURE.md`, `CHANGES.md`, `HANDOFF.md`, `OPENLB_MIGRATION_PLAN.md`.
+`README.md`, `ARCHITECTURE.md`, `CHANGES.md`, `HANDOFF.md`, `OPENLB_MIGRATION_PLAN.md`,
+`CLEANUP.md` (file-by-file cleanup audit: what is dead, duplicated, or out of date).
+
+> **Caveat on this map and on `HANDOFF.md`:** `CLEANUP.md` §2 lists where the docs and the
+> code have drifted apart — notably that `HANDOFF.md` predates the OpenLB migration entirely,
+> that `param_space.py` (not `param_space_density.py`) is what `run_optimization.py` imports,
+> and that many docs still cite test files by their pre-`tests/` paths.
 
 ---
 
 ## `_to_delete/` (quarantine — review then `rm -rf`)
 
-Compiled binaries checked into the repo (`gen_density_city`, `gen_paramspace`, `gen_rd_city`,
-`gen_zoning_demo`, `plume_validation`) and superseded docs (`OBLIQUE_DIVERGENCE_DIAGNOSIS.md`,
-`OVERNIGHT_DIAGNOSTIC_NOTE.md`, `TECHNICAL_STATUS_AND_ROADMAP.md`, `IMPROVEMENT_PLAN.md` —
-the old-solver bug diagnoses and pre-OpenLB roadmaps, superseded by `OPENLB_MIGRATION_PLAN.md`).
+Current contents (2026-09-08 pass, rationale in `CLEANUP.md`): `adjoint_transport_gpu.cu`
+(dead GPU adjoint — no includes, no build script, never compiled), `build.sh` (broken: built
+the moved `lab_test.cpp`; superseded by `run_forward_city.sh`), `cleanup.sh` (already
+executed; now a no-op).
+
+An earlier pass also quarantined compiled binaries (`gen_density_city`, `gen_paramspace`,
+`gen_rd_city`, `gen_zoning_demo`, `plume_validation`) and four superseded docs
+(`OBLIQUE_DIVERGENCE_DIAGNOSIS.md`, `OVERNIGHT_DIAGNOSTIC_NOTE.md`,
+`TECHNICAL_STATUS_AND_ROADMAP.md`, `IMPROVEMENT_PLAN.md`); those are already gone from this
+snapshot.
 
 ## Data flow
 

@@ -98,3 +98,8 @@ g++ -O3 -std=c++17 -I. gen_openlb_geom.cpp  -o gen_openlb_geom    # + OpenLB mat
 `WALE_MODEL.md`, `HRR_ARCHITECTURE.md`, `EXPOSURE_METRIC.md`, `ADJOINT_SOLVER.md`,
 `FORWARD_LIVE.md`, `INFILTRATION_MODEL.md`, `PARK_POROSITY.md`, `PARAM_SPACE_NOTE.md`, and
 others. Test-suite docs: `TEST_SUITE.md`, `VALIDATION_ROSTER.md`, `VERIFICATION_AUDIT.md`.
+
+`CLEANUP.md` audits the directory file-by-file — what is dead, what is duplicated, and where
+the docs no longer match the code. Read it before trusting `HANDOFF.md`, which predates the
+OpenLB migration and is superseded by this README plus
+`OPENLB_PORT_STATUS_AND_VERIFICATION.md`.
