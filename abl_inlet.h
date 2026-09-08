@@ -153,7 +153,9 @@ private:
         // Calibrate per-component gains so each unit-field component has var 1.
         gx = gy = gz = 1.0;
         RNG sr(seed ^ 0xABCDEF01u);
-        double sx=0, sy=0, sz=0; int M = 4000;
+        // 40k samples: at 4k the per-component gains were noisy enough to leave sigma_v
+        // ~7% low in abl_inlet_verify; 40k tightens all three components to <1%.
+        double sx=0, sy=0, sz=0; int M = 40000;
         for (int m = 0; m < M; ++m) {
             double X=sr.u01()*1000, Y=sr.u01()*1000, Z=sr.u01()*200, Tt=sr.u01()*1000;
             double a,b,c; fluct(X,Y,Z,Tt,a,b,c);   // gains==1 here

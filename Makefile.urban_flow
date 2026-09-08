@@ -1,0 +1,54 @@
+# Makefile.urban_flow — build file for the Stage-B OpenLB app.
+#
+# An OpenLB app must live inside the OpenLB source tree (it includes olb3D.h/olb3D.hh and
+# links the library built by the tree's own config.mk). So this is NOT built from this
+# repository — copy it into the OpenLB tree as described below.
+#
+# ── INSTALL ──────────────────────────────────────────────────────────────────────
+#   OLB=~/olb-1.8.1                      # wherever you unpacked OpenLB
+#   mkdir -p $OLB/examples/urban/urban_flow
+#   cp Makefile.urban_flow  $OLB/examples/urban/urban_flow/Makefile
+#   cp urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h \
+#      $OLB/examples/urban/urban_flow/
+#   cd $OLB/examples/urban/urban_flow && make
+#
+# examples/urban/urban_flow is the SAME nesting depth as examples/turbulence/nozzle3d, so
+# the relative ROOT below matches every stock example.
+#
+# ⚠ UNVERIFIED, like the app itself: there is no OpenLB in the environment this was written
+# in, so the variable names below follow the 1.8 example convention but have not been run.
+# If make fails on the includes, the fix is mechanical and takes a minute:
+#     cp $OLB/examples/turbulence/nozzle3d/Makefile .
+#     # then change only the target/output name to urban_flow
+# That file is authoritative for your exact release. Do that rather than debugging this one.
+#
+# ── BUILD OPTIONS ────────────────────────────────────────────────────────────────
+#   make COLLISION_MODEL=1     0 = WALE (default), 1 = consistent-Smagorinsky, 2 = regularized
+# Per OPENLB_PORT_STATUS_AND_VERIFICATION.md Phase 1: build the LIBRARY CPU-only first and
+# get nozzle3d running before you build this at all. GPU (Phase 8) is a config.mk change in
+# the OpenLB tree, not here.
+
+###########################################################################
+ROOT   := ../../..
+OUTPUT := urban_flow
+
+include $(ROOT)/config.mk
+include $(ROOT)/global.mk
+include $(ROOT)/rules.mk
+###########################################################################
+
+# Collision model selection (C6 in urban_flow.cpp)
+COLLISION_MODEL ?= 0
+CXXFLAGS += -DCOLLISION_MODEL=$(COLLISION_MODEL)
+
+# The app's own headers sit next to it; keep '.' on the include path explicitly so a copy
+# into the OpenLB tree needs no further path juggling.
+CXXFLAGS += -I.
+
+.PHONY: gates
+# Convenience: the two cheap gates that do NOT need this binary, run from the repo.
+# (Stage A must have produced geom_out/ first.)
+gates:
+	@echo "Gate 3 (Stage A)      : run  ./gen_openlb_geom   in the repo"
+	@echo "Gate 7b (linearity)   : run  ./linearity_guard --run ./urban_flow ./geom_out /tmp/lin"
+	@echo "Gate 5 (geometry)     : printed by ./urban_flow itself at startup"

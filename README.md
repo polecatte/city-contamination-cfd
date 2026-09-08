@@ -34,14 +34,23 @@ The pipeline is a three-stage swap of the *middle* box; Stages A and C are kept 
 ```
 
 ### Migration status by step (plan §7)
+- **Step 1 environment — NOT STARTED.** OpenLB is not installed anywhere reachable; the
+  cloud container's proxy blocks openlb.net / Zenodo / GitLab. This blocks everything
+  below. Recipe: `OPENLB_PORT_STATUS_AND_VERIFICATION.md` §3 Phases 0–1.
 - **Step 2 geometry bridge — DONE, gated.** `openlb_geometry.h` + `gen_openlb_geom.cpp`
   stamp OpenLB material numbers from the voxel grid; counts reconcile with the voxelizer
   at 4 m and 2 m. `geometry_loader.h` reads them back into a SuperGeometry.
-- **Step 3 airflow — inlet verified, engine scaffolded.** The ABL/RFG inlet is ported and
-  numerically verified (mean 0.10% vs log law, divergence 5.2%; `tests/abl_inlet_verify.cpp`).
-  `urban_flow.cpp` + `abl_inlet_olb.h` are the OpenLB 1.8 airflow scaffold — **compile on
-  your box** (flags marked `CONFIRM 1.8`); not yet built/gated.
-- **Steps 1, 4–7 — pending** (OpenLB 1.8 install on the A4000; scalar+deposition; retire).
+- **Step 3 airflow — inlet verified; engine ported but NEVER COMPILED.** The ABL/RFG inlet
+  is verified (mean 0.11% vs log law, σ 0.35%, divergence 5.6%; `tests/abl_inlet_verify.cpp`).
+  `urban_flow.cpp` + `abl_inlet_olb.h` have been ported to the **OpenLB 1.8.1** API — the
+  1.4-era idioms are gone and the audit's B1–B8 / S1–S3 defects are fixed — but there is no
+  OpenLB here to compile against, so it is a first compile candidate, not working code.
+- **Step 4 scalar + deposition — scaffolded, physics defects fixed.** The deposition-velocity
+  unit bug (80× over-deposition) and the discarded AD relaxation rate are corrected. Still
+  host-side per-step loops: gate it on a 40³ box, **not** the city.
+- **Step 4 gate — `tests/linearity_guard.cpp` now exists** (it didn't). Self-test passes
+  today without OpenLB; the solve-driving mode needs a built `urban_flow`.
+- **Steps 5–7 — pending.** Nothing has been retired; `_to_delete/` does not exist yet.
 
 ---
 

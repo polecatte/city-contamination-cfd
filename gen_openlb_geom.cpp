@@ -104,12 +104,6 @@ int main(){
     }
     printf("[gen_openlb_geom] source Omega = %ld ground cells (streets + parks)\n", nOmega);
 
-    // ── per-cell surface deposition velocity (size-resolved) → Step-4 sink ──
-    { FILE* f=fopen((OUT+"/dep_vel.f32").c_str(),"wb");
-      if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f);
-             fwrite(g.dep_vel.data(),sizeof(float),N,f); fclose(f);
-             printf("[gen_openlb_geom] wrote dep_vel.f32 (rep. bin dp=%.2g m)\n", DEP_DP);} }
-
     // ── receptor field w (F_inf infiltration weighting; ported from forward_city.cpp) ──
     // w = f_in·F_inf·(per-building inhabitance, spread over its outdoor envelope cells)
     //   + f_out (pedestrian band around the built area at z_ped). This is the Stage-C
@@ -165,7 +159,8 @@ int main(){
     // per-cell surface DRY-DEPOSITION velocity (m/s) — consumed by Stage B's deposition
     // sink (Step 4). 0 on fluid/indoor; usage-specific on building/park/ground faces.
     { FILE* f=fopen((OUT+"/dep_vel.f32").c_str(),"wb");
-      if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f); fwrite(g.dep_vel.data(),sizeof(float),N,f); fclose(f);} }
+      if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f); fwrite(g.dep_vel.data(),sizeof(float),N,f); fclose(f);
+             printf("[gen_openlb_geom] wrote dep_vel.f32 (rep. bin dp=%.2g m)\n", DEP_DP);} }
 
     // ── Step-2 GATE: reconcile material counts against the voxel grid ──
     bool gate = material_reconcile(g, mm, /*verbose=*/true);

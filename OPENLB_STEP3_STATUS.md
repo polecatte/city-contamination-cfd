@@ -23,7 +23,7 @@ analytical field:
 |---|---|---|
 | mean streamwise profile vs log law | max 0.10% error | PASS (<2%) |
 | solenoidality: RMS(div f)/RMS(grad) | 5.2% residual | acceptable — matches the header's "small residual; pressure cleans it over fetch" |
-| turbulence intensity: unit-field variance | within 6.8% (σ_v runs low) | minor — see note |
+| turbulence intensity: unit-field variance | within 0.35% | PASS (<2%) |
 | determinism (CPU/GPU parity prereq) | bit-identical repeat | PASS |
 
 Two test bugs were found and fixed along the way (both in the *harness*, not the inlet):
@@ -31,10 +31,20 @@ averaging speed magnitude instead of the streamwise component (Jensen bias), and
 structured sample grid that aliased against the Fourier modes and faked a 20% mean
 offset — randomized sampling gives 0.10%. See `abl_inlet_verify.png`.
 
-*Note (σ_v 6.8% low):* the per-component gain calibration in `abl_inlet.h::build_modes`
-uses only 4000 samples; bumping that to ~40k tightens all three σ to <1%. Non-blocking
-(within typical synthetic-inflow tolerance), and it's a one-line change to your file —
-flagged rather than made, since I don't edit your sources silently.
+*CORRECTION (2026-09-08) — the σ_v deficit was a TEST BUG, not an inlet defect.* This note
+previously blamed the 4000-sample gain calibration in `abl_inlet.h::build_modes` and claimed
+bumping it to ~40k would tighten all three σ to <1%. That was wrong on both counts. Raising
+the count to 40k made the reported σ_v slightly *worse* (6.8% → 7.9%), which is what
+prompted the recheck: an independent 2×10⁶-point random sample of the field gives component
+RMS (1.004, 0.996, 1.004), i.e. the inlet was always within 0.4%. The error was in check [2]
+of `abl_inlet_verify.cpp`, which sampled on the structured grid
+`x=(m%97)·2.3, y=(m%89)·1.7, z=2+(m%53)·1.9, t=(m%131)·0.11`. Stepping `m` walks a 1-D
+diagonal through a commensurate 4-D lattice rather than filling the volume, so it aliased
+against the Fourier modes — **the identical failure mode already found and fixed in check
+[1]**, which the fix never propagated to check [2]. Check [2] now hash-samples like check
+[1] and reports 0.35%; the gate is tightened from <5% to <2%. The 40k calibration was kept
+(it does modestly reduce seed-to-seed scatter in the gains: max component deviation across
+three seeds 2.0% → 0.8%), but it is not what fixed this.
 
 **Stage-A↔B file handshake — verified.** `geometry_loader.h`'s reader round-trips the
 `material_map.dat` + `source_mask.u8` the bridge produced: histogram reads back

@@ -23,8 +23,10 @@ cumulative dose `Θ = ∫C dt`, from a burst released over Ω (every outdoor gro
 | `openlb_geometry.h` | Stage A→B **geometry bridge**: voxel grid → OpenLB material map | done, gated |
 | `gen_openlb_geom.cpp` | Stage A driver: builds city, writes `material_map.dat` / `source_mask.u8` / `receptor_w.f32` | done, gated |
 | `geometry_loader.h` | Stage B: read material map + Ω mask; stamp a `SuperGeometry` | reader verified |
-| `abl_inlet_olb.h` | ABL/RFG inlet as an OpenLB `AnalyticalF3D` | scaffold (`CONFIRM 1.8`) |
-| `urban_flow.cpp` | Stage B **airflow app**: D3Q19 + WALE + ABL inlet + outlet + spin-up | scaffold (`CONFIRM 1.8`) |
+| `abl_inlet_olb.h` | ABL/RFG inlet as an OpenLB `AnalyticalF3D` | ported to 1.8.1, uncompiled |
+| `urban_flow.cpp` | Stage B **airflow + burst app**: D3Q19 + WALE + ABL inlet + outlet + spin-up, then the coupled D3Q7 AD lattice | ported to 1.8.1, **never compiled** |
+| `Makefile.urban_flow` | build file to copy into `<olb>/examples/urban/urban_flow/Makefile` | untested (see header) |
+| `tests/linearity_guard.cpp` | **Gate 7b**: Θ_ab = Θ_a + Θ_b, the check that protects the exposure metric; `--selftest` runs without OpenLB | checker verified |
 
 Material scheme: `1 fluid · 2 wall(ground+buildings) · 3 inlet · 4 outlet · 5 slip · 6 porous(parks)`.
 Ω stays a separate `source_mask.u8` (an AD-lattice property, not an NSE material).

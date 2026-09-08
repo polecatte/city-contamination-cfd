@@ -12,6 +12,73 @@ listings do not compile against 1.8.
 
 ---
 
+## 0. ADDENDUM — 2026-09-08: the §2 defects have been applied to the tree
+
+Every defect this audit lists in §2.1 (B1–B8), §2.2 (S1–S3) and the actionable parts of
+§2.3/§2.4 has now been **fixed in code**, and the missing Gate-7b test has been written.
+Read §2 below as the diagnosis; read this section for what the tree now contains.
+
+**Still true, and the most important sentence in this file:** `urban_flow.cpp` has *never
+been compiled*. There is still no OpenLB in the authoring environment. The port was made
+against the 1.8.1 Doxygen. It is a much better first compile candidate than before — the
+whole 1.4-era idiom layer is gone — but Phases 1–4 of §3 are unchanged and still mandatory.
+
+### Applied
+
+| Item | What changed |
+|---|---|
+| B1 | `olbInit` → `olb::initialize` |
+| B2 | `CuboidGeometry3D` → `CuboidDecomposition3D`, built with the **explicit-extent** ctor (`origin, dx, Vector<int,3>{nx,ny,nz}, nC`) so the 1:1 index assumption is stated, not hoped for |
+| B3 | all 8 `instances::get*` sites → `defineDynamics<TYPE>(geometry, material)`, with the dynamics named once via `BounceBackNS/NoDynamicsNS/BounceBackAD/NoDynamicsAD` aliases so a spelling change is a 4-line edit, not a 8-site hunt |
+| B4 | the four removed boundary setters → `boundary::set<boundary::InterpolatedVelocity/InterpolatedPressure/FullSlip/ZeroDistribution>` |
+| B5 | `THETA` / `DEPOSIT` now actually defined (`FIELD_BASE<1>`) and used unqualified |
+| B6 | descriptor is now `D3Q19<EFFECTIVE_OMEGA,VELO_GRAD,POROSITY>`, so `PorousBGKdynamics` can instantiate; park porosity is set via `defineField<POROSITY>` |
+| B7 | `block.get(x,y,z) = m` → `block.set({x,y,z}, m)` |
+| B8 / G1 | the z0 wall function **cannot** be written against stock 1.8, so the ground is bounce-back by DEFAULT and `GROUND_WALLFUNCTION` is now a `#error` naming the three G1 options. The drift measurement (Gate 6a) decides which one gets built — as this audit recommends |
+| S1 | all 7 `getOrigin()` sites → `blockOriginOf()` / mother-cuboid `getLatticeR`, in `urban_flow.cpp` and `geometry_loader.h` |
+| S2 | `alpha = min(1, 8·v_d)` → `8·converter.getLatticeVelocity(v_d)`. Verified arithmetically: at dx=4 m, dt=0.05 s this gives α = 2.0e-4, exactly the value §2.2 predicts, versus 1.6e-2 before |
+| S3 | `omegaAD` is derived from `D_eff = D_mol + ν/Sc_t` and **applied** via `setParameter<OMEGA>`; the constant-D_eff form first, per §3 Phase 6's own sequencing, with the per-cell upgrade documented in place |
+| G2 | not solved (it is a Phase-8 rewrite). Mitigated only: `injectBurst` and `deposit` now walk precomputed cell lists (22 812 and ~95 k cells) instead of full 2.63 M sweeps. `couple`/`accumulateTheta` are still full host sweeps. **Step 4 still must be gated on a 40³ box, not the city** |
+| G3 | sponge uses `ExternalSmagorinskyBGKdynamics` with a per-cell smoothstep-graded `C_s` field, which is what "graded fringe" actually requires |
+| §2.4 | τ gate 0.5 → 0.505; overlap 2 → 3; `superGeometry.communicate()` added; `mass_drained` now `emit − dep − air` plus an explicit `budget_closure`; ν_t really exported from `EFFECTIVE_OMEGA` instead of a literal 0; duplicate `dep_vel.f32` write removed |
+
+### Two deviations from this audit's recommendations, with reasons
+
+1. **The converter was NOT switched to `UnitConverterFromResolutionAndRelaxationTime`.**
+   §2.4 suggests it so dt is derived rather than guessed. It cannot work at this operating
+   point: with molecular ν = 1.5e-5 m²/s and dx = 4 m, τ ≈ 0.51 implies dt ≈ 3555 s and
+   u_LB ≈ 3555 — wildly super-Mach. At urban scale the Mach constraint is the binding one,
+   so dt still comes from u_LB ≈ 0.05, and the audit's actual *intent* (τ must not be
+   0.5+1e-7 by accident) is met by an explicit SGS **viscosity floor** derived from a
+   `TAU_TARGET` knob — the same NU_FLOOR mechanism the custom engine used (`CHANGES.md`
+   Fix 1 ran at ν_lb ≈ 1e-3…5e-3, i.e. τ ≈ 0.503…0.515). Default `TAU_TARGET=0.505`.
+
+2. **That floor costs Reynolds number, and the code now says so out loud.** At dx = 4 m,
+   τ = 0.505 the floor is ν = 0.53 m²/s → Re_eff ≈ 2670, below the ~1.1e4 Re-independence
+   threshold (Snyder 1972). This is the regime the custom engine ran in and it is exactly
+   what Gate 6b measures, so it is not a new problem — but the preflight now prints it as a
+   warning rather than leaving it implicit. dx = 2 m roughly doubles Re_eff.
+
+### New: the Gate-7b test that §2.4 says is missing
+
+`tests/linearity_guard.cpp` implements the §6.2 linearity guard. It drives `urban_flow`
+three times via a new `SRC_CELLS` env override (release {a}, {b}, {a,b}) and checks
+Θ_ab = Θ_a + Θ_b on both a relative-L2 and a max-pointwise statistic, and reports the
+Gate-7a mass budget from `meta_flow.txt` alongside. It has a `--selftest` mode that
+validates the checker itself against synthetic linear and deliberately-nonlinear triples
+(gain error, overlap saturation, one bad cell) — **this mode runs without OpenLB and
+passes today**, so the gate is known to discriminate before it is ever pointed at a solve.
+
+### Also fixed here: a bad number in the inlet verification
+
+`abl_inlet_verify.cpp` check [2] reported σ_v ~7% low and `OPENLB_STEP3_STATUS.md` blamed
+the inlet's gain calibration. Both were wrong: check [2] sampled on a structured grid that
+aliased against the Fourier modes — the same bug already fixed in check [1] and never
+propagated. Randomized sampling gives 0.35% max error on all three components. See the
+correction block in `OPENLB_STEP3_STATUS.md`. The inlet itself never needed fixing.
+
+---
+
 ## 1. Verdict
 
 **The port is at "Stage A done, Stage B written but never compiled."** That framing in

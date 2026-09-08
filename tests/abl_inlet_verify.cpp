@@ -88,11 +88,18 @@ int main() {
         double tgt_u = in.sigma_u_ratio * in.u_star;
         double tgt_v = in.sigma_v_ratio * in.u_star;
         double tgt_w = in.sigma_w_ratio * in.u_star;
-        // sample fluct() over a large space-time volume; it is unit-variance by design
+        // Sample fluct() over the inlet plane x time. RANDOMIZED, for the same reason
+        // check [1] is: the previous structured sample (x=(m%97)*2.3, y=(m%89)*1.7, ...)
+        // walks a 1-D diagonal through a commensurate 4-D grid, which aliases against the
+        // Fourier modes and understated sigma_v by ~7%. The field itself was fine — an
+        // independent 2e6-point random sample gives RMS (1.004, 0.996, 1.004).
         long M = 400000; double sx=0,sy=0,sz=0;
+        uint64_t rs2 = 0xB5026F5AA96619E9ull;
         for (long m = 0; m < M; ++m) {
-            double x = (m % 97) * 2.3, y = (m % 89) * 1.7, z = 2.0 + (m % 53) * 1.9;
-            double t = (m % 131) * 0.11;
+            double x = 0.0;                          // inlet plane x=0
+            double y = hrand(rs2) * 4000.0;          // random span position (m)
+            double z = 0.5 + hrand(rs2) * 150.0;     // random height (m)
+            double t = hrand(rs2) * 4000.0;          // random time (s)
             double fx,fy,fz; in.fluct(x,y,z,t,fx,fy,fz);
             sx += fx*fx; sy += fy*fy; sz += fz*fz;
         }
@@ -103,7 +110,7 @@ int main() {
         printf("   scaled sigma_w=%.4f (target %.4f, %.1f%%)\n", vw*in.sigma_w_ratio*in.u_star, tgt_w, 100.0*vw);
         double err = std::max({std::fabs(vu-1),std::fabs(vv-1),std::fabs(vw-1)});
         printf("   -> max unit-variance error: %.2f%%  [%s]\n", 100.0*err,
-               err < 0.05 ? "PASS <5%" : "CHECK");
+               err < 0.02 ? "PASS <2%" : "CHECK");
     }
 
     // ── 3. SOLENOIDALITY: RMS divergence / RMS gradient magnitude ──

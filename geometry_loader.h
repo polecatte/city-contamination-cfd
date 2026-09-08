@@ -62,26 +62,36 @@ inline bool load_source_mask (const std::string& fn, GridField<uint8_t>& s){ ret
 // urban_flow.cpp main()), so the OpenLB lattice coordinate (iX,iY,iZ) maps 1:1 to our
 // (x,y,z) array index.
 //
-// CONFIRM 1.8: in OpenLB ≥1.7 the SuperGeometry is templated `SuperGeometry<T,3>` and a
-// single cell is written with `superGeometry.set(iCglob, iX,iY,iZ, mat)` OR by iterating
-// the block geometries. The block-iteration idiom below is the portable one; check the
-// exact accessor names (`getBlockGeometry`, `getNblock`, `get(iX,iY,iZ)`) in the UG.
+// Two defects fixed here versus the first draft, both of which would have silently
+// scrambled the geometry rather than failing loudly:
+//
+//  (S1) `block.getOrigin()` returns the block origin "in SI units (meter)", NOT lattice
+//       indices — at dx=4 m every global index was 4× too small. The global offset must
+//       come from the cuboid decomposition's mother cuboid. A single-cuboid serial run
+//       has origin (0,0,0), so this looked correct right up until it went MPI/multi-block.
+//
+//  (B7) `block.get(x,y,z) = mat` cannot compile: BlockGeometry::get() returns `int` BY
+//       VALUE and is const. The 1.8 write accessor is `block.set({x,y,z}, mat)`.
+//
+// The caller supplies the global lattice origin of each local block (urban_flow.cpp's
+// blockOriginOf()), so this header stays free of decomposition-API details.
 template <class SGEOM>
 inline void stampSuperGeometry(SGEOM& superGeometry, const GridField<int32_t>& m) {
     auto& load = superGeometry.getLoadBalancer();
-    for (int iC = 0; iC < load.size(); ++iC) {                    // CONFIRM 1.8: local cuboids
-        auto& block = superGeometry.getBlockGeometry(iC);         // CONFIRM 1.8
-        const int gx0 = block.getOrigin()[0];                     // CONFIRM 1.8: global offset of this block
-        const int gy0 = block.getOrigin()[1];
-        const int gz0 = block.getOrigin()[2];
-        const int bnx = block.getNx(), bny = block.getNy(), bnz = block.getNz();  // CONFIRM 1.8
+    auto& cd   = superGeometry.getCuboidDecomposition();          // CONFIRM 1.8 accessor name
+    for (int iC = 0; iC < load.size(); ++iC) {                    // local cuboids
+        auto& block = superGeometry.getBlockGeometry(iC);
+        // (S1) global LATTICE origin of this block
+        auto originR = cd.getMotherCuboid().getLatticeR(cd.get(load.glob(iC)).getOrigin());
+        const int gx0 = (int)originR[0], gy0 = (int)originR[1], gz0 = (int)originR[2];
+        const int bnx = block.getNx(), bny = block.getNy(), bnz = block.getNz();
         for (int x=0; x<bnx; ++x) for (int y=0; y<bny; ++y) for (int z=0; z<bnz; ++z) {
             int X=gx0+x, Y=gy0+y, Z=gz0+z;
             if (X<0||X>=m.nx||Y<0||Y>=m.ny||Z<0||Z>=m.nz) continue;
-            block.get(x,y,z) = m.data[m.idx(X,Y,Z)];              // CONFIRM 1.8: material write
+            block.set({x,y,z}, m.data[m.idx(X,Y,Z)]);             // (B7) 1.8 write accessor
         }
     }
-    superGeometry.updateStatistics();                             // CONFIRM 1.8
+    superGeometry.updateStatistics();
 }
 #endif // URBAN_FLOW_WITH_OPENLB
 
