@@ -643,12 +643,14 @@ struct VeloGradRefresh {
 // and Gate 6b (cube reattachment Xr/H) are statements about the MEAN flow, and an
 // instantaneous snapshot of a turbulent field cannot answer either (HANDOFF.md: the old
 // solver's "44-70 % drift" was exactly such a snapshot artefact). Enabled with AVG_FT>0;
-// written as uavg.f32 in the 5-int layout, ncomp=3 (ux,uy,uz in m/s).
+// written as uavg.f32 in the 5-int layout, ncomp=6: mean (ux,uy,uz) then variance
+// (ux'^2,uy'^2,uz'^2), m/s and m^2/s^2 -- the variances give the turbulence intensity that
+// Gate 6b's reattachment length depends on.
 // ─────────────────────────────────────────────────────────────────────────────
 struct TimeMean {
     int nx=0,ny=0,nz=0; long nSamples=0;
     std::vector<double> sum;
-    void init(int X,int Y,int Z){ nx=X;ny=Y;nz=Z; sum.assign(3*(size_t)nx*ny*nz,0.0); nSamples=0; }
+    void init(int X,int Y,int Z){ nx=X;ny=Y;nz=Z; sum.assign(6*(size_t)nx*ny*nz,0.0); nSamples=0; }
     void sample(SuperLattice<T,DESCRIPTOR>& sLattice, SuperGeometry<T,3>& superGeometry, T cv) {
         const size_t N=(size_t)nx*ny*nz;
         auto& load = sLattice.getLoadBalancer();
@@ -666,17 +668,19 @@ struct TimeMean {
                 T u[3]={0,0,0};
                 block.get(x,y,z).computeU(u);
                 const size_t id=(size_t)Z*ny*nx+(size_t)Y*nx+X;
-                sum[id]+=u[0]*cv; sum[N+id]+=u[1]*cv; sum[2*N+id]+=u[2]*cv;
+                for (int c=0;c<3;++c) { const double v=u[c]*cv; sum[c*N+id]+=v; sum[(3+c)*N+id]+=v*v; }
             }
         }
         ++nSamples;
     }
     void write(const std::string& fn, double dx) const {
         if (nSamples==0) return;
+        const size_t N=(size_t)nx*ny*nz;
         std::vector<float> f(sum.size());
-        for (size_t i=0;i<sum.size();++i) f[i]=(float)(sum[i]/nSamples);
+        for (size_t i=0;i<3*N;++i) f[i]=(float)(sum[i]/nSamples);
+        for (size_t i=3*N;i<6*N;++i) { const double m=sum[i-3*N]/nSamples; f[i]=(float)std::max(0.0, sum[i]/nSamples - m*m); }
         FILE* fp=fopen(fn.c_str(),"wb"); if(!fp) return;
-        int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),3};
+        int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),6};
         fwrite(h,sizeof(int),5,fp); fwrite(f.data(),sizeof(float),f.size(),fp); fclose(fp);
     }
 };
@@ -1116,6 +1120,18 @@ int main(int argc, char* argv[]) {
 
     // ── snapshot the developed LIVE field for Stage C ──
     exportLiveFlow(sLattice, converter, superGeometry, nx, ny, nz, dx, OUT);
+    // Stage C reads OUT only (visualize_forward.py): the geometry it masks with, and a
+    // meta.txt saying umean_full.f32 is already in m/s. forward_city wrote LATTICE velocity
+    // there and the viz scales by U_inlet/U_LB (~69x) unless told otherwise.
+    for (const char* fn : {"geom_type.u8", "source_mask.u8", "receptor_w.f32"}) {
+        std::string c = "cp -f '" + GEOM + "/" + fn + "' '" + OUT + "/' 2>/dev/null"; if (system(c.c_str())) {}
+    }
+    if (FILE* mf = fopen((OUT+"/meta.txt").c_str(), "w")) {
+        fprintf(mf, "# written by urban_flow (OpenLB)\nU_inlet_ms %.6g\nvelocity_units ms\n", (double)U_INLET);
+        fprintf(mf, "grid %d %d %d\ndx_m %.4f\ndt_s %.6g\ntau %.6g\nnu_eff_m2s %.6g\nabl_seed %d\n",
+                nx, ny, nz, dx, (double)converter.getPhysDeltaT(), (double)TAU, (double)NU_EFF, envi("ABL_SEED",1000));
+        fclose(mf);
+    }
 
     if (!envi("STEP4",0)) {
         clout << "urban_flow COMPLETE (airflow only; STEP4=1 runs the burst). "

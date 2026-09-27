@@ -70,6 +70,9 @@ def parse_city():
 M = read_meta(os.path.join(OUT, "meta.txt"))
 NX, NY, NZ, DX, TYPE = read_u8_grid(os.path.join(OUT, "geom_type.u8"))
 U_INLET = float(M.get("U_inlet_ms", [4.0])[0]); V2MS = U_INLET / U_LB      # lattice velocity -> m/s
+# urban_flow (OpenLB) writes umean_full.f32 already in m/s and says so in meta.txt;
+# forward_city's lattice-unit fields keep the conversion above.
+if M.get("velocity_units", ["lattice"])[0] == "ms": V2MS = 1.0
 zped = max(1, min(NZ-1, int(round(2.0/DX))))
 EXT = [0, NX*DX, 0, NY*DX]
 

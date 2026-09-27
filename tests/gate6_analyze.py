@@ -5,7 +5,8 @@
     python3 tests/gate6_analyze.py cube GEOM_DIR OUT_DIR   # Gate 6b: cube Xr/H
 
 Reads GEOM_DIR/material_map.dat and OUT_DIR/uavg.f32 (written by urban_flow with
-AVG_FT>0; 5-int header [nx,ny,nz,dx*1000,ncomp] + ncomp float32 planes, z-major).
+AVG_FT>0; 5-int header [nx,ny,nz,dx*1000,ncomp] + ncomp float32 planes, z-major; ncomp 3 =
+means only (older runs), 6 = means then variances).
 Exit status 0 = gate PASS, 1 = FAIL, 2 = input problem. Writes a PNG next to uavg.f32.
 
 Gate 6a (OPENLB_PORT_STATUS_AND_VERIFICATION.md Phase 5a). Drift is measured the way the
@@ -72,6 +73,11 @@ def gate_abl(mat, u, dx, out):
         print(f"[6a] {name:17s} x={xs*dx:6.0f} m  drift max_z = {100*d_all:5.1f}%"
               f" (worst at z={kmax*dx:.0f} m)   z<=100 m: {100*d_low:5.1f}%"
               f"   U(4 m) {Uin[1]:.2f}->{U[1]:.2f}  U(40 m) {Uin[iref]:.2f}->{U[iref]:.2f} m/s")
+    if u.shape[0] >= 6:   # second moments present: streamwise turbulence intensity
+        for name, xs in [('inlet', 1), ('5H cube position (200 m)', min(nx - 1, int(round(200.0 / dx))))]:
+            su = np.sqrt(u[3][:, ys, xs].mean(axis=1)); U = prof(xs)
+            print(f"[6a] I_u at {name}: " + "  ".join(f"z={z*dx:.0f} m {100*su[z]/U[z]:.1f}%"
+                  for z in [1, 3, 5, 10, 20] if z < nz))
     gate = res['city face (40 m)']
     worst = max(res.values())
     ok = gate < 0.10
