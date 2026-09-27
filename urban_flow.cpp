@@ -705,6 +705,7 @@ struct TimeMean {
 // D_eff = D_MOL + NU_EFF/SC_T and APPLIED (lattice-constant; per-cell ν_t coupling is later).
 //
 // Mass budget (Gate 7a) is measured, not inferred: over the control volume x ∈ [1, nx−3]
+// (emission at Ω cells outside it is reported separately and kept out of the budget)
 // the outflow is the exact lattice flux across its two x-faces, read from the post-stream
 // ±x populations; airborne mass sums every CV cell, including mass in transit inside
 // bounce-back cells. Every cell and the padding start at C = 0 (see prepare), so no baseline
@@ -778,6 +779,8 @@ struct Ops {
     int nx=0, ny=0, nz=0; double dx=0;
     int xLo = 1, xHi = 0;                      // control volume in x (inclusive)
     std::vector<double> theta, dep;           // grid-indexed Θ = ∫C dt [lattice C · s], deposit
+    std::vector<float>  w;                    // receptor weight (receptor_w.f32), empty if absent
+    double wTheta = 0;                        // running <w, Θ>, for J(t) in the time series
     struct Blk {                               // block-local cell lists
         std::vector<int> sx,sy,sz;             // Ω source cells
         std::vector<int> dxv,dyv,dzv; std::vector<T> rate;   // deposition cells, Σ v_d·dt/dx
@@ -840,13 +843,17 @@ struct Ops {
                 } } }
         outDown=dn; outUp=up;
     }
-    double inject(ADLat& ad, T q) {                               // ΔC = q at each Ω cell
-        double e=0;
+    // ΔC = q at each Ω cell. Returns the mass emitted inside the control volume; emission at
+    // Ω cells beyond it (the city's Ω reaches x = nx-2, past the CV's downstream face) goes to
+    // emitOutsideCV, since it leaves through the outlet without ever crossing a CV face.
+    double inject(ADLat& ad, T q, double& emitOutsideCV) {
+        double e=0, eo=0;
         for (size_t iC=0;iC<blk.size();++iC){ auto& b=ad.getBlock(iC); auto& B=blk[iC];
             for (size_t k=0;k<B.sx.size();++k){ auto c=b.get(B.sx[k],B.sy[k],B.sz[k]);
                 for(int i=0;i<AD_DESCRIPTOR::q;++i) c[i]+=descriptors::t<T,AD_DESCRIPTOR>(i)*q;
-                e+=q; } }
-        return e;
+                const int X=B.gx0+B.sx[k];
+                if (X>=xLo && X<=xHi) e+=q; else eo+=q; } }
+        emitOutsideCV += eo; return e;
     }
     // remove the fraction `rate` of C (scaling the true populations keeps u-structure)
     double deposit(ADLat& ad, double& depOutsideCV) {
@@ -864,18 +871,21 @@ struct Ops {
                 if (X>=xLo && X<=xHi) dIn+=removed; else dOut+=removed; } }
         depOutsideCV += dOut; return dIn;
     }
-    // Θ += C·dt on fluid cells; returns CV mass (all non-void cells) and domain-wide airborne
+    // Θ += C·dt on fluid cells; returns CV mass (all non-void cells) and domain-wide airborne.
+    // Also advances <w,Θ> so J(t) can be logged without exporting Θ.
     double accumulate(ADLat& ad, SuperGeometry<T,3>& sg, T dt, double& airAll) {
-        double cv=0, all=0;
+        double cv=0, all=0, wc=0; const bool hasW = !w.empty();
         for (size_t iC=0;iC<blk.size();++iC){ auto& b=ad.getBlock(iC); auto& B=blk[iC]; auto& bg=sg.getBlockGeometry(iC);
             const long n=(long)B.ag.size();
             #ifdef PARALLEL_MODE_OMP
-            #pragma omp parallel for schedule(static) reduction(+:cv,all)
+            #pragma omp parallel for schedule(static) reduction(+:cv,all,wc)
             #endif
             for (long k=0;k<n;++k){ const T C=conc(b.get(B.ax[k],B.ay[k],B.az[k]));
                 if (B.acv[k]) cv+=C;
                 const int m=bg.get({B.ax[k],B.ay[k],B.az[k]});
-                if (m==MAT_FLUID||m==MAT_POROUS||m==MAT_SPONGE){ theta[B.ag[k]]+=C*dt; all+=C; } } }
+                if (m==MAT_FLUID||m==MAT_POROUS||m==MAT_SPONGE){ theta[B.ag[k]]+=C*dt; all+=C;
+                    if (hasW) wc += (double)w[B.ag[k]]*C; } } }
+        wTheta += wc*dt;
         airAll=all; return cv;
     }
     // settling: subtract w_s from the coupled vertical velocity (after the coupling ran)
@@ -1178,6 +1188,8 @@ int main(int argc, char* argv[]) {
     step4::prepare(adLattice, superGeometry, omegaAD);
     step4::Ops ops;
     ops.init(superGeometry, mat, src, vd, dt/(T)dx);
+    { bridge::GridField<float> wg; if (bridge::read_grid(GEOM+"/receptor_w.f32", wg) && wg.size()==(size_t)nx*ny*nz) ops.w = wg.data;
+      else cl4 << "no receptor_w.f32: J(t) not logged" << std::endl; }
     cl4 << "Omega source cells " << ops.nSrc << ", deposition cells " << ops.nDep
         << ", control volume x in [" << ops.xLo << "," << ops.xHi << "]" << std::endl;
     if (ops.nSrc == 0) { cl4 << "no source cells" << std::endl; return 2; }
@@ -1196,11 +1208,12 @@ int main(int argc, char* argv[]) {
     const T   CLEAR    = envd("CLEAR_FRAC", 0.01);          // 0 = run all MAX_BURST_STEPS
     const int MAXB     = envi("MAX_BURST_STEPS", 20*stepsPerFT);
     const int TS_EVERY = envi("TS_EVERY", 200);
-    double emit=0, depCV=0, depOut=0, outDown=0, outUp=0, airCV=0, airAll=0, peakAir=0; int endStep=MAXB;
+    // emit is the CV's emission (what the budget closes against); emitOut is Ω beyond the CV.
+    double emit=0, emitOut=0, depCV=0, depOut=0, outDown=0, outUp=0, airCV=0, airAll=0, peakAir=0; int endStep=MAXB;
     { double a0=0; const double m0 = ops.accumulate(adLattice, superGeometry, 0, a0);
       cl4 << "pre-release CV mass " << m0 << " (must be 0)" << std::endl; }
     FILE* ts=fopen((OUT+"/exposure_timeseries.csv").c_str(),"w");
-    if(ts) fprintf(ts,"step,t_s,airborne_cv,deposited_cv,emitted,out_downstream,out_upstream,budget_resid\n");
+    if(ts) fprintf(ts,"step,t_s,airborne_cv,deposited_cv,emitted,out_downstream,out_upstream,budget_resid,airborne_all,J\n");
 
     for (int iB=0; iB<MAXB; ++iB) {
         if (!uniform) {
@@ -1214,16 +1227,19 @@ int main(int argc, char* argv[]) {
         adLattice.collideAndStream();
         double fd=0, fu=0; ops.faceFlux(adLattice, fd, fu); outDown+=fd; outUp+=fu;
         const bool pulseOn = (iB*dt) < PULSE_S;
-        if (pulseOn) emit += ops.inject(adLattice, Q_RATE);
+        if (pulseOn) emit += ops.inject(adLattice, Q_RATE, emitOut);
         depCV += ops.deposit(adLattice, depOut);
         airCV = ops.accumulate(adLattice, superGeometry, dt, airAll);
         peakAir = std::max(peakAir, airCV);
         const double resid = emit>0 ? (emit-(depCV+airCV+outDown+outUp))/emit : 0.0;
         if (!std::isfinite(airCV)) { OstreamManager c(std::cout,"DIVERGED"); c<<"AD non-finite at burst step "<<iB<<std::endl; if(ts)fclose(ts); return 2; }
         if (iB%TS_EVERY==0) {
-            if (ts) { fprintf(ts,"%d,%.4f,%.9e,%.9e,%.9e,%.9e,%.9e,%.3e\n",iB,iB*dt,airCV,depCV,emit,outDown,outUp,resid); fflush(ts); }
+            // J(t) = <w,Θ(t)>/M_released: Stage C's J accumulated so far (lattice units)
+            const double Jt = (emit+emitOut)>0 ? ops.wTheta/(emit+emitOut) : 0.0;
+            if (ts) { fprintf(ts,"%d,%.4f,%.9e,%.9e,%.9e,%.9e,%.9e,%.3e,%.9e,%.9e\n",iB,iB*dt,airCV,depCV,emit,outDown,outUp,resid,airAll,Jt); fflush(ts); }
             cl4 << "iB=" << iB << " t=" << iB*dt << "s air=" << airCV << " dep=" << depCV
-                << " out=" << outDown << "+" << outUp << " emit=" << emit << " resid=" << resid << std::endl;
+                << " out=" << outDown << "+" << outUp << " emit=" << emit << " resid=" << resid
+                << " airborne_frac=" << ((emit+emitOut)>0 ? airAll/(emit+emitOut) : 0.0) << " J=" << Jt << std::endl;
         }
         if (CLEAR>0 && !pulseOn && peakAir>0 && airCV < CLEAR*peakAir) { endStep=iB+1; break; }
     }
@@ -1241,11 +1257,13 @@ int main(int argc, char* argv[]) {
         fprintf(mf,"burst_steps %d\ndt_s %.6g\nD_eff_m2s %.6g\ntau_AD %.6g\n",endStep,(double)dt,(double)D_EFF,(double)(1/omegaAD));
         fprintf(mf,"# control volume x in [%d,%d]; budget: emitted = deposited + airborne + drained\n",ops.xLo,ops.xHi);
         fprintf(mf,"mass_emitted %.9e\nmass_deposited %.9e\nmass_airborne %.9e\nmass_drained %.9e\n",emit,depCV,airCV,drained);
+        fprintf(mf,"mass_emitted_beyond_cv %.9e\nmass_emitted_total %.9e\n",emitOut,emit+emitOut);
         fprintf(mf,"mass_out_downstream %.9e\nmass_out_upstream %.9e\nmass_deposited_beyond_cv %.9e\n",outDown,outUp,depOut);
-        fprintf(mf,"budget_closure %.6e\ndeposited_frac %.6f\n",closure, emit>0?(depCV+depOut)/emit:0.0);
+        fprintf(mf,"budget_closure %.6e\ndeposited_frac %.6f\n",closure, emit+emitOut>0?(depCV+depOut)/(emit+emitOut):0.0);
         fprintf(mf,"theta_layout 5xint32[nx,ny,nz,dx*1000,1] units lattice_C*s\n");
         fprintf(mf,"# Stage C: J = (1/omega_cells) * sum_x receptor_w(x) * theta(x)\n"); fclose(mf);} }
 
+    if (emitOut > 0) cl4 << "Omega beyond the control volume emitted " << emitOut << " (not in the budget)" << std::endl;
     cl4 << "budget: emitted " << emit << " = deposited " << depCV << " + airborne " << airCV
         << " + drained " << drained << " (down " << outDown << ", up " << outUp << ")  closure "
         << closure << (closure<0.01 ? "  [<1%]" : "  [>=1%]") << std::endl;

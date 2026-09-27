@@ -44,7 +44,8 @@ def main():
         if tuple(ht[:3]) != tuple(hw[:3]):
             print(f"{out}: theta grid {ht[:3]} != receptor grid {hw[:3]}"); return 2
         m = meta(out)
-        emit = m['mass_emitted']
+        # all released mass: runs after the CV/Omega split report it as mass_emitted_total
+        emit = m.get('mass_emitted_total', m['mass_emitted'])
         J = float(np.dot(w.astype(np.float64), th.astype(np.float64)) / emit)
         neg = float(-th[th < 0].sum() / max(th[th > 0].sum(), 1e-30))
         print(f"[J] {out}: J = {J:.6e}   emitted {emit:.4g}, deposited {100*m['mass_deposited']/emit:.2f}%,"
