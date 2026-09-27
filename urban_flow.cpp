@@ -149,7 +149,11 @@ static bool preflight(UnitConverter<T,DESCRIPTOR> const& c) {
     bool ok=true; auto need=[&](bool cnd,const char* msg){ clout<<"["<<(cnd?"PASS":"FAIL")<<"] "<<msg<<std::endl; if(!cnd) ok=false; };
     clout << "uLB=" << uLB << "  tau=" << tau << "  Ma=" << Ma << std::endl;
     need(std::isfinite(uLB)&&uLB>0, "lattice velocity finite and positive");
-    need(tau > 0.5,                 "relaxation tau > 0.5 (positive effective viscosity)");
+    // tau > 0.5 alone is a false-negative sieve: the molecular-viscosity operating point
+    // sat at tau = 0.5000001 and passed it by 1.4e-7 while carrying effectively zero
+    // viscosity. BGK/WALE with no resolved SGS contribution (the flow is at rest when the
+    // inlet ramp starts, and WALE's nu_t vanishes in pure shear) needs a real floor.
+    need(tau >= 0.505,              "relaxation tau >= 0.505 (non-vanishing base viscosity)");
     need(Ma  < 0.1,                 "inlet Mach < 0.1 (safe low-compressibility regime)");
     need(uLB < 0.1,                 "lattice velocity < 0.1 (CFL / stability margin)");
     clout << "preflight " << (ok?"PASS — cleared to run":"FAIL — refusing to run (set FORCE=1 to override)") << std::endl;
@@ -524,13 +528,36 @@ int main(int argc, char* argv[]) {
     carve_sponge(mat, WIND_DEG, nSponge);
     clout << "material_map " << nx<<"x"<<ny<<"x"<<nz<<" dx="<<dx<<"  sponge="<<nSponge<<" cells" << std::endl;
 
-    // ── unit converter (forward_city operating point) ──
-    const T U_INLET = envd("U_INLET", 4.0), Z_REF = envd("ABL_ZREF", 4.0), nu_phys = 1.5e-5;
-    const int RES = envi("RESOLUTION", 1);
-    UnitConverter<T,DESCRIPTOR> converter(                                            // CONFIRM 1.8 ctor variant
-        (T)dx/RES, /*physDeltaT*/(T)(0.05*dx/U_INLET),
-        /*charL*/(T)(nz*dx), /*charU*/U_INLET, /*nu*/nu_phys, /*rho*/1.2);
+    // ── unit converter ──
+    // The relaxation time is the primary stability knob, so it is an INPUT and dt is DERIVED
+    // (UnitConverterFromResolutionAndRelaxationTime: dt = (tau-0.5)/3 * dx^2 / nu).
+    //
+    // nu here cannot be molecular air (1.5e-5 m^2/s). At dx = 4 m that gives dt ~ 3.6e3 s and
+    // a lattice velocity ~ 3.6e3 for any tau >= 0.505 -- the Mach gate would (rightly) refuse.
+    // The previous converter fixed dt from uLB = 0.05 instead, which with molecular nu put tau
+    // at 0.5000001. At grid scale the resolved flow has no molecular viscosity to speak of;
+    // what the lattice carries is a BACKGROUND eddy viscosity, on top of which WALE adds its
+    // local nu_t. So nu is NU_EFF, derived by default from the target lattice velocity:
+    //     nu_eff = (tau-0.5)/3 * dx * U / uLB          (dx=4, U=4, tau=0.51, uLB=0.05 -> 1.07)
+    // which is the same order as the neutral-ABL eddy viscosity kappa*u*z at z ~ 10 m. Set
+    // NU_EFF to fix it directly instead; the preflight then reports the uLB it implies.
+    const T U_INLET = envd("U_INLET", 4.0), Z_REF = envd("ABL_ZREF", 4.0);
+    const T TAU     = envd("TAU", 0.51);
+    const T U_LB    = envd("LATTICE_U", 0.05);
+    const T NU_EFF  = envd("NU_EFF", (TAU-0.5)/3.0 * dx * U_INLET / U_LB);
+    const T charL   = (T)(nz*dx);
+    UnitConverterFromResolutionAndRelaxationTime<T,DESCRIPTOR> converter(
+        /*resolution = cells per charL*/ (size_t)nz, TAU,
+        charL, /*charU*/U_INLET, /*nu*/NU_EFF, /*rho*/(T)1.2);
     converter.print();
+    clout << "operating point: tau=" << TAU << "  nu_eff=" << NU_EFF << " m^2/s"
+          << "  dt=" << converter.getPhysDeltaT() << " s  uLB=" << converter.getCharLatticeVelocity()
+          << "  Re_eff(charL)=" << U_INLET*charL/NU_EFF << std::endl;
+    if (std::fabs(converter.getPhysDeltaX() - (T)dx) > 1e-9*dx) {
+        clout << "converter dx " << converter.getPhysDeltaX() << " != map dx " << dx
+              << " -- the lattice would not be 1:1 with the material map" << std::endl;
+        return 4;
+    }
 
     // (C1) preflight — refuse to run outside the stable regime unless FORCE=1
     if (!preflight(converter) && !envi("FORCE",0)) { clout<<"aborting on preflight"<<std::endl; return 4; }
@@ -573,12 +600,16 @@ int main(int argc, char* argv[]) {
     // ── develop the LIVE turbulent flow (no averaging) ──
     const int SPIN_FT   = envi("SPINUP_FT", 3);
     const int stepsPerFT= (int)std::llround((nx*dx)/U_INLET / converter.getPhysDeltaT());  // CONFIRM 1.8
-    const int MAX_STEPS = envi("MAX_STEPS", SPIN_FT*stepsPerFT);
+    const int SPIN_STEPS= SPIN_FT*stepsPerFT;
+    const int MAX_STEPS = envi("MAX_STEPS", SPIN_STEPS);
     const int rampSteps = stepsPerFT;                      // (C3) ramp over 1 flow-through
     const int CHECK     = envi("CHECK_EVERY", 200);        // (C4) divergence-guard cadence
     const int ADM_EVERY = envi("ADM_EVERY", 0);           // (C6) 0 = ADM off
-    clout << "live spin-up: " << SPIN_FT << " flow-throughs = " << MAX_STEPS
+    clout << "live spin-up: " << SPIN_FT << " flow-throughs = " << SPIN_STEPS
           << " steps (" << stepsPerFT << "/FT), ramp " << rampSteps << ", check " << CHECK << std::endl;
+    if (MAX_STEPS != SPIN_STEPS)
+        clout << "MAX_STEPS=" << MAX_STEPS << " overrides the spin-up: running " << MAX_STEPS
+              << " steps (" << (T)MAX_STEPS/stepsPerFT << " flow-throughs)" << std::endl;
 
     for (int iT=0; iT<MAX_STEPS; ++iT) {
         setBoundaryValues(sLattice, converter, superGeometry, iT, rampSteps);   // C3

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # olbconfig.sh — switch an OpenLB tree between CPU-only and GPU (CUDA) builds.
 #
-#   ./olbconfig.sh cpu     # serial CPU_SISD, g++     (Phases 1-7)
+#   ./olbconfig.sh cpu     # serial CPU_SISD, g++     (Phases 1-4: port + geometry gates)
+#   ./olbconfig.sh cpu-mt  # OpenMP CPU_SISD, g++     (Phases 5-7: many flow-through runs)
 #   ./olbconfig.sh gpu     # single-GPU CUDA, nvcc    (Phase 8)
 #   ./olbconfig.sh show    # print the active config
 #   ./olbconfig.sh list    # list the templates this release ships
@@ -103,6 +104,28 @@ case "$MODE" in
     echo "configured: CPU (serial, g++)"
     ;;
 
+  cpu-mt)
+    backup
+    # Shared-memory OpenMP on one box. Seeded from OpenLB's gcc CPU template for its flag
+    # set, then de-MPI'd: that template sets CXX := mpic++ and PARALLEL_MODE := MPI, and
+    # OMP mode needs neither (nor an MPI install). In 1.8 OMP parallelises each block's
+    # collide loop over iX (core/platform/cpu/sisd/operator.h), so it scales on a
+    # single-cuboid run; set OMP_NUM_THREADS to choose the thread count.
+    t=$(pick_template 'cpu_gcc_openmpi') || t=""
+    [ -n "$t" ] || { echo "ERROR: config/cpu_gcc_openmpi.mk not found" >&2; exit 1; }
+    cp "$t" "$CFG"
+    echo "seeded config.mk from $(basename "$t")"
+    setvar "$CFG" CXX 'g++'
+    setvar "$CFG" CC 'gcc'
+    setvar "$CFG" PARALLEL_MODE 'OMP'
+    setvar "$CFG" MPIFLAGS ''
+    setvar "$CFG" OMPFLAGS '-fopenmp'
+    setvar "$CFG" PLATFORMS 'CPU_SISD'
+    grep -qE '^[[:space:]]*CXXFLAGS.*std=c\+\+20' "$CFG" \
+      || echo "WARNING: CXXFLAGS in $(basename "$t") has no -std=c++20 -- check it" >&2
+    echo "configured: CPU (OpenMP, g++) -- run with OMP_NUM_THREADS=\$(nproc)"
+    ;;
+
   gpu)
     backup
     # Use OpenLB's own single-GPU template rather than synthesising one: it
@@ -139,7 +162,7 @@ case "$MODE" in
     echo "configured: GPU (single-GPU CUDA, from $(basename "$t"))"
     ;;
 
-  *) echo "usage: $0 {cpu|gpu|show|list}" >&2; exit 2 ;;
+  *) echo "usage: $0 {cpu|cpu-mt|gpu|show|list}" >&2; exit 2 ;;
 esac
 
 echo
