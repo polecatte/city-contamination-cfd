@@ -1,12 +1,23 @@
 #!/usr/bin/env bash
 # olbconfig.sh — switch an OpenLB tree between CPU-only and GPU (CUDA) builds.
 #
-#   ./olbconfig.sh cpu     # CPU_SISD, g++            (Phases 1-7)
-#   ./olbconfig.sh gpu     # CPU_SISD GPU_CUDA, nvcc  (Phase 8)
+#   ./olbconfig.sh cpu     # serial CPU_SISD, g++     (Phases 1-7)
+#   ./olbconfig.sh gpu     # single-GPU CUDA, nvcc    (Phase 8)
 #   ./olbconfig.sh show    # print the active config
+#   ./olbconfig.sh list    # list the templates this release ships
 #
-# Requires OLB_ROOT. Writes $OLB_ROOT/config.mk, backing up the previous one.
-# Switching platforms invalidates every object file: run `make clean` after.
+# Requires OLB_ROOT. Writes $OLB_ROOT/config.mk.
+#
+# DESIGN: this does NOT synthesise a config. OpenLB ships ~22 tested templates
+# in config/, and they set variables beyond the obvious ones -- which rule file
+# to include (default.mk vs default.mixed.mk), the separate flag set nvcc uses,
+# and so on. Editing a config in place leaks state between modes: a CPU switch
+# that leaves a GPU rule-file selection behind produces a CPU build that still
+# invokes nvcc, with none of nvcc's flags set. So each mode REPLACES config.mk
+# wholesale from a template, then patches only CUDA_ARCH.
+#
+# The pristine shipped config.mk is preserved as config.mk.orig on first run
+# and is what `cpu` restores.
 
 set -euo pipefail
 
@@ -15,123 +26,120 @@ MODE="${1:-show}"
 [ -d "$OLB_ROOT/src" ] || { echo "ERROR: no src/ under OLB_ROOT=$OLB_ROOT" >&2; exit 1; }
 
 CFG="$OLB_ROOT/config.mk"
+ORIG="$OLB_ROOT/config.mk.orig"
+TDIR="$OLB_ROOT/config"
 
-# set a make variable: rewrite it in place if present, append if not.
-# Only matches uncommented assignments, so '# CXX := ...' is left alone.
+# Preserve the as-shipped config exactly once, before anything edits it.
+if [ ! -f "$ORIG" ] && [ -f "$CFG" ]; then
+  cp "$CFG" "$ORIG"
+  echo "saved pristine config as config.mk.orig"
+fi
+
+backup() { [ -f "$CFG" ] && cp "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"; }
+
+# Rewrite a make variable: first uncommented assignment is replaced, any later
+# duplicates of it are deleted, and an absent variable is appended.
 setvar() {
   local f="$1" k="$2" v="$3"
   if grep -qE "^[[:space:]]*${k}[[:space:]]*[:?+]?=" "$f"; then
-    sed -i -E "s|^[[:space:]]*${k}[[:space:]]*[:?+]?=.*|${k} := ${v}|" "$f"
+    sed -i -E "0,/^[[:space:]]*${k}[[:space:]]*[:?+]?=/s|^[[:space:]]*${k}[[:space:]]*[:?+]?=.*|${k} := ${v}|" "$f"
+    sed -i -E "1,\$ { /^${k} := /!{ /^[[:space:]]*${k}[[:space:]]*[:?+]?=/d } }" "$f"
   else
     printf '%s := %s\n' "$k" "$v" >> "$f"
   fi
 }
 
-getvar() { grep -E "^[[:space:]]*$2[[:space:]]*[:?+]?=" "$1" 2>/dev/null | tail -1 || true; }
+pick_template() {
+  local pat="$1"
+  [ -d "$TDIR" ] || return 1
+  ls "$TDIR"/*.mk 2>/dev/null | grep -E "/(${pat})\.mk$" | head -1
+}
 
 show() {
   echo "OLB_ROOT = $OLB_ROOT"
   if [ -f "$CFG" ]; then
-    echo "--- $CFG ---"
+    echo "--- config.mk (uncommented) ---"
     grep -vE '^[[:space:]]*(#|$)' "$CFG"
+    echo "--- sanity ---"
+    if grep -qE '^[[:space:]]*[A-Z_]*CUDA' "$CFG"; then
+      echo "CUDA vars present  : YES"
+    else
+      echo "CUDA vars present  : no"
+    fi
+    grep -qE '^[[:space:]]*PLATFORMS.*GPU_CUDA' "$CFG" \
+      && echo "GPU_CUDA platform  : YES" || echo "GPU_CUDA platform  : no"
   else
     echo "no config.mk"
   fi
   echo "--- built libs ---"
-  find "$OLB_ROOT" -name '*.a' -exec ls -lh {} \; 2>/dev/null || echo "none"
-}
-
-# Start from an OpenLB-provided template so we inherit any variable this
-# release needs that we don't explicitly set. Prefer a mode-matching template.
-seed_config() {
-  local want="$1" pick=""
-  if [ -d "$OLB_ROOT/config" ]; then
-    # shellcheck disable=SC2012
-    pick=$(ls "$OLB_ROOT/config"/*.mk 2>/dev/null | grep -iE "$want" | head -1 || true)
-    [ -n "$pick" ] || pick=$(ls "$OLB_ROOT/config"/*.mk 2>/dev/null | head -1 || true)
-  fi
-  if [ -f "$CFG" ]; then
-    cp "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"
-  fi
-  if [ -n "$pick" ] && [ ! -f "$CFG" ]; then
-    cp "$pick" "$CFG"
-    echo "seeded config.mk from $(basename "$pick")"
-  elif [ -n "$pick" ]; then
-    echo "editing existing config.mk (templates available: $(ls "$OLB_ROOT/config"/*.mk 2>/dev/null | xargs -n1 basename | tr '\n' ' '))"
-  elif [ ! -f "$CFG" ]; then
-    : > "$CFG"
-    echo "WARNING: no config/ templates found; writing config.mk from scratch" >&2
-  fi
+  find "$OLB_ROOT" -name '*.a' -exec ls -lh {} \; 2>/dev/null || true
 }
 
 case "$MODE" in
+  list)
+    ls -1 "$TDIR"/*.mk 2>/dev/null | xargs -n1 basename || echo "no config/ directory"
+    exit 0 ;;
+
+  show) show; exit 0 ;;
+
   cpu)
-    seed_config 'cpu|default|gcc'
-    setvar "$CFG" CXX                 'g++'
-    setvar "$CFG" CC                  'gcc'
-    setvar "$CFG" CXXFLAGS            '-O3 -std=c++20'
-    setvar "$CFG" PARALLEL_MODE       'NONE'
-    setvar "$CFG" PLATFORMS           'CPU_SISD'
-    setvar "$CFG" FLOATING_POINT_TYPE 'double'
-    echo "configured: CPU (CPU_SISD, g++, double, serial)"
+    backup
+    if [ -f "$ORIG" ]; then
+      cp "$ORIG" "$CFG"
+      echo "restored config.mk from pristine config.mk.orig"
+    else
+      t=$(pick_template 'cpu_gcc_openmpi') || t=""
+      [ -n "$t" ] || { echo "ERROR: no pristine config and no cpu template found" >&2; exit 1; }
+      cp "$t" "$CFG"
+      echo "seeded config.mk from $(basename "$t")"
+      setvar "$CFG" PARALLEL_MODE 'NONE'
+      setvar "$CFG" MPIFLAGS ''
+    fi
+    # The pristine config is OpenLB's serial-gcc default; assert rather than assume.
+    if grep -qE '^[[:space:]]*PLATFORMS.*GPU_CUDA' "$CFG"; then
+      echo "WARNING: restored config still lists GPU_CUDA -- forcing CPU_SISD" >&2
+      setvar "$CFG" PLATFORMS 'CPU_SISD'
+    fi
+    echo "configured: CPU (serial, g++)"
     ;;
 
   gpu)
-    seed_config 'gpu|cuda'
+    backup
+    # Use OpenLB's own single-GPU template rather than synthesising one: it
+    # carries the correct rule-file selection and nvcc flag set.
+    t=$(pick_template 'gpu_only') || t=""
+    if [ -z "$t" ]; then
+      echo "ERROR: config/gpu_only.mk not found. Available:" >&2
+      ls -1 "$TDIR"/*.mk 2>/dev/null | xargs -n1 basename >&2
+      exit 1
+    fi
+    cp "$t" "$CFG"
+    echo "seeded config.mk from $(basename "$t")"
 
-    # --- CUDA arch from the actual card ---
     ARCH=""
     if command -v nvidia-smi >/dev/null 2>&1; then
       ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
              | head -1 | tr -d ' .' || true)
     fi
-    if [ -z "$ARCH" ]; then
-      ARCH=86
-      echo "WARNING: could not read compute_cap from nvidia-smi; defaulting CUDA_ARCH=86" >&2
-    fi
-
-    # --- host compiler: nvcc rejects gcc newer than its supported max ---
-    CCBIN=""
-    if command -v nvcc >/dev/null 2>&1; then
-      NVCC_VER=$(nvcc --version | grep -oE 'release [0-9]+\.[0-9]+' | awk '{print $2}' | head -1)
-      GCC_MAJ=$(gcc -dumpversion | cut -d. -f1)
-      NV_MAJ=${NVCC_VER%%.*}; NV_MIN=${NVCC_VER##*.}
-      # CUDA 12.0-12.3 tops out around gcc 12; later 12.x raised it.
-      MAXGCC=99
-      if [ "$NV_MAJ" = "12" ] && [ "$NV_MIN" -le 3 ]; then MAXGCC=12; fi
-      if [ "$NV_MAJ" = "11" ]; then MAXGCC=11; fi
-      if [ "$GCC_MAJ" -gt "$MAXGCC" ]; then
-        for c in g++-12 g++-11; do
-          if command -v "$c" >/dev/null 2>&1; then CCBIN="$c"; break; fi
-        done
-        if [ -n "$CCBIN" ]; then
-          echo "NOTE: gcc $GCC_MAJ > CUDA $NVCC_VER max ($MAXGCC) — using -ccbin $CCBIN"
-        else
-          echo "WARNING: gcc $GCC_MAJ exceeds CUDA $NVCC_VER's supported max ($MAXGCC)," >&2
-          echo "         and no g++-12/g++-11 found. Install one (apt install g++-12)" >&2
-          echo "         or a newer CUDA toolkit, or nvcc will refuse to compile." >&2
-        fi
-      fi
+    if [ -n "$ARCH" ]; then
+      setvar "$CFG" CUDA_ARCH "$ARCH"
+      echo "CUDA_ARCH := $ARCH (from nvidia-smi compute_cap)"
     else
-      echo "WARNING: nvcc not on PATH" >&2
+      echo "WARNING: could not read compute_cap; leaving template's CUDA_ARCH as-is" >&2
     fi
 
-    FLAGS='-O3 -std=c++20 --forward-unknown-to-host-compiler'
-    [ -n "$CCBIN" ] && FLAGS="$FLAGS -ccbin $CCBIN"
-
-    setvar "$CFG" CXX                 'nvcc'
-    setvar "$CFG" CC                  'nvcc'
-    setvar "$CFG" CXXFLAGS            "$FLAGS"
-    setvar "$CFG" CUDA_CXX            'nvcc'
-    setvar "$CFG" CUDA_ARCH           "$ARCH"
-    setvar "$CFG" PARALLEL_MODE       'NONE'
-    setvar "$CFG" PLATFORMS           'CPU_SISD GPU_CUDA'
-    setvar "$CFG" FLOATING_POINT_TYPE 'double'
-    echo "configured: GPU (CPU_SISD GPU_CUDA, nvcc, sm_$ARCH, double, single-GPU)"
+    # Every flag variable that must carry -std=c++20 -- OpenLB's headers hard
+    # #error without it, and nvcc defaults to C++17.
+    for v in CXXFLAGS CUDA_CXXFLAGS; do
+      if grep -qE "^[[:space:]]*${v}[[:space:]]*[:?+]?=" "$CFG" \
+         && ! grep -E "^[[:space:]]*${v}[[:space:]]*[:?+]?=" "$CFG" | grep -q 'std=c++'; then
+        echo "WARNING: $v in $(basename "$t") has no -std=c++20 -- check it" >&2
+      fi
+    done
+    echo "configured: GPU (single-GPU CUDA, from $(basename "$t"))"
     ;;
 
-  show) show; exit 0 ;;
-  *) echo "usage: $0 {cpu|gpu|show}" >&2; exit 2 ;;
+  *) echo "usage: $0 {cpu|gpu|show|list}" >&2; exit 2 ;;
 esac
 
 echo
@@ -139,9 +147,6 @@ show
 echo
 echo "NEXT — platform changed, so stale objects must go:"
 echo "  cd \$OLB_ROOT && make clean"
-if [ "$MODE" = gpu ]; then
-  echo "  make -C external CXX=nvcc CC=nvcc"
-else
-  echo "  make -C external"
-fi
+echo "  make -C external"
 echo "  make -j\$(nproc) 2>&1 | tee ~/build_lib.log"
+echo "Also clean any example you already built: make clean in its directory."
