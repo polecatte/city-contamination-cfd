@@ -602,14 +602,12 @@ int main(int argc, char* argv[]) {
         fprintf(mf,"deposited_frac %.4f\ntheta_layout 5xint32[nx,ny,nz,dx*1000,1]\n", emit>0?dep/emit:0.0);
         fprintf(mf,"# Stage C: J = (1/omega_cells) * sum_x receptor_w(x) * theta(x)\n"); fclose(mf);} }
 
-#else
-    clout << "urban_flow COMPLETE (airflow only; Step 4 off — rebuild with -DENABLE_STEP4). "
-          << "Wrote umean_full.f32 to " << OUT << "/" << std::endl;
-    return 0;
-#endif // ENABLE_STEP4
-
     clout << "urban_flow COMPLETE — live airflow + burst transport. Wrote umean_full.f32, "
           << "theta.f32, deposition.f32, exposure_timeseries.csv to " << OUT << "/  (Omega="
           << nOmega << ", emitted=" << emit << ", deposited=" << dep << ")" << std::endl;
+#else
+    clout << "urban_flow COMPLETE (airflow only; Step 4 off — rebuild with -DENABLE_STEP4). "
+          << "Wrote umean_full.f32 to " << OUT << "/" << std::endl;
+#endif // ENABLE_STEP4
     return 0;
 }

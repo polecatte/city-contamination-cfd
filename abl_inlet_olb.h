@@ -18,19 +18,22 @@ namespace bridge {
 // AnalyticalF3D that returns the inlet velocity in LATTICE units at a given physical
 // time. Rebuild/refresh the time each step with setTime(physTime) before defineU.
 //
-// 1.8: the base is `AnalyticalF<3,T,T>`, NOT `AnalyticalF3D<T,T>` -- the *3D<T,T> spelling
-// is not a template in 1.8 (gcc: "expected template-name before '<' token"). The compiler's
-// own candidate list for defineRhoU prints the real form: AnalyticalF<3, double, double>.
+// The base is `olb::AnalyticalF3D<T,T>` -- FULLY QUALIFIED. urban_flow.cpp includes this
+// header BEFORE its `using namespace olb;`, so nothing from olb is visible unqualified here
+// and an unqualified AnalyticalF3D fails with "expected template-name before '<' token".
+// That error is about qualification, not about the name: 1.8 does provide AnalyticalF3D<T,T>
+// (examples/turbulence/nozzle3d/nozzle3d.cpp:244 uses it). Keeping this header
+// self-contained rather than depending on the includer's using-directives.
 // operator() signature is `bool operator()(T output[], const T input[])`.
 // `input` carries PHYSICAL coordinates when the functor is applied via defineU over a
 // SuperGeometry material (check whether your defineU passes physical or lattice coords;
 // if lattice, multiply input by converter.getPhysDeltaX()).
 template <typename T, typename DESCRIPTOR, typename CONVERTER>
-class AblVelocityF3D : public AnalyticalF<3,T,T> {
+class AblVelocityF3D : public olb::AnalyticalF3D<T,T> {
 public:
     AblVelocityF3D(const CONVERTER& converter, const abl::ABLInlet& inlet,
                    T physTime = 0, T ramp = 1)
-        : AnalyticalF<3,T,T>(3), _conv(converter), _inlet(inlet), _t(physTime), _ramp(ramp) {}
+        : olb::AnalyticalF3D<T,T>(3), _conv(converter), _inlet(inlet), _t(physTime), _ramp(ramp) {}
 
     void setTime(T physTime) { _t = physTime; }
     // CORRECTIVE — startup ramp: scale the whole inlet by a smoothstep factor in [0,1]
