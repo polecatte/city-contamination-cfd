@@ -55,11 +55,10 @@ using namespace olb;
 using namespace olb::descriptors;
 typedef double T;
 
-// ── B5: THETA/DEPOSIT were used as descriptor fields but never defined. FIELD_BASE<1>
-// gives each a single scalar per cell. Declared inside olb::descriptors so the existing
-// `descriptors::THETA` usage sites stay valid.
+// ── B5 (corrected): THETA already ships in 1.8 as FIELD_BASE<1,0,0>
+// (src/descriptor/fields.h:423), so defining it here was a redefinition. Only DEPOSIT is
+// genuinely ours. One fewer field to justify.
 namespace olb::descriptors {
-struct THETA   : public FIELD_BASE<1> {};   // running Theta = integral of C dt
 struct DEPOSIT : public FIELD_BASE<1> {};   // deposited mass at wall-adjacent cells
 }
 
@@ -183,10 +182,18 @@ void prepareLattice(SuperLattice<T,DESCRIPTOR>& sLattice,
     boundary::set<boundary::InterpolatedPressure<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_OUTLET);
     boundary::set<boundary::FullSlip<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_SLIP);
 
-    // initial condition: rest; the inlet ramps in over the first flow-through
-    auto allFluidish = superGeometry.getMaterialIndicator({MAT_FLUID,MAT_INLET,MAT_OUTLET,MAT_POROUS,MAT_SPONGE});
-    sLattice.defineRhoU(allFluidish, T(1), std::vector<T>{0,0,0});                   // CONFIRM 1.8
-    sLattice.iniEquilibrium(allFluidish, T(1), std::vector<T>{0,0,0});               // CONFIRM 1.8
+    // initial condition: rest; the inlet ramps in over the first flow-through.
+    // 1.8 takes AnalyticalF arguments, not a scalar and a std::vector, and the indicator
+    // parameter is FunctorPtr&& -- so the indicator must be a fresh temporary at each call
+    // rather than one named lvalue reused.
+    AnalyticalConst3D<T,T> rhoOne(T(1));
+    AnalyticalConst3D<T,T> uZero(T(0),T(0),T(0));
+    sLattice.defineRhoU(
+        superGeometry.getMaterialIndicator({MAT_FLUID,MAT_INLET,MAT_OUTLET,MAT_POROUS,MAT_SPONGE}),
+        rhoOne, uZero);
+    sLattice.iniEquilibrium(
+        superGeometry.getMaterialIndicator({MAT_FLUID,MAT_INLET,MAT_OUTLET,MAT_POROUS,MAT_SPONGE}),
+        rhoOne, uZero);
     sLattice.initialize();
     clout << "prepareLattice done (collision model " << COLLISION_MODEL
           << ", sponge " << nSponge << " cells)" << std::endl;
@@ -332,7 +339,11 @@ void prepareScalarLattice(SuperLattice<T,AD_DESCRIPTOR>& adLattice,
     // CONFIRM 1.8: attach a NavierStokesAdvectionDiffusionCoupling generator between the two
     // lattices so each AD step advects on the current NSE velocity; the settling offset −w_s ẑ
     // is added to the coupled velocity in the coupling (or in the per-step velocity copy).
-    adLattice.defineRhoU(fluidish, T(0), std::vector<T>{0,0,0});
+    AnalyticalConst3D<T,T> rhoZero(T(0));
+    AnalyticalConst3D<T,T> uZeroAD(T(0),T(0),T(0));
+    adLattice.defineRhoU(
+        superGeometry.getMaterialIndicator({MAT_FLUID,MAT_INLET,MAT_OUTLET,MAT_POROUS,MAT_SPONGE}),
+        rhoZero, uZeroAD);
     adLattice.initialize();
     (void)omegaAD;(void)converter;(void)D_mol;(void)Sc_t;(void)nsLattice;
     clout << "prepareScalarLattice done" << std::endl;

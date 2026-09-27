@@ -18,17 +18,19 @@ namespace bridge {
 // AnalyticalF3D that returns the inlet velocity in LATTICE units at a given physical
 // time. Rebuild/refresh the time each step with setTime(physTime) before defineU.
 //
-// CONFIRM 1.8: base class is `AnalyticalF3D<T,T>` with ctor `AnalyticalF3D(3)` for a
-// 3-component output; operator() signature is `bool operator()(T output[], const T input[])`.
+// 1.8: the base is `AnalyticalF<3,T,T>`, NOT `AnalyticalF3D<T,T>` -- the *3D<T,T> spelling
+// is not a template in 1.8 (gcc: "expected template-name before '<' token"). The compiler's
+// own candidate list for defineRhoU prints the real form: AnalyticalF<3, double, double>.
+// operator() signature is `bool operator()(T output[], const T input[])`.
 // `input` carries PHYSICAL coordinates when the functor is applied via defineU over a
 // SuperGeometry material (check whether your defineU passes physical or lattice coords;
 // if lattice, multiply input by converter.getPhysDeltaX()).
 template <typename T, typename DESCRIPTOR, typename CONVERTER>
-class AblVelocityF3D : public AnalyticalF3D<T,T> {
+class AblVelocityF3D : public AnalyticalF<3,T,T> {
 public:
     AblVelocityF3D(const CONVERTER& converter, const abl::ABLInlet& inlet,
                    T physTime = 0, T ramp = 1)
-        : AnalyticalF3D<T,T>(3), _conv(converter), _inlet(inlet), _t(physTime), _ramp(ramp) {}
+        : AnalyticalF<3,T,T>(3), _conv(converter), _inlet(inlet), _t(physTime), _ramp(ramp) {}
 
     void setTime(T physTime) { _t = physTime; }
     // CORRECTIVE — startup ramp: scale the whole inlet by a smoothstep factor in [0,1]
