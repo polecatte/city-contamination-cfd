@@ -116,8 +116,9 @@ int main(int argc, char** argv){
     if(!bridge::load_source_mask (dir+"/source_mask.u8",   s)) return 2;
     printf("material_map: %dx%dx%d dx=%.3f  (%zu cells)\n", m.nx,m.ny,m.nz,m.dx,m.size());
     std::map<int,long> hist; for(auto v: m.data) hist[v]++;
-    const char* nm[8]={"donothing","fluid","wall","inlet","outlet","slip","porous","ground"};
-    for(auto& kv: hist) printf("  MAT %d %-10s %ld\n", kv.first, (kv.first>=0&&kv.first<=7)?nm[kv.first]:"?", kv.second);
+    const char* nm[10]={"donothing","fluid","wall","inlet","outlet","slip","porous",
+                        "ground","sponge","frame"};
+    for(auto& kv: hist) printf("  MAT %d %-10s %ld\n", kv.first, (kv.first>=0&&kv.first<=9)?nm[kv.first]:"?", kv.second);
     long omega=0; for(auto v: s.data) if(v) omega++;
     printf("source_mask: Omega = %ld cells\n", omega);
     printf("SELFTEST OK\n");

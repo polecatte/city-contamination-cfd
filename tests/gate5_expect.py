@@ -19,7 +19,7 @@ def main():
     d      = sys.argv[1] if len(sys.argv) > 1 else "geom_out"
     nsp    = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     wind   = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
-    buf    = int(sys.argv[4]) if len(sys.argv) > 4 else 1   # SPONGE_BUFFER
+    buf    = int(sys.argv[4]) if len(sys.argv) > 4 else 0   # SPONGE_BUFFER
     with open(f"{d}/material_map.dat", "rb") as f:
         nx, ny, nz, dxm, ncomp = struct.unpack("<5i", f.read(20))
         mat = list(struct.unpack(f"<{nx*ny*nz}i", f.read(4*nx*ny*nz)))
@@ -39,11 +39,12 @@ def main():
             mat[i] = MAT_SPONGE; carved += 1
 
     post = collections.Counter(mat)
-    names = {0:"VOID",1:"FLUID",2:"WALL",3:"INLET",4:"OUTLET",5:"SLIP",6:"POROUS",7:"GROUND",8:"SPONGE"}
+    names = {0:"VOID",1:"FLUID",2:"WALL",3:"INLET",4:"OUTLET",5:"SLIP",6:"POROUS",
+             7:"GROUND",8:"SPONGE",9:"FRAME"}
     print(f"grid {nx}x{ny}x{nz}  dx={dxm/1000.0:.3f}  total={nx*ny*nz}")
     print(f"sponge: {nsp} cells at wind {wind:g} deg, buffer {buf} -> {carved} FLUID cells converted\n")
     print(f"{'MAT':>3} {'name':<7} {'stage A':>10} {'after carve':>12}   <- GATE5 must equal this")
-    for m in range(9):
+    for m in range(10):
         print(f"{m:>3} {names[m]:<7} {pre.get(m,0):>10} {post.get(m,0):>12}")
     print(f"\ntotal preserved: {sum(post.values())} == {nx*ny*nz}: {sum(post.values())==nx*ny*nz}")
 

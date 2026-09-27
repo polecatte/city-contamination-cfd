@@ -57,6 +57,13 @@ enum OlbMaterial : int32_t {
     MAT_OUTLET    = 4,
     MAT_SLIP      = 5,
     MAT_POROUS    = 6,
+    MAT_FRAME     = 9,   // domain box edges/corners — see "One face per cell" in
+                         // OPENLB_MIGRATION_PLAN.md 6.4. Solid no-slip, but its own number
+                         // so the verified WALL count stays exactly the building shells.
+                         // Must NOT be 0: OpenLB reads material 0 as "outside" when it
+                         // derives a boundary cell's discrete normal, and an extra outside
+                         // neighbour turns the adjacent face cell into an edge/corner that
+                         // the interpolated boundaries have no specialisation for.
     MAT_GROUND    = 7,   // ground plane — ROUGH wall (wall function w/ z0), kept SEPARATE
                          // from buildings so the ABL wall-function corrective targets only
                          // the floor (buildings stay smooth no-slip per COST 732).
@@ -89,8 +96,9 @@ struct MaterialMap {
 //       that happens to sit on a face is never reclassified as an inlet/outlet/slip:
 //       inlet face → INLET, opposite face → OUTLET, remaining lateral + top → SLIP.
 //       EXACTLY ONE FACE PER CELL: a cell lying on two or more domain faces (the 12 box
-//       edges and 8 corners) gets MAT_DONOTHING rather than being claimed by whichever overlay
-//       ran first. See "One face per cell" in OPENLB_MIGRATION_PLAN.md for why.
+//       edges and 8 corners) gets MAT_FRAME rather than being claimed by whichever overlay
+//       ran first. See "One face per cell" in OPENLB_MIGRATION_PLAN.md 6.4 for why, and in
+//       particular why MAT_FRAME must not be material 0.
 inline MaterialMap build_material_map(const VoxelGrid& g, double wind_deg = 0.0) {
     MaterialMap m;
     m.nx = g.nx; m.ny = g.ny; m.nz = g.nz; m.cell_size = g.cell_size;
@@ -138,7 +146,7 @@ inline MaterialMap build_material_map(const VoxelGrid& g, double wind_deg = 0.0)
         if (nf == 0) continue;                       // domain interior
         const size_t i = m.idx(x, y, z);
         if (m.mat[i] != MAT_FLUID) continue;         // buildings / ground / parks keep theirs
-        if (nf >= 2) { m.mat[i] = MAT_DONOTHING; continue; }   // box edge or corner
+        if (nf >= 2) { m.mat[i] = MAT_FRAME; continue; }       // box edge or corner
         int32_t v = MAT_SLIP;                        // lateral or top face
         switch (inflow) {
             case PX:  if (x == 0)      v = MAT_INLET;  else if (x == nx - 1) v = MAT_OUTLET; break;
@@ -181,12 +189,12 @@ inline bool material_reconcile(const VoxelGrid& g, const MaterialMap& m, bool ve
         }
     }
     // material-side counts
-    long m_cnt[8] = {0,0,0,0,0,0,0,0};
-    for (size_t i = 0; i < N; ++i) if (m.mat[i] >= 0 && m.mat[i] <= 7) ++m_cnt[m.mat[i]];
-    // MAT_DONOTHING here is the box edges/corners carved out of fluid by the one-face-per-cell
-    // rule, so it belongs on the fluid side of this identity.
+    long m_cnt[10] = {0,0,0,0,0,0,0,0,0,0};
+    for (size_t i = 0; i < N; ++i) if (m.mat[i] >= 0 && m.mat[i] <= 9) ++m_cnt[m.mat[i]];
+    // MAT_FRAME is the box edges/corners carved out of fluid by the one-face-per-cell rule,
+    // so it belongs on the fluid side of this identity.
     long m_fluidfaces = m_cnt[MAT_FLUID] + m_cnt[MAT_INLET] + m_cnt[MAT_OUTLET]
-                      + m_cnt[MAT_SLIP]  + m_cnt[MAT_DONOTHING];
+                      + m_cnt[MAT_SLIP]  + m_cnt[MAT_FRAME];
 
     // reconciliation identities
     bool ok = true;
@@ -196,17 +204,19 @@ inline bool material_reconcile(const VoxelGrid& g, const MaterialMap& m, bool ve
     };
     if (verbose) {
         printf("\n[openlb_geom] material histogram (%zu cells)\n", N);
-        const char* nm[8] = {"DONOTHING","FLUID","WALL","INLET","OUTLET","SLIP","POROUS","GROUND"};
-        for (int k = 0; k < 8; ++k)
+        const char* nm[10] = {"DONOTHING","FLUID","WALL","INLET","OUTLET","SLIP","POROUS",
+                              "GROUND","(sponge)","FRAME"};
+        for (int k = 0; k < 10; ++k)
             printf("  MAT %d %-10s %10ld (%5.2f%%)\n", k, nm[k], m_cnt[k], 100.0*m_cnt[k]/N);
         printf("\n[openlb_geom] reconciliation against voxel grid\n");
     }
     check("GROUND = ground cells",          m_cnt[MAT_GROUND], v_ground);
     check("WALL = solid building shells",   m_cnt[MAT_WALL],   v_shell_solid);
     check("POROUS = park shells + indoor",  m_cnt[MAT_POROUS], v_shell_porous + v_indoor);
-    check("fluid+in+out+slip+donothing = FLUID", m_fluidfaces,     v_fluid);
+    check("fluid+in+out+slip+frame = FLUID", m_fluidfaces,     v_fluid);
     check("total cells conserved",          (long)N,
-          m_cnt[0]+m_cnt[MAT_FLUID]+m_cnt[MAT_WALL]+m_cnt[MAT_INLET]+m_cnt[MAT_OUTLET]+m_cnt[MAT_SLIP]+m_cnt[MAT_POROUS]+m_cnt[MAT_GROUND]);
+          m_cnt[0]+m_cnt[MAT_FLUID]+m_cnt[MAT_WALL]+m_cnt[MAT_INLET]+m_cnt[MAT_OUTLET]
+          +m_cnt[MAT_SLIP]+m_cnt[MAT_POROUS]+m_cnt[MAT_GROUND]+m_cnt[MAT_FRAME]);
     if (verbose) printf("[openlb_geom] gate: %s\n", ok ? "PASS — material counts match the old voxelizer"
                                                         : "FAIL — mapping does not reconcile");
     return ok;

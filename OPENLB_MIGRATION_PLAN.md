@@ -184,57 +184,66 @@ had to be a correct *census*: every cell classified exactly once, sums reconcili
 the voxelizer. It was, and Stage A's gate proves it.
 
 OpenLB's interpolated and slip boundaries need more than a census. Each boundary cell must
-have a well-defined discrete inward normal, which OpenLB derives from the cell's material
-neighbourhood: it looks for the direction in which the bulk fluid lies. A boundary cell with
-no bulk-fluid neighbour has no derivable normal, and `boundary::set<>` refuses with
-`std::runtime_error: Could not set Boundary`.
+be classified as flat, edge or corner, and served by a template specialisation matching its
+**discrete normal**. `boundaryhelper::constructConcreteDynamicsForDirectionOrientation` in
+`src/boundary/setBoundary3D.h` enumerates exactly the six axis normals; anything with two or
+three nonzero components falls through to `throw std::runtime_error("Could not set
+Boundary.")`. The interpolated velocity and pressure boundaries have no edge or corner
+specialisation in that family.
 
-The original overlay produced exactly that. It ran three passes in sequence — inlet/outlet
-on the wind-aligned faces, then the lateral faces, then the top — each claiming any cell
-still marked `MAT_FLUID`. Because the inlet pass ran first and swept its entire plane, it
-claimed the two columns where the `x=0` plane meets the lateral slip planes at `y=0` and
-`y=ny-1`. Those cells are on the inlet, but every neighbour of theirs is another boundary
-cell: `+x` is SLIP, not fluid. The same happened mirrored at the outlet, and along the seam
-where the top face meets the lateral faces. At the default operating point:
+**How the normal is derived, and the trap in it.** `BlockGeometryStatistics3D::getType` takes
+a *fluid* indicator and an **outside** indicator, and outside means **material 0**. The normal
+is built from which of a cell's six neighbours are outside. So:
 
-| material | orphaned cells | location |
+- exactly one outside neighbour → flat → a valid axis normal → works
+- two → edge, three → corner → no specialisation → throws
+
+Cells beyond the mother cuboid count as outside, because unstamped halo reads 0.
+
+This produced two successive failures, and it is worth recording both because the second was
+self-inflicted.
+
+*First arrangement.* The overlay ran three passes — inlet/outlet on the wind-aligned faces,
+then the laterals, then the top — each claiming any cell still `MAT_FLUID`. The inlet pass ran
+first over its whole plane, so it took the `y=0` and `y=ny-1` columns. Those cells lie on two
+domain faces: `-x` is beyond the cuboid and so is `-y`. Two outside neighbours, edge normal,
+throw.
+
+*Second arrangement.* Restricting inlet/outlet to the face interior and assigning the box
+edges to **`MAT_DONOTHING`** looked principled — such a cell has no unique normal and touches
+no fluid, so no dynamics says something true about it. But material 0 *is* OpenLB's "outside",
+so the frame handed the next ring of face cells a second outside neighbour. The problem moved
+inward by one cell rather than going away: 337 inlet, 337 outlet and 1 370 slip cells were
+still edges or corners.
+
+**The rule that works.** A cell belongs to exactly one domain face. Zero faces is interior.
+One face takes that face's material. **Two or more — the 12 box edges and 8 corners — becomes
+`MAT_FRAME` (9), a solid no-slip material that is neither fluid nor material 0.** With the
+frame at 9, every INLET, OUTLET and SLIP cell has exactly one outside neighbour and a valid
+axis normal.
+
+`MAT_FRAME` is deliberately not `MAT_WALL`: folding 1 032 cells into WALL would break the
+`WALL = solid building shells` identity, which currently matches the old voxelizer exactly at
+61 528. Its own number keeps every verified count intact. The frame cells touch no fluid, so
+the bounce-back assigned to them is inert — the material exists to occupy a classification,
+not to impose physics. The bottom edges need no special case: `z=0` is `MAT_GROUND` from the
+type pass and the overlay only reclassifies `MAT_FLUID`.
+
+| material | before | after |
 |---|---|---|
-| 3 INLET | 341 | `x=0`, columns `y=0` and `y=ny-1` |
-| 4 OUTLET | 341 | `x=nx-1`, same columns |
-| 5 SLIP | 350 | `z=nz-1` top, seams along `y=0` and `y=ny-1` |
+| 0 DONOTHING | 0 | 0 |
+| 1 FLUID | 2 445 872 | 2 445 872 |
+| 2 WALL | 61 528 | 61 528 |
+| 3 INLET | 14 696 | **14 355** |
+| 4 OUTLET | 14 696 | **14 355** |
+| 5 SLIP | 59 675 | **59 325** |
+| 6 POROUS | 4 725 | 4 725 |
+| 7 GROUND | 29 559 | 29 559 |
+| 9 FRAME | — | **1 032** |
 
-1 032 cells out of 2.63 M — 0.04 % — and the run aborted on the first of them.
-
-**The rule now: a cell belongs to exactly one domain face.** `build_material_map` counts how
-many of the six faces a cell lies on. Zero means interior. One means the cell takes that
-face's material — INLET, OUTLET, or SLIP. **Two or more means the cell is on a box edge or
-corner, and it becomes `MAT_DONOTHING`.**
-
-Assigning the edges to no-dynamics is not a workaround, it is the physically correct answer.
-A cell on two domain faces has no unique inward normal *by construction* — that is a property
-of the box, not of the discretization. And such a cell touches no fluid cell at all, so it
-cannot exchange populations with the flow and cannot influence the solution regardless of
-what dynamics it carries. Giving it no dynamics says exactly that. The alternative readings
-are worse: an arbitrary normal is a fabricated boundary condition, and leaving it as bulk
-fluid puts an unconstrained cell outside the domain's boundary.
-
-The bottom edges need no special handling: `z=0` is `MAT_GROUND` from the type pass, and the
-overlay only reclassifies cells still marked `MAT_FLUID`.
-
-**Consequences for Stage A's gate.** Three counts change, and the fourth reconciliation
-identity changes shape:
-
-| | before | after |
-|---|---|---|
-| MAT 0 DONOTHING | 0 | **1 032** |
-| MAT 3 INLET | 14 696 | **14 355** |
-| MAT 4 OUTLET | 14 696 | **14 355** |
-| MAT 5 SLIP | 59 675 | **59 325** |
-| identity 4 | `fluid+inlet+outlet+slip = FLUID` | `fluid+in+out+slip+donothing = FLUID` |
-
-The edge cells were carved out of fluid, so they belong on the fluid side of that identity.
-FLUID, WALL, POROUS and GROUND are untouched, all five identities still PASS, and `Ω` stays
-22 812 — the source mask is ground-level and never touched a domain face.
+The fourth identity becomes `fluid+in+out+slip+frame = FLUID`, since the frame was carved out
+of fluid. All five still PASS and `Ω` stays 22 812 — the source mask is ground-level and never
+touched a domain face.
 
 **Why change Stage A rather than the solver.** The alternative was to leave the map alone and
 have `prepareLattice` set boundaries on a trimmed indicator. That works, but it puts the
@@ -245,7 +254,11 @@ a one-time cost paid while the numbers are cheap; explaining a standing discrepa
 
 **What this says about the migration.** The defect was latent in the geometry for the entire
 life of the custom solver and its own gate could not see it, because the gate checks counts
-and the defect is in adjacency. A validated community solver is stricter than a bespoke one
+and the defect is in adjacency. It also took three attempts to diagnose, two of them wrong,
+because the error message is generic and the real precondition lives in a template dispatch
+table in the library. The lesson for the rest of the port: read the library's own source for
+the failing precondition before theorising from the outside — one grep of
+`setBoundary3D.h` settled what two rounds of plausible reasoning did not. A validated community solver is stricter than a bespoke one
 in ways that are not predictable in advance — that strictness is part of what the migration
 buys, and this is the first instance of it paying out. It also argues for keeping Gate 5
 (OpenLB's own per-material voxel counts) permanently rather than treating it as a one-off:

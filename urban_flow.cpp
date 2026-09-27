@@ -92,7 +92,7 @@ static int    envi(const char* k,int d){const char* e=getenv(k);return e?atoi(e)
 // Material numbers — MUST match openlb_geometry.h (note MAT_GROUND split from MAT_WALL,
 // and MAT_SPONGE is a SOLVER-LOCAL material carved out of MAT_FLUID near the outlet (C5)).
 enum { MAT_VOID=0, MAT_FLUID=1, MAT_WALL=2, MAT_INLET=3, MAT_OUTLET=4,
-       MAT_SLIP=5, MAT_POROUS=6, MAT_GROUND=7, MAT_SPONGE=8 };
+       MAT_SLIP=5, MAT_POROUS=6, MAT_GROUND=7, MAT_SPONGE=8, MAT_FRAME=9 };
 
 static abl::ABLInlet gInlet;   // built in main, referenced in setBoundaryValues
 
@@ -107,12 +107,14 @@ static void carve_sponge(bridge::GridField<int32_t>& m, double wind_deg, int nSp
     const int nx=m.nx, ny=m.ny, nz=m.nz;
     double wd = std::fmod(wind_deg,360.0); if (wd<0) wd+=360.0;
     auto mark=[&](int x,int y,int z){ size_t i=m.idx(x,y,z); if(m.data[i]==MAT_FLUID) m.data[i]=MAT_SPONGE; };
-    // SPONGE_BUFFER cells of FLUID are left between the band and the outlet plane. OpenLB
-    // derives each boundary cell's inward normal from its material neighbourhood; if the
-    // sponge abuts the outlet, every outlet cell's only inward neighbour is MAT_SPONGE and
-    // the normal may not be derivable. One cell of MAT_FLUID keeps that unambiguous at
-    // negligible cost to the absorbing layer. SPONGE_BUFFER=0 restores the old placement.
-    const int buf = envi("SPONGE_BUFFER", 1);
+    // SPONGE_BUFFER cells of FLUID may be left between the band and the outlet plane.
+    // Default 0 (band flush against the outlet, the original C5 placement). This was briefly
+    // defaulted to 1 while chasing "Could not set Boundary", on the theory that the outlet's
+    // inward neighbour being MAT_SPONGE blocked normal derivation; the real cause was
+    // material 0 in the box frame (OPENLB_MIGRATION_PLAN.md 6.4) and the outlet was never
+    // reached. Kept as a knob since the sponge/outlet interface is worth a look at Gate 6a,
+    // but not defaulted on for a reason that turned out to be wrong.
+    const int buf = envi("SPONGE_BUFFER", 0);
     if (wd < 45 || wd >= 315) for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=nx-buf-nSponge;x<nx-buf;++x) mark(x,y,z); // +x
     else if (wd < 135)        for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=ny-buf-nSponge;y<ny-buf;++y) mark(x,y,z); // +y
     else if (wd < 225)        for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=buf;x<buf+nSponge;++x)       mark(x,y,z); // -x
@@ -154,6 +156,9 @@ void prepareLattice(SuperLattice<T,DESCRIPTOR>& sLattice,
 
     // buildings: smooth no-slip bounce-back
     sLattice.defineDynamics<BounceBack>(superGeometry, MAT_WALL);                    // B3
+    // Domain box edges/corners (OPENLB_MIGRATION_PLAN.md 6.4). These touch no fluid cell,
+    // so bounce-back on them is inert; they exist to be neither fluid nor material 0.
+    sLattice.defineDynamics<BounceBack>(superGeometry, MAT_FRAME);
 
     // (C2) GROUND: rough-wall FUNCTION (z0), NOT plain bounce-back — this is what holds the
     // ABL profile horizontally homogeneous over the fetch. CONFIRM 1.8: exact API varies by
@@ -358,6 +363,7 @@ void prepareScalarLattice(SuperLattice<T,AD_DESCRIPTOR>& adLattice,
     // zero-flux walls: bounce-back on buildings + ground (deposition handled by the sink op)
     adLattice.defineDynamics<BounceBack>(superGeometry, MAT_WALL);                      // B3
     adLattice.defineDynamics<BounceBack>(superGeometry, MAT_GROUND);                    // B3
+    adLattice.defineDynamics<BounceBack>(superGeometry, MAT_FRAME);
     // outlet: advective outflow / zero inflow  (CONFIRM 1.8: setZeroGradientBoundary or a
     // convective/anti-bounce-back AD outflow on MAT_OUTLET)
     boundary::set<boundary::ZeroDistribution<T,AD_DESCRIPTOR>>(adLattice, superGeometry, MAT_OUTLET); // B4
@@ -533,7 +539,7 @@ int main(int argc, char* argv[]) {
     // Gate 5: OpenLB's own per-material voxel counts must equal the Stage-A histogram
     // exactly (modulo the sponge cells carved out of FLUID). This one check catches the
     // getOrigin() unit bug, any nx-vs-nx+1 off-by-one, and any overlap indexing error.
-    for (int m=0; m<=MAT_SPONGE; ++m)
+    for (int m=0; m<=MAT_FRAME; ++m)
       clout << "GATE5 MAT " << m << " olb=" << superGeometry.getStatistics().getNvoxel(m) << std::endl;
 
     // ── verified ABL/RFG inlet ──
