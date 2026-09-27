@@ -98,7 +98,8 @@ static abl::ABLInlet gInlet;   // built in main, referenced in setBoundaryValues
 
 // ─────────────────────────────────────────────────────────────────────────────
 // (C5) Carve a sponge band out of the fluid cells adjacent to the outlet face, on the
-// HOST material array before stamping. Wind-aligned: default +x → band at x∈[nx-n,nx).
+// HOST material array before stamping. Wind-aligned: default +x → band at
+// x∈[nx-buf-n, nx-buf), i.e. SPONGE_BUFFER fluid cells short of the outlet plane.
 // Solver-local (MAT_SPONGE); the geometry bridge stays pure geometry.
 // ─────────────────────────────────────────────────────────────────────────────
 static void carve_sponge(bridge::GridField<int32_t>& m, double wind_deg, int nSponge) {
@@ -106,10 +107,16 @@ static void carve_sponge(bridge::GridField<int32_t>& m, double wind_deg, int nSp
     const int nx=m.nx, ny=m.ny, nz=m.nz;
     double wd = std::fmod(wind_deg,360.0); if (wd<0) wd+=360.0;
     auto mark=[&](int x,int y,int z){ size_t i=m.idx(x,y,z); if(m.data[i]==MAT_FLUID) m.data[i]=MAT_SPONGE; };
-    if (wd < 45 || wd >= 315)       for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=nx-nSponge;x<nx;++x) mark(x,y,z); // +x
-    else if (wd < 135)              for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=ny-nSponge;y<ny;++y) mark(x,y,z); // +y
-    else if (wd < 225)              for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nSponge;++x)     mark(x,y,z); // -x
-    else                            for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=0;y<nSponge;++y)     mark(x,y,z); // -y
+    // SPONGE_BUFFER cells of FLUID are left between the band and the outlet plane. OpenLB
+    // derives each boundary cell's inward normal from its material neighbourhood; if the
+    // sponge abuts the outlet, every outlet cell's only inward neighbour is MAT_SPONGE and
+    // the normal may not be derivable. One cell of MAT_FLUID keeps that unambiguous at
+    // negligible cost to the absorbing layer. SPONGE_BUFFER=0 restores the old placement.
+    const int buf = envi("SPONGE_BUFFER", 1);
+    if (wd < 45 || wd >= 315) for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=nx-buf-nSponge;x<nx-buf;++x) mark(x,y,z); // +x
+    else if (wd < 135)        for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=ny-buf-nSponge;y<ny-buf;++y) mark(x,y,z); // +y
+    else if (wd < 225)        for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=buf;x<buf+nSponge;++x)       mark(x,y,z); // -x
+    else                      for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=buf;y<buf+nSponge;++y)      mark(x,y,z); // -y
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -178,9 +185,31 @@ void prepareLattice(SuperLattice<T,DESCRIPTOR>& sLattice,
     // ── domain boundaries ──
     // B4: the set*Boundary free functions are gone; 1.8 uses the declarative
     // boundary::set<> API, which takes omega from the cell dynamics rather than an argument.
-    boundary::set<boundary::InterpolatedVelocity<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_INLET);
-    boundary::set<boundary::InterpolatedPressure<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_OUTLET);
-    boundary::set<boundary::FullSlip<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_SLIP);
+    //
+    // Each call is announced and individually caught so a "Could not set Boundary" throw
+    // names the material that failed and how many cells it had, instead of aborting
+    // anonymously. OpenLB derives a discrete inward normal per boundary cell from its
+    // material neighbourhood, so this failing is a statement about geometry adjacency, and
+    // the material number plus cell count is the minimum needed to chase it.
+    auto& gstat = superGeometry.getStatistics();
+    auto trySet = [&](const char* what, int matNo, auto&& fn) {
+        clout << "boundary " << what << " on MAT " << matNo
+              << " (" << gstat.getNvoxel(matNo) << " cells) ... " << std::flush;
+        try { fn(); clout << "ok" << std::endl; }
+        catch (std::exception const& e) {
+            clout << "FAILED: " << e.what() << std::endl;
+            clout << "  MAT " << matNo << " has no derivable inward normal for at least one "
+                  << "cell. Check that its neighbours include MAT_FLUID (1) specifically, "
+                  << "not merely some other fluid-carrying material." << std::endl;
+            throw;
+        }
+    };
+    trySet("InterpolatedVelocity", MAT_INLET, [&]{
+        boundary::set<boundary::InterpolatedVelocity<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_INLET); });
+    trySet("InterpolatedPressure", MAT_OUTLET, [&]{
+        boundary::set<boundary::InterpolatedPressure<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_OUTLET); });
+    trySet("FullSlip", MAT_SLIP, [&]{
+        boundary::set<boundary::FullSlip<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_SLIP); });
 
     // initial condition: rest; the inlet ramps in over the first flow-through.
     // 1.8 takes AnalyticalF arguments, not a scalar and a std::vector, and the indicator
