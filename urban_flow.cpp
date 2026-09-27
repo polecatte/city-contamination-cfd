@@ -55,13 +55,23 @@ using namespace olb;
 using namespace olb::descriptors;
 typedef double T;
 
+// ── B5: THETA/DEPOSIT were used as descriptor fields but never defined. FIELD_BASE<1>
+// gives each a single scalar per cell. Declared inside olb::descriptors so the existing
+// `descriptors::THETA` usage sites stay valid.
+namespace olb::descriptors {
+struct THETA   : public FIELD_BASE<1> {};   // running Theta = integral of C dt
+struct DEPOSIT : public FIELD_BASE<1> {};   // deposited mass at wall-adjacent cells
+}
+
 // ── LES collision selection (C6) ──  -DCOLLISION_MODEL=0|1|2  (default 0 = WALE)
 #ifndef COLLISION_MODEL
 #define COLLISION_MODEL 0
 #endif
-// CONFIRM 1.8: descriptor must carry the fields the chosen LES dynamics needs (effective
-// omega / tau). WALE typically wants a D3Q19 descriptor with a TAU_EFF field.
-#define DESCRIPTOR WALED3Q19Descriptor
+// B6: WALED3Q19Descriptor is D3Q19<EFFECTIVE_OMEGA,VELO_GRAD> and carries NO POROSITY
+// field, so PorousBGKdynamics cannot instantiate on it. Spell the descriptor out with
+// POROSITY added rather than using the alias.
+using UrbanD3Q19Descriptor = D3Q19<EFFECTIVE_OMEGA,VELO_GRAD,POROSITY>;
+#define DESCRIPTOR UrbanD3Q19Descriptor
 #if   COLLISION_MODEL==0
   #define BULK_DYNAMICS WALEBGKdynamics                 // CONFIRM 1.8
 #elif COLLISION_MODEL==1
@@ -128,34 +138,28 @@ void prepareLattice(SuperLattice<T,DESCRIPTOR>& sLattice,
                     UnitConverter<T,DESCRIPTOR> const& converter,
                     SuperGeometry<T,3>& superGeometry, int nSponge) {   // CONFIRM 1.8 types
     OstreamManager clout(std::cout, "prepareLattice");
-    const T omega = converter.getLatticeRelaxationFrequency();
+    const T omega = converter.getLatticeRelaxationFrequency(); (void)omega;  // B4: unused now
 
-    sLattice.defineDynamics(superGeometry, MAT_VOID, &instances::getNoDynamics<T,DESCRIPTOR>()); // CONFIRM 1.8
+    sLattice.defineDynamics<NoDynamics>(superGeometry, MAT_VOID);                    // B3
 
     // bulk fluid + inlet + outlet carry the selected LES dynamics (C6)
     auto bulkInd = superGeometry.getMaterialIndicator({MAT_FLUID, MAT_INLET, MAT_OUTLET});
     sLattice.template defineDynamics<BULK_DYNAMICS<T,DESCRIPTOR>>(bulkInd);          // CONFIRM 1.8
 
     // buildings: smooth no-slip bounce-back
-    sLattice.defineDynamics(superGeometry, MAT_WALL, &instances::getBounceBack<T,DESCRIPTOR>());  // CONFIRM 1.8
+    sLattice.defineDynamics<BounceBack>(superGeometry, MAT_WALL);                    // B3
 
     // (C2) GROUND: rough-wall FUNCTION (z0), NOT plain bounce-back — this is what holds the
     // ABL profile horizontally homogeneous over the fetch. CONFIRM 1.8: exact API varies by
     // release; typical form is a wallFunction boundary taking the converter + a param struct
     // (wall profile Musker/power-law, roughness z0, rhoMethod, van-Driest). If your build has
     // no wall-function BC, fall back to bounce-back and accept the drift (set GROUND_BOUNCEBACK=1).
-    if (envi("GROUND_BOUNCEBACK",0)) {
-        sLattice.defineDynamics(superGeometry, MAT_GROUND, &instances::getBounceBack<T,DESCRIPTOR>());
-    } else {
-        wallFunctionParam<T> wp;                                                    // CONFIRM 1.8 struct/name
-        wp.wallProfile     = 1;              // 1=Musker (or power-law) — CONFIRM 1.8 enum
-        wp.rhoMethod       = 0;              // CONFIRM 1.8
-        wp.curved          = false;
-        wp.latticeWallDistance = 0.5;        // ground plane half a cell below first fluid node
-        wp.z0              = envd("ABL_Z0", 0.045);   // aerodynamic roughness (m); match the inlet
-        setWallFunctionBoundary<T,DESCRIPTOR>(sLattice,
-            superGeometry.getMaterialIndicator({MAT_GROUND}), converter, wp);        // CONFIRM 1.8
-    }
+    // B8/G1: OpenLB 1.8 has NO aerodynamic-roughness (z0) wall function. wallFunctionParam
+    // has no z0 member, and setTurbulentWallModel/WallModelParameters is a smooth-wall
+    // Musker model. So the z0 branch cannot be written against 1.8 at all. Use the
+    // unresolved no-slip floor for now; Gate 6a decides G1 on measurement (free-slip
+    // approach floor / this / setTurbulentWallModel), not on argument.
+    sLattice.defineDynamics<BounceBack>(superGeometry, MAT_GROUND);                  // B3+B8
 
     // porous park canopy (PorousBGK — set porosity field to the calibrated C_d/LAD)
     sLattice.template defineDynamics<PorousBGKdynamics<T,DESCRIPTOR>>(
@@ -173,12 +177,11 @@ void prepareLattice(SuperLattice<T,DESCRIPTOR>& sLattice,
     }
 
     // ── domain boundaries ──
-    setInterpolatedVelocityBoundary<T,DESCRIPTOR>(sLattice, omega,
-        superGeometry.getMaterialIndicator({MAT_INLET}));                            // CONFIRM 1.8
-    setInterpolatedPressureBoundary<T,DESCRIPTOR>(sLattice, omega,
-        superGeometry.getMaterialIndicator({MAT_OUTLET}));                           // CONFIRM 1.8
-    setSlipBoundary<T,DESCRIPTOR>(sLattice,
-        superGeometry.getMaterialIndicator({MAT_SLIP}));                             // CONFIRM 1.8
+    // B4: the set*Boundary free functions are gone; 1.8 uses the declarative
+    // boundary::set<> API, which takes omega from the cell dynamics rather than an argument.
+    boundary::set<boundary::InterpolatedVelocity<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_INLET);
+    boundary::set<boundary::InterpolatedPressure<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_OUTLET);
+    boundary::set<boundary::FullSlip<T,DESCRIPTOR>>(sLattice, superGeometry, MAT_SLIP);
 
     // initial condition: rest; the inlet ramps in over the first flow-through
     auto allFluidish = superGeometry.getMaterialIndicator({MAT_FLUID,MAT_INLET,MAT_OUTLET,MAT_POROUS,MAT_SPONGE});
@@ -242,7 +245,8 @@ void exportLiveFlow(SuperLattice<T,DESCRIPTOR>& sLattice,
     for (int iC=0; iC<load.size(); ++iC) {                                           // CONFIRM 1.8
         auto& block = sLattice.getBlock(iC);                                         // CONFIRM 1.8
         auto& bgeo  = superGeometry.getBlockGeometry(iC);
-        const int gx0=bgeo.getOrigin()[0], gy0=bgeo.getOrigin()[1], gz0=bgeo.getOrigin()[2];
+        const auto off=bridge::blockOffset(superGeometry,iC);                         // S1
+        const int gx0=off[0], gy0=off[1], gz0=off[2];
         const int bnx=bgeo.getNx(), bny=bgeo.getNy(), bnz=bgeo.getNz();
         for (int x=0;x<bnx;++x) for(int y=0;y<bny;++y) for(int z=0;z<bnz;++z) {
             int X=gx0+x, Y=gy0+y, Z=gz0+z;
@@ -283,6 +287,11 @@ void exportLiveFlow(SuperLattice<T,DESCRIPTOR>& sLattice,
 // CPU-gate testing; for A4000 production reimplement each as an on-device post-processor
 // (structure maps 1:1 — same per-cell arithmetic).
 
+// Gate 4 (airflow first): Step 4 is compiled only with -DENABLE_STEP4. Phase 6 turns it on
+// after S2 (deposition velocity needs lattice units) and S3 (AD omega is a discarded
+// placeholder) are fixed and the 40^3 box gates 7a/7b/7c are written.
+#ifdef ENABLE_STEP4
+
 // per-cell Stage-A inputs mirrored to the host, grid-indexed
 struct ScalarInputs {
     int nx,ny,nz; double dx;
@@ -301,20 +310,23 @@ void prepareScalarLattice(SuperLattice<T,AD_DESCRIPTOR>& adLattice,
     // AD relaxation from the molecular + turbulent diffusivity D_eff = D_mol + ν_t/Sc_t.
     // CONFIRM 1.8: build a second UnitConverter (AdeUnitConverter) for the scalar, or set the
     // AD omega from D_eff directly. ν_t is spatially varying (WALE) — couple it per cell.
-    const T omegaAD = 1.0;  // placeholder; CONFIRM 1.8: = 1/(D_eff_lb*4 + 0.5) for D3Q7 TRT/BGK
+    // TODO(S3, Phase 6): this placeholder is discarded below, never applied. At omega=1 the
+    // D3Q7 diffusivity is D=(1/omega-0.5)/4=0.125 lu ~ 40 m^2/s, ~100x the turbulent
+    // diffusivity, making the plume pure diffusion. Derive from D_eff = D_mol + nu_t/Sc_t;
+    // nu_t varies per cell under WALE, so this must become a per-cell effective omega.
+    const T omegaAD = 1.0;  // placeholder — NOT APPLIED
 
     auto fluidish = superGeometry.getMaterialIndicator({MAT_FLUID,MAT_INLET,MAT_OUTLET,MAT_POROUS,MAT_SPONGE});
     adLattice.template defineDynamics<AD_DYNAMICS<T,AD_DESCRIPTOR>>(fluidish);          // CONFIRM 1.8
-    adLattice.defineDynamics(superGeometry, MAT_VOID, &instances::getNoDynamics<T,AD_DESCRIPTOR>());
+    adLattice.defineDynamics<NoDynamics>(superGeometry, MAT_VOID);                      // B3
     // zero-flux walls: bounce-back on buildings + ground (deposition handled by the sink op)
-    adLattice.defineDynamics(superGeometry, MAT_WALL,   &instances::getBounceBack<T,AD_DESCRIPTOR>());
-    adLattice.defineDynamics(superGeometry, MAT_GROUND, &instances::getBounceBack<T,AD_DESCRIPTOR>());
+    adLattice.defineDynamics<BounceBack>(superGeometry, MAT_WALL);                      // B3
+    adLattice.defineDynamics<BounceBack>(superGeometry, MAT_GROUND);                    // B3
     // outlet: advective outflow / zero inflow  (CONFIRM 1.8: setZeroGradientBoundary or a
     // convective/anti-bounce-back AD outflow on MAT_OUTLET)
-    setZeroDistributionBoundary<T,AD_DESCRIPTOR>(adLattice,
-        superGeometry.getMaterialIndicator({MAT_OUTLET}));                              // CONFIRM 1.8
+    boundary::set<boundary::ZeroDistribution<T,AD_DESCRIPTOR>>(adLattice, superGeometry, MAT_OUTLET); // B4
     // top/lateral: zero-flux (bounce-back / mirror on MAT_SLIP)
-    adLattice.defineDynamics(superGeometry, MAT_SLIP, &instances::getBounceBack<T,AD_DESCRIPTOR>());
+    adLattice.defineDynamics<BounceBack>(superGeometry, MAT_SLIP);                      // B3
 
     // NSE → AD velocity coupling (advection on the LIVE flow).
     // CONFIRM 1.8: attach a NavierStokesAdvectionDiffusionCoupling generator between the two
@@ -351,7 +363,8 @@ inline double injectBurst(ADLat& ad, SuperGeometry<T,3>& sg, const ScalarInputs&
     if(!on) return 0.0; double emitted=0;
     auto& load=ad.getLoadBalancer();
     for(int iC=0;iC<load.size();++iC){ auto& ab=ad.getBlock(iC);
-        auto& bg=sg.getBlockGeometry(iC); const int gx=bg.getOrigin()[0],gy=bg.getOrigin()[1],gz=bg.getOrigin()[2];
+        auto& bg=sg.getBlockGeometry(iC); const auto off=bridge::blockOffset(sg,iC);          // S1
+        const int gx=off[0],gy=off[1],gz=off[2];
         const int bnx=bg.getNx(),bny=bg.getNy(),bnz=bg.getNz();
         for(int x=0;x<bnx;++x)for(int y=0;y<bny;++y)for(int z=0;z<bnz;++z){
             int X=gx+x,Y=gy+y,Z=gz+z; if(X<0||X>=in.nx||Y<0||Y>=in.ny||Z<0||Z>=in.nz)continue;
@@ -366,7 +379,8 @@ inline double deposit(ADLat& ad, SuperGeometry<T,3>& sg, const ScalarInputs& in)
     static const int dxn[6]={1,-1,0,0,0,0},dyn[6]={0,0,1,-1,0,0},dzn[6]={0,0,0,0,1,-1};
     double dep=0; auto& load=ad.getLoadBalancer();
     for(int iC=0;iC<load.size();++iC){ auto& ab=ad.getBlock(iC);
-        auto& bg=sg.getBlockGeometry(iC); const int gx=bg.getOrigin()[0],gy=bg.getOrigin()[1],gz=bg.getOrigin()[2];
+        auto& bg=sg.getBlockGeometry(iC); const auto off=bridge::blockOffset(sg,iC);          // S1
+        const int gx=off[0],gy=off[1],gz=off[2];
         const int bnx=bg.getNx(),bny=bg.getNy(),bnz=bg.getNz();
         for(int x=0;x<bnx;++x)for(int y=0;y<bny;++y)for(int z=0;z<bnz;++z){
             int X=gx+x,Y=gy+y,Z=gz+z; if(X<0||X>=in.nx||Y<0||Y>=in.ny||Z<0||Z>=in.nz)continue;
@@ -378,7 +392,10 @@ inline double deposit(ADLat& ad, SuperGeometry<T,3>& sg, const ScalarInputs& in)
                 if(nm==MAT_WALL||nm==MAT_GROUND||nm==MAT_POROUS) vd=std::max(vd,in.vd[in.idx(xx,yy,zz)]); }
             if(vd<=0.f)continue;
             auto c=ab.get(x,y,z); T rho=c.computeRho();                                 // CONFIRM 1.8
-            T alpha=std::min<T>(1.0, 8.0*vd);   // α = 8·v_d_lb (half-way bounce-back closure)
+            // TODO(S2, Phase 6): vd is PHYSICAL m/s (voxelize.h:65) but the closure needs
+            // lattice units: alpha = 8*v_d_lb, v_d_lb = vd*dt/dx. At the current operating
+            // point dt/dx = 0.0125, so this over-deposits by 80x and inverts the mass budget.
+            T alpha=std::min<T>(1.0, 8.0*vd);   // alpha = 8*v_d_lb (half-way bounce-back closure)
             T removed=(alpha/8.0)*rho; c.defineRho(rho-removed);
             T acc=c.template getField<descriptors::DEPOSIT>(); c.template setField<descriptors::DEPOSIT>(acc+removed);
             dep+=removed; }
@@ -390,7 +407,8 @@ inline double deposit(ADLat& ad, SuperGeometry<T,3>& sg, const ScalarInputs& in)
 inline double accumulateTheta(ADLat& ad, SuperGeometry<T,3>& sg, const ScalarInputs& in, T dt_lb) {
     double airborne=0; auto& load=ad.getLoadBalancer();
     for(int iC=0;iC<load.size();++iC){ auto& ab=ad.getBlock(iC);
-        auto& bg=sg.getBlockGeometry(iC); const int gx=bg.getOrigin()[0],gy=bg.getOrigin()[1],gz=bg.getOrigin()[2];
+        auto& bg=sg.getBlockGeometry(iC); const auto off=bridge::blockOffset(sg,iC);          // S1
+        const int gx=off[0],gy=off[1],gz=off[2];
         const int bnx=bg.getNx(),bny=bg.getNy(),bnz=bg.getNz();
         for(int x=0;x<bnx;++x)for(int y=0;y<bny;++y)for(int z=0;z<bnz;++z){
             int X=gx+x,Y=gy+y,Z=gz+z; if(X<0||X>=in.nx||Y<0||Y>=in.ny||Z<0||Z>=in.nz)continue;
@@ -407,7 +425,8 @@ inline void gatherField(ADLat& ad, SuperGeometry<T,3>& sg, const ScalarInputs& i
                         int which /*0=THETA 1=DEPOSIT*/, std::vector<float>& out) {
     out.assign((size_t)in.nx*in.ny*in.nz, 0.f); auto& load=ad.getLoadBalancer();
     for(int iC=0;iC<load.size();++iC){ auto& ab=ad.getBlock(iC);
-        auto& bg=sg.getBlockGeometry(iC); const int gx=bg.getOrigin()[0],gy=bg.getOrigin()[1],gz=bg.getOrigin()[2];
+        auto& bg=sg.getBlockGeometry(iC); const auto off=bridge::blockOffset(sg,iC);          // S1
+        const int gx=off[0],gy=off[1],gz=off[2];
         const int bnx=bg.getNx(),bny=bg.getNy(),bnz=bg.getNz();
         for(int x=0;x<bnx;++x)for(int y=0;y<bny;++y)for(int z=0;z<bnz;++z){
             int X=gx+x,Y=gy+y,Z=gz+z; if(X<0||X>=in.nx||Y<0||Y>=in.ny||Z<0||Z>=in.nz)continue;
@@ -417,6 +436,7 @@ inline void gatherField(ADLat& ad, SuperGeometry<T,3>& sg, const ScalarInputs& i
     }
 }
 } // namespace step4
+#endif // ENABLE_STEP4
 
 // write Θ and deposition fields in the project 5-int format for Stage C (J = ⟨w,Θ⟩/|Ω|)
 static void writeField5(const std::string& fn,const std::vector<float>& d,int nx,int ny,int nz,double dx){
@@ -426,7 +446,7 @@ static void writeField5(const std::string& fn,const std::vector<float>& d,int nx
 
 // ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
-    olbInit(&argc, &argv);                                                           // CONFIRM 1.8
+    olb::initialize(&argc, &argv);                                                   // B1
     OstreamManager clout(std::cout,"urban_flow");
     const std::string GEOM = getenv("GEOM_DIR") ? getenv("GEOM_DIR") : "geom_out";
     const std::string OUT  = getenv("OUT_DIR")  ? getenv("OUT_DIR")  : "urban_flow_out";
@@ -453,17 +473,28 @@ int main(int argc, char* argv[]) {
     if (!preflight(converter) && !envi("FORCE",0)) { clout<<"aborting on preflight"<<std::endl; return 4; }
 
     // ── OpenLB geometry over an nx×ny×nz cuboid (1:1 with the imported map) ──
-    Vector<T,3> extent((T)nx*dx,(T)ny*dx,(T)nz*dx), origin(0,0,0);
-    IndicatorCuboid3D<T> cuboid(extent, origin);                                     // CONFIRM 1.8
+    // B2: CuboidGeometry3D was renamed CuboidDecomposition3D in 1.8.
+    // Also (2.4): the IndicatorCuboid3D + spacing ctor may yield nx or nx+1 nodes per axis,
+    // and everything downstream assumes exact 1:1 with the imported map. The explicit-extent
+    // ctor removes that ambiguity. Overlap raised 2 -> 3: the 1.8 default, and what
+    // interpolated boundaries plus WALE velocity gradients want.
+    Vector<T,3> origin(0,0,0);
 #ifdef PARALLEL_MODE_MPI
-    CuboidGeometry3D<T> cuboidGeometry(cuboid, dx, singleton::mpi().getSize());
+    const int noOfCuboids = singleton::mpi().getSize();
 #else
-    CuboidGeometry3D<T> cuboidGeometry(cuboid, dx, 1);
+    const int noOfCuboids = 1;
 #endif
-    HeuristicLoadBalancer<T> loadBalancer(cuboidGeometry);
-    SuperGeometry<T,3> superGeometry(cuboidGeometry, loadBalancer, 2);               // CONFIRM 1.8
+    CuboidDecomposition3D<T> cuboidDecomposition(origin, (T)dx, Vector<int,3>{nx,ny,nz}, noOfCuboids);
+    HeuristicLoadBalancer<T> loadBalancer(cuboidDecomposition);
+    SuperGeometry<T,3> superGeometry(cuboidDecomposition, loadBalancer, 3);
     bridge::stampSuperGeometry(superGeometry, mat);   // geometry bridge + sponge, applied
-    superGeometry.getStatistics().print();                                           // CONFIRM 1.8
+    superGeometry.getStatistics().print();
+
+    // Gate 5: OpenLB's own per-material voxel counts must equal the Stage-A histogram
+    // exactly (modulo the sponge cells carved out of FLUID). This one check catches the
+    // getOrigin() unit bug, any nx-vs-nx+1 off-by-one, and any overlap indexing error.
+    for (int m=0; m<=MAT_SPONGE; ++m)
+      clout << "GATE5 MAT " << m << " olb=" << superGeometry.getStatistics().getNvoxel(m) << std::endl;
 
     // ── verified ABL/RFG inlet ──
     gInlet.z0 = envd("ABL_Z0", 0.045); gInlet.d = 0.0; gInlet.wind_angle = WIND_DEG*M_PI/180.0;
@@ -506,6 +537,7 @@ int main(int argc, char* argv[]) {
     // ── snapshot the developed LIVE field for Stage C ──
     exportLiveFlow(sLattice, converter, superGeometry, nx, ny, nz, dx, OUT);
 
+#ifdef ENABLE_STEP4
     // ════════════════════════ STEP 4: live-flow burst transport ════════════════════════
     // Continue the LIVE flow and run the accidental burst over Ω on it (no frozen mean).
     ScalarInputs sin; sin.nx=nx; sin.ny=ny; sin.nz=nz; sin.dx=dx; sin.mat=mat.data;
@@ -558,6 +590,12 @@ int main(int argc, char* argv[]) {
         fprintf(mf,"burst_steps %d\nmass_emitted %.6e\nmass_deposited %.6e\nmass_drained %.6e\n",endStep,emit,dep,outflow);
         fprintf(mf,"deposited_frac %.4f\ntheta_layout 5xint32[nx,ny,nz,dx*1000,1]\n", emit>0?dep/emit:0.0);
         fprintf(mf,"# Stage C: J = (1/omega_cells) * sum_x receptor_w(x) * theta(x)\n"); fclose(mf);} }
+
+#else
+    clout << "urban_flow COMPLETE (airflow only; Step 4 off — rebuild with -DENABLE_STEP4). "
+          << "Wrote umean_full.f32 to " << OUT << "/" << std::endl;
+    return 0;
+#endif // ENABLE_STEP4
 
     clout << "urban_flow COMPLETE — live airflow + burst transport. Wrote umean_full.f32, "
           << "theta.f32, deposition.f32, exposure_timeseries.csv to " << OUT << "/  (Omega="

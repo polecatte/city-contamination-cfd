@@ -66,22 +66,40 @@ inline bool load_source_mask (const std::string& fn, GridField<uint8_t>& s){ ret
 // single cell is written with `superGeometry.set(iCglob, iX,iY,iZ, mat)` OR by iterating
 // the block geometries. The block-iteration idiom below is the portable one; check the
 // exact accessor names (`getBlockGeometry`, `getNblock`, `get(iX,iY,iZ)`) in the UG.
+// ── S1: the GLOBAL LATTICE OFFSET of a local block ───────────────────────────
+// BlockGeometry::getOrigin() returns the origin "in SI units (meter)", NOT lattice
+// indices. Truncating it to int makes every global index wrong by a factor of ~1/dx
+// (at dx=4 m, 4x). In a single-cuboid serial run the origin is (0,0,0) so it accidentally
+// works, then silently corrupts the moment the run goes MPI or multi-block. The offset
+// must come from the mother cuboid's lattice mapping.
+//
+// This is the ONLY place the conversion is written. Every block loop in urban_flow.cpp
+// calls it, so if an accessor name differs in your tree there is one site to fix.
+template <class SSTRUCT>
+inline olb::LatticeR<3> blockOffset(SSTRUCT& s, int iC) {
+    auto& cd = s.getCuboidDecomposition();                        // B2: was CuboidGeometry3D
+    const int iCglob = s.getLoadBalancer().glob(iC);
+    return cd.getMotherCuboid().getLatticeR(cd.get(iCglob).getOrigin());
+}
+
 template <class SGEOM>
 inline void stampSuperGeometry(SGEOM& superGeometry, const GridField<int32_t>& m) {
     auto& load = superGeometry.getLoadBalancer();
-    for (int iC = 0; iC < load.size(); ++iC) {                    // CONFIRM 1.8: local cuboids
-        auto& block = superGeometry.getBlockGeometry(iC);         // CONFIRM 1.8
-        const int gx0 = block.getOrigin()[0];                     // CONFIRM 1.8: global offset of this block
-        const int gy0 = block.getOrigin()[1];
-        const int gz0 = block.getOrigin()[2];
-        const int bnx = block.getNx(), bny = block.getNy(), bnz = block.getNz();  // CONFIRM 1.8
+    for (int iC = 0; iC < load.size(); ++iC) {
+        auto& block = superGeometry.getBlockGeometry(iC);
+        const auto off = blockOffset(superGeometry, iC);           // S1
+        const int gx0 = off[0], gy0 = off[1], gz0 = off[2];
+        const int bnx = block.getNx(), bny = block.getNy(), bnz = block.getNz();
         for (int x=0; x<bnx; ++x) for (int y=0; y<bny; ++y) for (int z=0; z<bnz; ++z) {
             int X=gx0+x, Y=gy0+y, Z=gz0+z;
             if (X<0||X>=m.nx||Y<0||Y>=m.ny||Z<0||Z>=m.nz) continue;
-            block.get(x,y,z) = m.data[m.idx(X,Y,Z)];              // CONFIRM 1.8: material write
+            block.set({x,y,z}, m.data[m.idx(X,Y,Z)]);             // B7: get() returns int by value
         }
     }
-    superGeometry.updateStatistics();                             // CONFIRM 1.8
+    superGeometry.updateStatistics();
+    // 2.4: without this, halo material numbers stay unstamped, so any neighbour test near a
+    // block edge is wrong under MPI.
+    superGeometry.communicate();
 }
 #endif // URBAN_FLOW_WITH_OPENLB
 
