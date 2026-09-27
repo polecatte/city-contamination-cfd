@@ -9,7 +9,7 @@ Reads Stage A's material_map.dat, replays urban_flow.cpp's carve_sponge() on the
 array exactly as the solver does, and prints the histogram OpenLB's
 superGeometry.getStatistics().getNvoxel(m) must reproduce.
 
-  python3 tests/gate5_expect.py geom_out [SPONGE_CELLS] [WIND_DEG] [SPONGE_BUFFER]
+  python3 tests/gate5_expect.py geom_out [SPONGE_CELLS] [WIND_DEG]
 """
 import sys, struct, collections
 
@@ -19,30 +19,35 @@ def main():
     d      = sys.argv[1] if len(sys.argv) > 1 else "geom_out"
     nsp    = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     wind   = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
-    buf    = int(sys.argv[4]) if len(sys.argv) > 4 else 0   # SPONGE_BUFFER
     with open(f"{d}/material_map.dat", "rb") as f:
         nx, ny, nz, dxm, ncomp = struct.unpack("<5i", f.read(20))
         mat = list(struct.unpack(f"<{nx*ny*nz}i", f.read(4*nx*ny*nz)))
     idx = lambda x, y, z: z*ny*nx + y*nx + x
     pre = collections.Counter(mat)
 
-    # carve_sponge(): wind-aligned band of FLUID cells before the outlet face
+    # carve_sponge(): wind-aligned band, eroded so no sponge cell touches a boundary plane
     wd = wind % 360.0
-    if wd < 45 or wd >= 315:  rng = [(x, y, z) for z in range(nz) for y in range(ny) for x in range(nx-buf-nsp, nx-buf)]
-    elif wd < 135:            rng = [(x, y, z) for z in range(nz) for x in range(nx) for y in range(ny-buf-nsp, ny-buf)]
-    elif wd < 225:            rng = [(x, y, z) for z in range(nz) for y in range(ny) for x in range(buf, buf+nsp)]
-    else:                     rng = [(x, y, z) for z in range(nz) for x in range(nx) for y in range(buf, buf+nsp)]
-    carved = 0
-    for x, y, z in rng:
-        i = idx(x, y, z)
-        if mat[i] == MAT_FLUID:
-            mat[i] = MAT_SPONGE; carved += 1
+    if wd < 45 or wd >= 315: rng = [(x,y,z) for z in range(nz) for y in range(ny) for x in range(nx-nsp, nx)]
+    elif wd < 135:           rng = [(x,y,z) for z in range(nz) for x in range(nx) for y in range(ny-nsp, ny)]
+    elif wd < 225:           rng = [(x,y,z) for z in range(nz) for y in range(ny) for x in range(nsp)]
+    else:                    rng = [(x,y,z) for z in range(nz) for x in range(nx) for y in range(nsp)]
+    D = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
+    def eligible(x, y, z):
+        if mat[idx(x,y,z)] != MAT_FLUID: return False
+        for dx, dy, dz in D:
+            xx, yy, zz = x+dx, y+dy, z+dz
+            if not (0 <= xx < nx and 0 <= yy < ny and 0 <= zz < nz): return False
+            if mat[idx(xx,yy,zz)] != MAT_FLUID: return False
+        return True
+    pick = [idx(x,y,z) for (x,y,z) in rng if eligible(x,y,z)]
+    for i in pick: mat[i] = MAT_SPONGE
+    carved = len(pick)
 
     post = collections.Counter(mat)
     names = {0:"VOID",1:"FLUID",2:"WALL",3:"INLET",4:"OUTLET",5:"SLIP",6:"POROUS",
              7:"GROUND",8:"SPONGE",9:"FRAME"}
     print(f"grid {nx}x{ny}x{nz}  dx={dxm/1000.0:.3f}  total={nx*ny*nz}")
-    print(f"sponge: {nsp} cells at wind {wind:g} deg, buffer {buf} -> {carved} FLUID cells converted\n")
+    print(f"sponge: {nsp} cells at wind {wind:g} deg, eroded -> {carved} FLUID cells converted\n")
     print(f"{'MAT':>3} {'name':<7} {'stage A':>10} {'after carve':>12}   <- GATE5 must equal this")
     for m in range(10):
         print(f"{m:>3} {names[m]:<7} {pre.get(m,0):>10} {post.get(m,0):>12}")

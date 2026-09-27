@@ -216,6 +216,23 @@ so the frame handed the next ring of face cells a second outside neighbour. The 
 inward by one cell rather than going away: 337 inlet, 337 outlet and 1 370 slip cells were
 still edges or corners.
 
+**The second condition: the inward neighbour must be material 1.** Fixing the frame let the
+inlet through and the outlet then failed identically, which isolated a rule the outside-count
+does not capture. `getType` takes a **fluid** indicator as well as an outside one, and it wants
+`MAT_FLUID` specifically in the inward direction — a neighbour carrying bulk dynamics under
+some other material number is not enough. The inlet's inward neighbour was fluid; the outlet's
+was `MAT_SPONGE`, because the C5 absorbing band is carved right up against the outlet by
+design. All 14 355 outlet cells failed, and 2 373 slip cells would have followed, since the
+band spans the full cross-section and touches the lateral faces.
+
+So **`MAT_SPONGE` must stay one cell clear of every boundary plane.** `carve_sponge` now admits
+a cell only if it *and all six of its neighbours* are `MAT_FLUID` — an erosion rather than index
+arithmetic. That arithmetic was got wrong twice: the outlet plane occupies `x=nx-1`, so a band
+ending at `nx-buf` still reaches it, and the lateral faces need the same clearance in `y` and
+`z`. The erosion needs no special cases and is correct for any wind direction. It costs the
+band its outermost shell — 83 130 sponge cells instead of 100 485 — which is immaterial to an
+absorbing layer whose job is graded dissipation over 8 cells.
+
 **The rule that works.** A cell belongs to exactly one domain face. Zero faces is interior.
 One face takes that face's material. **Two or more — the 12 box edges and 8 corners — becomes
 `MAT_FRAME` (9), a solid no-slip material that is neither fluid nor material 0.** With the
@@ -239,6 +256,7 @@ type pass and the overlay only reclassifies `MAT_FLUID`.
 | 5 SLIP | 59 675 | **59 325** |
 | 6 POROUS | 4 725 | 4 725 |
 | 7 GROUND | 29 559 | 29 559 |
+| 8 SPONGE (solver-local) | 100 485 | **83 130** |
 | 9 FRAME | — | **1 032** |
 
 The fourth identity becomes `fluid+in+out+slip+frame = FLUID`, since the frame was carved out
@@ -258,7 +276,10 @@ and the defect is in adjacency. It also took three attempts to diagnose, two of 
 because the error message is generic and the real precondition lives in a template dispatch
 table in the library. The lesson for the rest of the port: read the library's own source for
 the failing precondition before theorising from the outside — one grep of
-`setBoundary3D.h` settled what two rounds of plausible reasoning did not. A validated community solver is stricter than a bespoke one
+`setBoundary3D.h` settled what two rounds of plausible reasoning did not. And instrument before
+theorising: announcing each `boundary::set` call with its material number turned an anonymous
+abort into a controlled comparison — inlet passing while outlet failed on identical geometry is
+what isolated the material-1 condition. A validated community solver is stricter than a bespoke one
 in ways that are not predictable in advance — that strictness is part of what the migration
 buys, and this is the first instance of it paying out. It also argues for keeping Gate 5
 (OpenLB's own per-material voxel counts) permanently rather than treating it as a one-off:

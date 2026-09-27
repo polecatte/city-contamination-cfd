@@ -98,27 +98,44 @@ static abl::ABLInlet gInlet;   // built in main, referenced in setBoundaryValues
 
 // ─────────────────────────────────────────────────────────────────────────────
 // (C5) Carve a sponge band out of the fluid cells adjacent to the outlet face, on the
-// HOST material array before stamping. Wind-aligned: default +x → band at
-// x∈[nx-buf-n, nx-buf), i.e. SPONGE_BUFFER fluid cells short of the outlet plane.
+// HOST material array before stamping. Wind-aligned: default +x → band at x∈[nx-n,nx),
+// eroded by one cell so it never touches a boundary plane (see the note in the body).
 // Solver-local (MAT_SPONGE); the geometry bridge stays pure geometry.
 // ─────────────────────────────────────────────────────────────────────────────
 static void carve_sponge(bridge::GridField<int32_t>& m, double wind_deg, int nSponge) {
     if (nSponge <= 0) return;
     const int nx=m.nx, ny=m.ny, nz=m.nz;
     double wd = std::fmod(wind_deg,360.0); if (wd<0) wd+=360.0;
-    auto mark=[&](int x,int y,int z){ size_t i=m.idx(x,y,z); if(m.data[i]==MAT_FLUID) m.data[i]=MAT_SPONGE; };
-    // SPONGE_BUFFER cells of FLUID may be left between the band and the outlet plane.
-    // Default 0 (band flush against the outlet, the original C5 placement). This was briefly
-    // defaulted to 1 while chasing "Could not set Boundary", on the theory that the outlet's
-    // inward neighbour being MAT_SPONGE blocked normal derivation; the real cause was
-    // material 0 in the box frame (OPENLB_MIGRATION_PLAN.md 6.4) and the outlet was never
-    // reached. Kept as a knob since the sponge/outlet interface is worth a look at Gate 6a,
-    // but not defaulted on for a reason that turned out to be wrong.
-    const int buf = envi("SPONGE_BUFFER", 0);
-    if (wd < 45 || wd >= 315) for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=nx-buf-nSponge;x<nx-buf;++x) mark(x,y,z); // +x
-    else if (wd < 135)        for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=ny-buf-nSponge;y<ny-buf;++y) mark(x,y,z); // +y
-    else if (wd < 225)        for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=buf;x<buf+nSponge;++x)       mark(x,y,z); // -x
-    else                      for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=buf;y<buf+nSponge;++y)      mark(x,y,z); // -y
+    static const int dn[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+    // A cell joins the sponge only if IT AND ALL SIX NEIGHBOURS are MAT_FLUID, which keeps
+    // MAT_SPONGE one cell clear of every domain boundary plane. OpenLB's
+    // BlockGeometryStatistics3D::getType needs a boundary cell's inward neighbour to be
+    // MAT_FLUID (1) specifically -- bulk dynamics on some other material is not enough -- so a
+    // sponge cell abutting the outlet or a lateral slip face makes that boundary unsettable
+    // ("Could not set Boundary"). See OPENLB_MIGRATION_PLAN.md 6.4.
+    //
+    // Written as an erosion rather than index arithmetic because the arithmetic version was
+    // wrong twice: the outlet plane occupies x=nx-1, so a band ending at nx-buf still reaches
+    // it, and the lateral slip faces need the same clearance in y and z. The erosion is
+    // correct for any wind direction and any face layout without special cases.
+    auto eligible=[&](int x,int y,int z)->bool{
+        if (m.data[m.idx(x,y,z)] != MAT_FLUID) return false;
+        for (int d=0; d<6; ++d) {
+            const int xx=x+dn[d][0], yy=y+dn[d][1], zz=z+dn[d][2];
+            if (xx<0||xx>=nx||yy<0||yy>=ny||zz<0||zz>=nz) return false;
+            if (m.data[m.idx(xx,yy,zz)] != MAT_FLUID) return false;
+        }
+        return true;
+    };
+    // Two passes: eligibility is judged against the ORIGINAL map, so an earlier mark in the
+    // same band cannot disqualify its neighbour.
+    std::vector<size_t> pick;
+    auto mark=[&](int x,int y,int z){ if (eligible(x,y,z)) pick.push_back(m.idx(x,y,z)); };
+    if (wd < 45 || wd >= 315) for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=nx-nSponge;x<nx;++x)  mark(x,y,z); // +x
+    else if (wd < 135)        for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=ny-nSponge;y<ny;++y)  mark(x,y,z); // +y
+    else if (wd < 225)        for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nSponge;++x)      mark(x,y,z); // -x
+    else                      for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=0;y<nSponge;++y)      mark(x,y,z); // -y
+    for (size_t k : pick) m.data[k] = MAT_SPONGE;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
