@@ -172,6 +172,85 @@ to the same drag (C_d≈0.2, LAD≈1) — a calibration task, not a research one
 grid (rather than via STL) so the new solid/porous/ground classification matches the old
 voxelization cell-for-cell.
 
+### 6.4 One face per cell — domain-boundary adjacency
+
+**This was not anticipated and it is worth stating at length, because it is the first place
+the migration exposed a latent defect in geometry that had always passed its own gate.**
+
+The custom solver applied boundary conditions per material number and never needed to know
+which way a boundary faced. Bounce-back is direction-agnostic, and the old inlet wrote a
+prescribed profile onto whatever cells carried `MAT_INLET`. So the material map only ever
+had to be a correct *census*: every cell classified exactly once, sums reconciling against
+the voxelizer. It was, and Stage A's gate proves it.
+
+OpenLB's interpolated and slip boundaries need more than a census. Each boundary cell must
+have a well-defined discrete inward normal, which OpenLB derives from the cell's material
+neighbourhood: it looks for the direction in which the bulk fluid lies. A boundary cell with
+no bulk-fluid neighbour has no derivable normal, and `boundary::set<>` refuses with
+`std::runtime_error: Could not set Boundary`.
+
+The original overlay produced exactly that. It ran three passes in sequence — inlet/outlet
+on the wind-aligned faces, then the lateral faces, then the top — each claiming any cell
+still marked `MAT_FLUID`. Because the inlet pass ran first and swept its entire plane, it
+claimed the two columns where the `x=0` plane meets the lateral slip planes at `y=0` and
+`y=ny-1`. Those cells are on the inlet, but every neighbour of theirs is another boundary
+cell: `+x` is SLIP, not fluid. The same happened mirrored at the outlet, and along the seam
+where the top face meets the lateral faces. At the default operating point:
+
+| material | orphaned cells | location |
+|---|---|---|
+| 3 INLET | 341 | `x=0`, columns `y=0` and `y=ny-1` |
+| 4 OUTLET | 341 | `x=nx-1`, same columns |
+| 5 SLIP | 350 | `z=nz-1` top, seams along `y=0` and `y=ny-1` |
+
+1 032 cells out of 2.63 M — 0.04 % — and the run aborted on the first of them.
+
+**The rule now: a cell belongs to exactly one domain face.** `build_material_map` counts how
+many of the six faces a cell lies on. Zero means interior. One means the cell takes that
+face's material — INLET, OUTLET, or SLIP. **Two or more means the cell is on a box edge or
+corner, and it becomes `MAT_DONOTHING`.**
+
+Assigning the edges to no-dynamics is not a workaround, it is the physically correct answer.
+A cell on two domain faces has no unique inward normal *by construction* — that is a property
+of the box, not of the discretization. And such a cell touches no fluid cell at all, so it
+cannot exchange populations with the flow and cannot influence the solution regardless of
+what dynamics it carries. Giving it no dynamics says exactly that. The alternative readings
+are worse: an arbitrary normal is a fabricated boundary condition, and leaving it as bulk
+fluid puts an unconstrained cell outside the domain's boundary.
+
+The bottom edges need no special handling: `z=0` is `MAT_GROUND` from the type pass, and the
+overlay only reclassifies cells still marked `MAT_FLUID`.
+
+**Consequences for Stage A's gate.** Three counts change, and the fourth reconciliation
+identity changes shape:
+
+| | before | after |
+|---|---|---|
+| MAT 0 DONOTHING | 0 | **1 032** |
+| MAT 3 INLET | 14 696 | **14 355** |
+| MAT 4 OUTLET | 14 696 | **14 355** |
+| MAT 5 SLIP | 59 675 | **59 325** |
+| identity 4 | `fluid+inlet+outlet+slip = FLUID` | `fluid+in+out+slip+donothing = FLUID` |
+
+The edge cells were carved out of fluid, so they belong on the fluid side of that identity.
+FLUID, WALL, POROUS and GROUND are untouched, all five identities still PASS, and `Ω` stays
+22 812 — the source mask is ground-level and never touched a domain face.
+
+**Why change Stage A rather than the solver.** The alternative was to leave the map alone and
+have `prepareLattice` set boundaries on a trimmed indicator. That works, but it puts the
+solver's boundary layout permanently out of step with the material map, which is the one
+artefact a reviewer can inspect directly — and it leaves a map that is wrong in a way that
+only shows up in a solver nobody has run yet. Re-baselining the Gate 3 reference numbers is
+a one-time cost paid while the numbers are cheap; explaining a standing discrepancy is not.
+
+**What this says about the migration.** The defect was latent in the geometry for the entire
+life of the custom solver and its own gate could not see it, because the gate checks counts
+and the defect is in adjacency. A validated community solver is stricter than a bespoke one
+in ways that are not predictable in advance — that strictness is part of what the migration
+buys, and this is the first instance of it paying out. It also argues for keeping Gate 5
+(OpenLB's own per-material voxel counts) permanently rather than treating it as a one-off:
+it is the only check that sees the geometry the way the solver does.
+
 ## 7. Sequencing (each step gated by a test before the next)
 
 1. **Environment.** Confirm/instal OpenLB 1.8 on the A4000 (GPU build) and a CPU build in

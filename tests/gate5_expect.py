@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """gate5_expect.py — expected per-material voxel counts for Gate 5.
 
+Reflects the one-face-per-cell rule (OPENLB_MIGRATION_PLAN.md 6.4): box edges and
+corners are MAT_DONOTHING, so INLET/OUTLET/SLIP are smaller than the pre-fix figures
+and MAT 0 is no longer zero.
+
 Reads Stage A's material_map.dat, replays urban_flow.cpp's carve_sponge() on the host
 array exactly as the solver does, and prints the histogram OpenLB's
 superGeometry.getStatistics().getNvoxel(m) must reproduce.

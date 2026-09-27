@@ -38,9 +38,9 @@ worse than a crash.
 
 ```
 gen_openlb_geom (dx=4 m)  → 177×167×89 = 2 630 751 cells
-  MAT 1 fluid 2 445 872 · 2 wall 61 528 · 3 inlet 14 696 · 4 outlet 14 696
-  5 slip 59 675 · 6 porous 4 725 · 7 ground 29 559        Ω = 22 812
-  all 5 reconciliation identities PASS · exit 0
+  MAT 1 fluid 2 445 872 · 2 wall 61 528 · 3 inlet 14 355 · 4 outlet 14 355
+  5 slip 59 325 · 6 porous 4 725 · 7 ground 29 559        Ω = 22 812
+  all 5 reconciliation identities PASS (identity 4 now fluid+in+out+slip+donothing) · exit 0
 geometry_loader selftest  → round-trips every count · SELFTEST OK
 abl_inlet_verify          → log-law 0.10% [PASS] · div 5.2% · σ 6.8% low · deterministic
 ```
@@ -258,8 +258,8 @@ g++ -O2 -std=c++17 -DGEOMLOADER_SELFTEST -x c++ geometry_loader.h -o geomloader_
 **Gate 3 (exact numbers to match — I reproduced these today on a clean tree):**
 
 ```
-2 630 751 cells · fluid 2 445 872 · wall 61 528 · inlet 14 696 · outlet 14 696
-slip 59 675 · porous 4 725 · ground 29 559 · Ω 22 812 · all identities PASS · exit 0
+2 630 751 cells · fluid 2 445 872 · wall 61 528 · inlet 14 355 · outlet 14 355
+slip 59 325 · porous 4 725 · ground 29 559 · Ω 22 812 · all identities PASS · exit 0
 ```
 
 Any deviation means a compiler/environment difference, not a code change — chase it now
