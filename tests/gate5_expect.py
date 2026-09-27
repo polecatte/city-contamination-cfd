@@ -25,22 +25,31 @@ def main():
     idx = lambda x, y, z: z*ny*nx + y*nx + x
     pre = collections.Counter(mat)
 
-    # carve_sponge(): wind-aligned band, eroded so no sponge cell touches a boundary plane
+    # carve_sponge(): erosion, matching urban_flow.cpp. A cell joins the sponge only if IT
+    # AND ALL SIX NEIGHBOURS are MAT_FLUID, keeping MAT_SPONGE one cell clear of every domain
+    # boundary plane -- OpenLB needs a boundary cell's inward neighbour to be MAT_FLUID
+    # specifically. Eligibility is judged against the ORIGINAL map, so an earlier mark in the
+    # same band cannot disqualify its neighbour.
+    dn = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
+    def eligible(x, y, z):
+        if mat[idx(x,y,z)] != MAT_FLUID:
+            return False
+        for ddx, ddy, ddz in dn:
+            xx, yy, zz = x+ddx, y+ddy, z+ddz
+            if not (0 <= xx < nx and 0 <= yy < ny and 0 <= zz < nz):
+                return False
+            if mat[idx(xx,yy,zz)] != MAT_FLUID:
+                return False
+        return True
+
     wd = wind % 360.0
     if wd < 45 or wd >= 315: rng = [(x,y,z) for z in range(nz) for y in range(ny) for x in range(nx-nsp, nx)]
     elif wd < 135:           rng = [(x,y,z) for z in range(nz) for x in range(nx) for y in range(ny-nsp, ny)]
     elif wd < 225:           rng = [(x,y,z) for z in range(nz) for y in range(ny) for x in range(nsp)]
     else:                    rng = [(x,y,z) for z in range(nz) for x in range(nx) for y in range(nsp)]
-    D = ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1))
-    def eligible(x, y, z):
-        if mat[idx(x,y,z)] != MAT_FLUID: return False
-        for dx, dy, dz in D:
-            xx, yy, zz = x+dx, y+dy, z+dz
-            if not (0 <= xx < nx and 0 <= yy < ny and 0 <= zz < nz): return False
-            if mat[idx(xx,yy,zz)] != MAT_FLUID: return False
-        return True
     pick = [idx(x,y,z) for (x,y,z) in rng if eligible(x,y,z)]
-    for i in pick: mat[i] = MAT_SPONGE
+    for i in pick:
+        mat[i] = MAT_SPONGE
     carved = len(pick)
 
     post = collections.Counter(mat)
