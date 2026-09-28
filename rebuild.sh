@@ -3,7 +3,7 @@
 # The app directory holds symlinks into this repo, so a pull is all the update needed.
 set -euo pipefail
 : "${OLB_ROOT:?OLB_ROOT is not set}"
-BRANCH="${BRANCH:-claude/charming-allen-8pfsrc}"
+BRANCH="${BRANCH:-claude/gracious-lovelace-3wlllj}"
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP="$OLB_ROOT/examples/urban/urban_flow"
 
