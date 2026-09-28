@@ -12,8 +12,8 @@ them to round-off apart from thread-order effects in the time means.
 |---|---|---|
 | 3 | Stage A geometry, clean rebuild | ✅ counts identical to `OPENLB_PORT_STATUS…` §3 |
 | 5 | OpenLB's own voxel counts = Stage A (+ sponge carve) | ✅ exact, all 10 materials |
-| 6a | ABL drift inlet → city face < 10 % | ✅ **9.4 %** — after two fixes (§4); bounce-back floor was 42.7 % |
-| 6a′ | peak lattice \|u\| < 0.1 throughout | ❌ **0.14–0.15** at the default operating point (§6) |
+| 6a | ABL drift inlet → city face < 10 % | ⚠️ **10.9 %** at the new default operating point (9.4 % at the old one); ≤ 7 % from ¼ L on (§4, §6) |
+| 6a′ | peak lattice \|u\| < 0.1 throughout | ✅ **0.090** at the new default (τ 0.505, uLB 0.032); was 0.14–0.15 (§6) |
 | 6b | cube reattachment Xr/H ∈ 1.4–1.8 | ❌ **2.60** (τ 0.51), **2.66** (τ 0.505) — not a viscosity effect (§5) |
 | 7a | scalar mass budget closes < 1 % | ✅ **5e-11** (measured flux, not inferred) |
 | 7b | linearity Θ_{a+b} = Θ_a + Θ_b | ✅ L2 **3.2e-8**, max pointwise **3.6e-6** |
@@ -83,6 +83,7 @@ mean over the last 2. Drift = max_z |U_x(z) − U_inlet(z)| / U_inlet(40 m), lat
 | bounce-back / slip lid | **42.7 %** | 50.9 % | 53.2 % | 53.1 % | 3.88 → 0.67 m/s |
 | RoughWall / slip lid | 10.8 % (at z = 348 m) | 9.7 % | 8.5 % | 9.0 % | 3.88 → 3.90 |
 | RoughWall / TopStress | **9.4 %** (at z = 348 m) | 4.4 % | 4.5 % | 3.9 % | 3.88 → 3.88 |
+| same, new operating point (§6) | **10.9 %** (z = 348 m; 10.3 % at z ≤ 100 m) | 7.0 % | 5.1 % | 4.1 % | 3.88 → 3.78 |
 
 - **Bounce-back fails as the audit feared** (option 1 measured, fails). A no-slip wall one 4 m
   cell from the flow imposes a laminar stress ~ν·U₁/(dx/2), an order of magnitude above ρu*².
@@ -142,10 +143,19 @@ The one free choice at fixed dx is the split between τ and the lattice velocity
   the two cube runs show Xr is insensitive to, so meeting the Mach condition should not cost
   6b anything. It costs ~1.5× wall time.
 
-Options: (a) `LATTICE_U=0.034 TAU=0.505` as the new default — the conservative one;
-(b) keep uLB 0.05 and accept Ma ≈ 0.25 in the fastest cells, which are aloft rather than in
-the street canyons that set J (compressibility error O(Ma²) ≈ 6 % there). Your call; the
-defaults are unchanged.
+**Decided (2026-09-28): `TAU=0.505`, `LATTICE_U=0.032` are the defaults** — the more physical
+choice on both axes: lower Mach and 22 % less added viscosity (ν_eff 0.83 vs 1.07 m²/s). The
+city's measured peak ratio is 3.06, hence 0.032 rather than 0.034. dt = 0.032 s, 1.56× the
+steps per flow-through.
+
+Measured at the new point: peak |u|_lb **0.090** on the 6a fetch (6a′ passes); 7a/7b/7c all
+still pass on the box (closure 1.4e-11, deposition −10.4 % vs reference, linearity holds).
+The cost is at the city face: drift 10.9 % (9.4 % before). The deficit is the inlet-adjustment
+zone — U(4 m) dips 3.88 → 3.25 m/s at 40 m, then recovers to 3.72 / 3.78 / 3.86 at ¼, ½, ¾ L —
+and a less viscous flow adjusts over a sharper, deeper dip. The city face sits inside it
+because `BUF_UP` is 40 m. Drift is ≤ 7 % from 176 m on, so an upstream buffer of ~150 m would
+clear the gate. (COST 732 asks 5 H_max upstream, 440 m here.) Not changed: it also moves the
+start of Ω, so it is a metric decision as much as a domain one.
 
 ## 7. Phase 6 — scalar + deposition (Step 4)
 
@@ -182,7 +192,10 @@ an accuracy term to carry in the error budget, not a correctness defect.
 
 ## 8. Gate 8 — city end-to-end
 
-The production city (177 × 167 × 89, dx = 4 m), default operating point, rough wall + top
+*These runs predate §6's operating-point change and §9's 15 H domain; they are the evidence
+that motivated both. The lab box reruns Gate 8 on the new domain.*
+
+The production city (177 × 167 × 89, dx = 4 m), then-default operating point, rough wall + top
 stress, 3 flow-through spin-up, then the burst over Ω (2 s pulse) riding the live flow. Two
 runs differing only in the inlet seed (`ABL_SEED` 1000, 2000).
 
@@ -213,21 +226,45 @@ output): street-canyon speeds are 0–6 m/s at the first cell with near-stagnant
 expected; and near-ground flow is *reversed* over the last ~100 m before the outlet. The city's
 own wake reaches the outlet because the downstream buffer is 70 m (`BUF_DOWN`, inherited from
 forward_city) against COST 732's ~15H. It does not break the budget (measured outflow stays
-positive), but it is a domain-sizing question worth revisiting before production rankings.
+positive); §9 extends the buffer to 15 H.
 
-## 9. What I would do next
+## 9. Production domain: 15 H downstream
 
-1. **Gate 6b.** Run the cube at dx = 2 m (H/dx = 20) on the lab box (`DX=2 CUBE_H=20
-   CASE=cube ./gen_gate6_geom`). Inflow turbulence is measured and ruled out as the main cause
-   (§5), so resolution is the test that decides it.
-2. **Mach.** Pick the operating point (§6). `LATTICE_U=0.034 TAU=0.505` meets peak < 0.1.
-3. **Gate 8 to full clearance**, same two seeds, on the lab box.
+`gen_openlb_geom` now defaults `BUF_DOWN` to **15 × 88 m = 1 320 m** (88 m is the production
+city's tallest building at the default knobs), a named constant rather than 15 × maxH of each
+design: a domain that resizes with the design would make J step-discontinuous across designs.
+It warns if a design is taller. The grid grows from 177 × 167 × 89 to **490 × 167 × 89**
+(7.28 M cells, 2.8×). Two consequences, both handled:
+
+- **Ω must not grow with the domain.** Stage A's rule (every open ground cell) turned the new
+  buffer into release area: 75 083 cells instead of 22 812, which would dilute J with releases
+  that never cross the city. Ω is now capped at the old footprint (`OMEGA_DOWN` = 70 m past the
+  city). Checked: `source_mask.u8`, `receptor_w.f32`, `material_map.dat` and `dep_vel.f32` are
+  cell-for-cell identical to the old domain over the shared region, and Ω and w are empty
+  beyond it. Gate 5 is exact on the new map.
+- **Cost.** 3 flow-throughs are now 45 939 steps (longer domain, smaller dt): ~7.7 h per
+  spin-up on the 4-core container, so the wake check runs on the lab box (`lab_openlb.sh`
+  gate `wake`: < 2 % reversed near-ground flow over the last 15 % of x; the old 70 m domain
+  measures 68.9 % and fails it).
+
+Small tests (`gen_gate6_geom`: abl, cube, box) are unaffected.
+
+## 10. What I would do next
+
+`./lab_openlb.sh all` on the lab box runs items 1–3 (runbook: `LAB_RUNBOOK_OPENLB.md`).
+
+1. **Gate 6b.** The cube at dx = 2 m (H/dx = 20). Inflow turbulence is measured and ruled out as
+   the main cause (§5), so resolution is the test that decides it.
+2. **Gate 8 to full clearance** on the 15 H production domain, two seeds, plus the wake check.
+3. **Upstream buffer** (§6): decide whether to lengthen `BUF_UP` to clear 6a at the city face.
 4. **Phase 8 (GPU).** Every host operator added here — `VeloGradRefresh`, `RoughWall`,
    `TopStress`, the Step-4 inject/deposit/accumulate/flux loops — is a per-cell loop with no
    cross-cell writes (the specular remap reads a snapshot), so each maps onto an OpenLB
    post-processor one-to-one. That is the G2 rewrite, now with a known list.
 
-## 10. Reproduce
+## 11. Reproduce
+
+All of this is scripted in `lab_openlb.sh`; the manual equivalent:
 
 ```bash
 export OLB_ROOT=…/release-1.8.1 && ./olbconfig.sh cpu-mt && (cd $OLB_ROOT && make -C external)

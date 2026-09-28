@@ -941,12 +941,17 @@ int main(int argc, char* argv[]) {
     // at 0.5000001. At grid scale the resolved flow has no molecular viscosity to speak of;
     // what the lattice carries is a BACKGROUND eddy viscosity, on top of which WALE adds its
     // local nu_t. So nu is NU_EFF, derived by default from the target lattice velocity:
-    //     nu_eff = (tau-0.5)/3 * dx * U / uLB          (dx=4, U=4, tau=0.51, uLB=0.05 -> 1.07)
+    //     nu_eff = (tau-0.5)/3 * dx * U / uLB      (dx=4, U=4, tau=0.505, uLB=0.032 -> 0.83)
     // which is the same order as the neutral-ABL eddy viscosity kappa*u*z at z ~ 10 m. Set
     // NU_EFF to fix it directly instead; the preflight then reports the uLB it implies.
+    //
+    // Defaults (OPENLB_PHASE5_6_GATES.md §6): tau at the 0.505 floor for the least added
+    // viscosity, and uLB_ref = 0.032 because the measured PEAK lattice speed is ~3.1x uLB_ref
+    // (log-law top + resolved fluctuation; 0.153 on the city at 0.05) and must stay < 0.1.
+    // The earlier 0.51 / 0.05 ran at peak Ma ~ 0.26 with 30 % more viscosity.
     const T U_INLET = envd("U_INLET", 4.0), Z_REF = envd("ABL_ZREF", 4.0);
-    const T TAU     = envd("TAU", 0.51);
-    const T U_LB    = envd("LATTICE_U", 0.05);
+    const T TAU     = envd("TAU", 0.505);
+    const T U_LB    = envd("LATTICE_U", 0.032);
     const T NU_EFF  = envd("NU_EFF", (TAU-0.5)/3.0 * dx * U_INLET / U_LB);
     const T charL   = (T)(nz*dx);
     UnitConverterFromResolutionAndRelaxationTime<T,DESCRIPTOR> converter(

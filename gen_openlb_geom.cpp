@@ -9,8 +9,8 @@
 // It prints the voxel summary and the material-map reconciliation, which is the Step-2
 // gate ("material counts match the old voxelizer").
 //
-// The city-build knobs mirror forward_city.cpp's defaults exactly so the two produce the
-// SAME geometry; every knob is env-overridable. Grid resolution is the compile-time
+// The city-build knobs mirror forward_city.cpp's defaults (except BUF_DOWN, see below) so
+// the city itself is the SAME; every knob is env-overridable. Grid resolution is the compile-time
 // CELL_SIZE_M (build with -DCELL_SIZE_M=2.0 to match the coarse production run).
 //
 // Build:  g++ -O3 -std=c++17 -DCELL_SIZE_M=4.0 gen_openlb_geom.cpp -o gen_openlb_geom
@@ -39,7 +39,15 @@ int main(){
     const double CITY_M = envd("CITY_M", 600.0);
     const double POP    = envd("POP",   20000.0);
     const double BUF_UP    = envd("BUF_UP",    40.0);
-    const double BUF_DOWN  = envd("BUF_DOWN",  70.0);
+    // Downstream buffer: 15 x the tallest building (COST 732, Franke et al. 2007) so the
+    // city's wake closes before the outlet. At 70 m (inherited from forward_city) the near-
+    // ground flow was reversed over the last ~100 m, i.e. the wake reached the pressure
+    // outlet. Deliberately a CONSTANT rather than 15*maxH of the current design: a domain
+    // that resizes with the design makes J step-discontinuous across designs (the same reason
+    // nz_cost732 replaced power-of-two rounding). 88 m is the production city's tallest
+    // building at the default knobs; re-derive it if the design space grows taller.
+    constexpr double H_REF_M = 88.0;
+    const double BUF_DOWN  = envd("BUF_DOWN",  15.0 * H_REF_M);   // 1320 m
     const double BUF_LAT   = envd("BUF_LAT",   35.0);
     const double HEADROOM_H = envd("HEADROOM_H", 3.0);
     const double WIND_DEG   = envd("WIND_DEG",   0.0);
@@ -80,6 +88,9 @@ int main(){
     Result r  = rezone(p, r0, mzp);
     printf("[gen_openlb_geom] city: blocks=%d biz=%d maxH=%.0fm pop=%.0f inhab=%.0f\n",
            r.num_blocks, r.counts[1], r.max_height, r.population, r.total_inhabitance);
+    if (r.max_height > H_REF_M)
+        printf("[gen_openlb_geom] WARNING: tallest building %.0f m exceeds H_REF_M = %.0f m; "
+               "BUF_DOWN = %.0f m is under 15 H_max for this design\n", r.max_height, H_REF_M, BUF_DOWN);
 
     // ── voxelize solid buildings; relaxed vertical headroom (matches forward_city) ──
     int maxHC=0; for(auto& b: r.blocks) maxHC=std::max(maxHC, b.height_cells);
@@ -94,10 +105,16 @@ int main(){
     const double dx = g.cell_size;
     auto IDX=[&](int x,int y,int z){ return (size_t)z*ny*nx + (size_t)y*nx + x; };
 
-    // ── source set Ω (identical rule to forward_city.cpp) ──
+    // ── source set Ω (forward_city.cpp's rule, over forward_city's footprint) ──
+    // Every open ground cell, but only up to OMEGA_DOWN (70 m, the old downstream buffer) past
+    // the city. The long wake buffer above is there for the FLOW; without this cut its
+    // ground would join Ω (75 083 cells instead of 22 812) and J would average in releases
+    // that never pass over the city.
+    const double OMEGA_DOWN = envd("OMEGA_DOWN", 70.0);
+    const int xOmegaEnd = (int)std::floor((BUF_UP + CITY_M + OMEGA_DOWN)/dx);   // exclusive
     std::vector<uint8_t> srcmask(N, 0);
     long nOmega=0; const int zsrc=1;
-    for(int y=0;y<ny;++y)for(int x=0;x<nx;++x){
+    for(int y=0;y<ny;++y)for(int x=0;x<std::min(nx,xOmegaEnd);++x){
         size_t id=IDX(x,y,zsrc); uint8_t t=g.type[id];
         bool open=(t==CELL_FLUID), parkg=(t==CELL_SHELL && g.perm[id]>0.5f);
         if(open||parkg){ srcmask[id]=1; ++nOmega; }
