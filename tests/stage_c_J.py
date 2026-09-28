@@ -59,7 +59,34 @@ def main():
         sok = spread < 0.05
         print(f"[8] seed spread max|J-mean|/mean = {100*spread:.2f}%  -> {'PASS' if sok else 'FAIL'} (< 5%)")
         ok = ok and sok
+        curves(outs)
     return 0 if ok else 1
+
+
+def curves(outs):
+    """J(t) from exposure_timeseries.csv: the seed spread along the curve, and how much of the
+    release was still airborne when each run stopped (J's truncation: that mass has not yet
+    finished contributing to Theta)."""
+    ts = []
+    for out in outs:
+        p = os.path.join(out, 'exposure_timeseries.csv')
+        if not os.path.exists(p):
+            return
+        d = np.genfromtxt(p, delimiter=',', names=True)
+        if 'J' not in d.dtype.names:
+            return
+        ts.append(d)
+    n = min(len(d) for d in ts)
+    t = ts[0]['t_s'][:n]
+    J = np.array([d['J'][:n] for d in ts])
+    Jm = J.mean(axis=0)
+    sel = [i for i in np.linspace(n // 8, n - 1, 6).astype(int) if Jm[i] > 0]
+    print("[8] J(t) across seeds:  " + "  ".join(f"t={t[i]:.0f}s {100*np.max(np.abs(J[:, i]-Jm[i]))/Jm[i]:.1f}%" for i in sel))
+    for out, d in zip(outs, ts):
+        emitted = d['emitted'][-1]
+        m = meta(out)
+        tot = m.get('mass_emitted_total', emitted)
+        print(f"[8] {out}: stopped at t={d['t_s'][-1]:.0f} s with {100*d['airborne_all'][-1]/tot:.1f}% of the release still airborne")
 
 
 if __name__ == '__main__':

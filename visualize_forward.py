@@ -132,7 +132,11 @@ def three_time_maps(prefix, title, cmap_name, out):
 
 def exposure_graph():
     if TS is None: print("[viz] no exposure_timeseries.csv — skipping exposure graph"); return
-    t = np.atleast_1d(TS["t_s"]); cum = np.atleast_1d(TS["cumulative_dose"]); rate = np.atleast_1d(TS["exposure_rate"])
+    t = np.atleast_1d(TS["t_s"])
+    if "cumulative_dose" in TS.dtype.names:                     # forward_city schema
+        cum = np.atleast_1d(TS["cumulative_dose"]); rate = np.atleast_1d(TS["exposure_rate"])
+    else:                                                       # urban_flow: J(t) = <w,Θ(t)>/M
+        cum = np.atleast_1d(TS["J"]); rate = np.gradient(cum, t) if len(t) > 1 else np.zeros_like(cum)
     fig, ax1 = plt.subplots(figsize=(9, 5.2))
     ax1.plot(t, cum, "-", color="#1f3a93", lw=2.2, label="cumulative dose ⟨w,∫C dt⟩")
     ax1.set_xlabel("time since release [s]"); ax1.set_ylabel("cumulative population dose", color="#1f3a93")
