@@ -60,7 +60,7 @@ build() {
   say "build $name  (log: $WORK/logs/build_$name.log)"
   if ! "$@" > "$WORK/logs/build_$name.log" 2>&1; then
     say "FAIL build $name. First errors:"
-    { grep -m 20 -E 'error|Error|fatal' "$WORK/logs/build_$name.log" || tail -n 30 "$WORK/logs/build_$name.log"; } | sed 's/^/     /'
+    { grep -m 20 -E 'error|Error|fatal|undefined reference|cannot find' "$WORK/logs/build_$name.log" || tail -n 30 "$WORK/logs/build_$name.log"; } | sed 's/^/     /'
     say "compiler: $(g++ --version | head -1)"
     exit 1
   fi
@@ -89,10 +89,17 @@ do_setup() {
   fi
   step olb_config    env OLB_ROOT="$OLB_ROOT" "$REPO/olbconfig.sh" cpu-mt
   step olb_external  make -C "$OLB_ROOT/external"
+  # OpenLB's core library and any app objects must match the configured mode. A tree built
+  # earlier in another mode (serial for Phases 1-4) keeps objects that no longer link
+  # ("undefined reference to omp_..."). The marker is keyed on config.mk, so switching mode
+  # rebuilds the core once; the app objects are always rebuilt (cheap next to any run).
+  local cfg; cfg="$(md5sum "$OLB_ROOT/config.mk" | cut -c1-12)"
+  step "olb_core_$cfg" sh -c "make -C '$OLB_ROOT' clean-core && make -C '$OLB_ROOT' -j$THREADS core"
   mkdir -p "$APP"
   for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h; do ln -sf "$REPO/$f" "$APP/$f"; done
   printf 'EXAMPLE = urban_flow\nOLB_ROOT := ../../..\ninclude $(OLB_ROOT)/default.mk\n' > "$APP/Makefile"
   # the app is always rebuilt: it is cheap next to a run and the sources may have been pulled
+  rm -f "${APP:?}"/*.o "${APP:?}"/*.d "${APP:?}/urban_flow"
   build app       make -C "$APP"
   build gen_openlb_geom g++ -O3 -std=c++17 -I"$REPO" -DCELL_SIZE_M=4.0 "$REPO/gen_openlb_geom.cpp" -o "$WORK/gen_openlb_geom"
   build gen_gate6_geom  g++ -O2 -std=c++17 -I"$REPO" "$REPO/gen_gate6_geom.cpp" -o "$WORK/gen_gate6_geom"
