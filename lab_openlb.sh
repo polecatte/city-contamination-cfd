@@ -151,8 +151,12 @@ do_package() {
     cat "$SUMMARY" 2>/dev/null || true
     grep -h -E 'MLUPs :' "$WORK"/out_*.log "$WORK"/city_s*.log 2>/dev/null | sed 's/^/throughput /' || true
   } > "$WORK/summary_$ts.txt"
-  ( cd "$WORK" && tar czf "olb_lab_$ts.tar.gz" summary_$ts.txt logs *.log \
-      $(ls -d out_*/meta*.txt out_*/*.png out_*/*.csv city_s*/meta*.txt city_s*/*.csv city_s*/figs lin7b/*/meta_flow.txt 2>/dev/null) )
+  # Only what exists: a pattern that matches nothing (e.g. no run logs yet) is dropped rather
+  # than handed to tar as a literal name.
+  ( cd "$WORK" && shopt -s nullglob && \
+    files=( "summary_$ts.txt" logs done *.log g5_*.txt out_*/meta*.txt out_*/*.png out_*/*.csv \
+            city_s*/meta*.txt city_s*/*.csv city_s*/figs lin7b/*/meta_flow.txt ) && \
+    tar czf "olb_lab_$ts.tar.gz" "${files[@]}" )
   say "packaged $WORK/olb_lab_$ts.tar.gz"
   cat "$WORK/summary_$ts.txt"
 }
