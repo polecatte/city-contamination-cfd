@@ -116,13 +116,16 @@ hypothesis, too little Reynolds number, is refuted by the second row**: halving 
 viscosity moved Xr/H by +0.06, inside the scatter of a 2-flow-through mean. The candidates
 left, in the order I would test them:
 
-1. **Resolution.** H/dx = 10 is the audit's floor. On a coarse grid the separated shear layer
-   transitions late whatever ν is, which lengthens the bubble. Test: the same cube at dx = 2 m
-   (H/dx = 20; 11 M cells, ~16× the cost — hours on the 32-core box, not feasible here).
-2. **Inflow turbulence.** Xr falls with turbulence intensity at roof height. The inlet's σ is
-   already 6.8 % low (`abl_inlet_verify`), and the resolved fluctuations then decay over the 5H
-   upstream fetch at 4 m resolution. Test: `TimeMean` now accumulates second moments, so one
-   empty-domain run (`AVG_FT=2`) gives I_u at the cube position (`gate6_analyze.py abl`).
+1. **Resolution — now the prime suspect.** H/dx = 10 is the audit's floor. On a coarse grid the
+   separated shear layer transitions late whatever ν is, which lengthens the bubble. Test: the
+   same cube at dx = 2 m (H/dx = 20; 11 M cells, ~16× the cost — hours on the 32-core box, not
+   feasible here).
+2. **Inflow turbulence — measured, and not enough to explain it.** Xr falls with turbulence
+   intensity at roof height, so this was the other candidate. One empty-domain run with the
+   new second moments (`AVG_FT=2`, `gate6_analyze.py abl`), at the cube position 200 m
+   downstream: I_u = 13.9 % at z = 40 m (roof) and 15.4 % at 20 m, against the neutral-ABL
+   target σ_u = 2.5u* → 15.1 % and 17.2 %. About 8–10 % low, and it does not decay over the
+   fetch (12.9 % at the inlet at 40 m). A 10 % deficit in I_u does not make a bubble 60 % long.
 3. Only then the floor model inside the bubble (reversed flow under `RoughWall`), by rerunning
    with `GROUND_MODEL=0` for the cube alone.
 
@@ -214,9 +217,9 @@ positive), but it is a domain-sizing question worth revisiting before production
 
 ## 9. What I would do next
 
-1. **Gate 6b.** Run the cube at dx = 2 m (H/dx = 20) on the lab box, and measure I_u at the cube
-   position with the new second moments (`AVG_FT` runs now write them; `gate6_analyze.py abl`
-   prints I_u). These decide between resolution and inflow turbulence (§5).
+1. **Gate 6b.** Run the cube at dx = 2 m (H/dx = 20) on the lab box (`DX=2 CUBE_H=20
+   CASE=cube ./gen_gate6_geom`). Inflow turbulence is measured and ruled out as the main cause
+   (§5), so resolution is the test that decides it.
 2. **Mach.** Pick the operating point (§6). `LATTICE_U=0.034 TAU=0.505` meets peak < 0.1.
 3. **Gate 8 to full clearance**, same two seeds, on the lab box.
 4. **Phase 8 (GPU).** Every host operator added here — `VeloGradRefresh`, `RoughWall`,
