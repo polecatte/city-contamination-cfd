@@ -23,8 +23,10 @@ git checkout claude/gracious-lovelace-3wlllj
 ## 2. Run
 
 ```bash
+mkdir -p ~/olb_lab
 tmux new -s olb                                    # it takes hours; survive an SSH drop
 ./lab_openlb.sh all 2>&1 | tee -a ~/olb_lab/lab.log
+# (typed INSIDE the tmux shell, so the window stays open if the script stops)
 # detach: Ctrl-b d      reattach: tmux attach -t olb      progress: ./lab_openlb.sh status
 ```
 

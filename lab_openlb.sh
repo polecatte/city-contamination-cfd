@@ -10,7 +10,7 @@
 #
 # Resumable: every step writes $WORK/done/<step> when it finishes and is skipped next time
 # (delete the marker to rerun one). Run it under tmux or nohup — it takes hours:
-#   tmux new -s olb './lab_openlb.sh all 2>&1 | tee -a ~/olb_lab/lab.log'
+#   tmux new -s olb './lab_openlb.sh all 2>&1 | tee -a ~/olb_lab/lab.log; read -p "[done - Enter to close]"'
 #
 # Env:
 #   WORK      working directory (default ~/olb_lab): OpenLB tree, geometries, outputs, logs
@@ -49,7 +49,20 @@ step() {
   if ( cd "$WORK" && "$@" ) > "$WORK/logs/$name.log" 2>&1; then
     mark "$name"; say "ok   $name"
   else
-    say "FAIL $name — see $WORK/logs/$name.log"; return 1
+    say "FAIL $name — last lines of $WORK/logs/$name.log:"
+    tail -n 25 "$WORK/logs/$name.log" | sed 's/^/     /'; return 1
+  fi
+}
+
+# build NAME CMD... : compile, and on failure show the first errors instead of just a path
+build() {
+  local name="$1"; shift
+  say "build $name  (log: $WORK/logs/build_$name.log)"
+  if ! "$@" > "$WORK/logs/build_$name.log" 2>&1; then
+    say "FAIL build $name. First errors:"
+    { grep -m 20 -E 'error|Error|fatal' "$WORK/logs/build_$name.log" || tail -n 30 "$WORK/logs/build_$name.log"; } | sed 's/^/     /'
+    say "compiler: $(g++ --version | head -1)"
+    exit 1
   fi
 }
 
@@ -80,11 +93,10 @@ do_setup() {
   for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h; do ln -sf "$REPO/$f" "$APP/$f"; done
   printf 'EXAMPLE = urban_flow\nOLB_ROOT := ../../..\ninclude $(OLB_ROOT)/default.mk\n' > "$APP/Makefile"
   # the app is always rebuilt: it is cheap next to a run and the sources may have been pulled
-  say "build urban_flow"; make -C "$APP" > "$WORK/logs/build_app.log" 2>&1 \
-    || { say "FAIL app build — $WORK/logs/build_app.log"; exit 1; }
-  g++ -O3 -std=c++17 -I"$REPO" -DCELL_SIZE_M=4.0 "$REPO/gen_openlb_geom.cpp" -o "$WORK/gen_openlb_geom"
-  g++ -O2 -std=c++17 -I"$REPO" "$REPO/gen_gate6_geom.cpp" -o "$WORK/gen_gate6_geom"
-  g++ -O2 -std=c++17 -I"$REPO" "$REPO/tests/linearity_guard.cpp" -o "$WORK/linearity_guard"
+  build app       make -C "$APP"
+  build gen_openlb_geom g++ -O3 -std=c++17 -I"$REPO" -DCELL_SIZE_M=4.0 "$REPO/gen_openlb_geom.cpp" -o "$WORK/gen_openlb_geom"
+  build gen_gate6_geom  g++ -O2 -std=c++17 -I"$REPO" "$REPO/gen_gate6_geom.cpp" -o "$WORK/gen_gate6_geom"
+  build linearity_guard g++ -O2 -std=c++17 -I"$REPO" "$REPO/tests/linearity_guard.cpp" -o "$WORK/linearity_guard"
   python3 -c 'import numpy, matplotlib' 2>/dev/null || say "WARNING: python3 numpy/matplotlib missing — analysers need numpy"
   step geometry sh -c '
     OUT_DIR=geom_prod ./gen_openlb_geom &&
