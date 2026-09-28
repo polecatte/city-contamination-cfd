@@ -1,5 +1,11 @@
 # OpenLB port — status audit & lab-machine verification plan
 
+> **Update 2026-09-27:** Phases 5–7 have been run. Results, the four silent defects the
+> first runs exposed, the G1 decision (a custom rough-wall floor plus a top shear stress),
+> and the operating-point trade-off Gate 6b forces are in
+> [`OPENLB_PHASE5_6_GATES.md`](OPENLB_PHASE5_6_GATES.md). The Phase-1 config below is still
+> right for the port; use `./olbconfig.sh cpu-mt` (OpenMP) for Phase 5 onwards.
+
 Audit date: 2026-08-20. Scope: `OPENLB_MIGRATION_PLAN.md` §7 steps 1–4 as implemented in
 `openlb_geometry.h`, `gen_openlb_geom.cpp`, `geometry_loader.h`, `abl_inlet_olb.h`,
 `urban_flow.cpp`.
