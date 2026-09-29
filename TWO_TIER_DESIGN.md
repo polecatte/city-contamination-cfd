@@ -139,5 +139,16 @@ Validation before use:
 2. Oblique inlets (two-face inflow and outflow, per-direction domain layout) + the four
    validation tests above.
 3. Labelled release-zone tracers and per-building dose output in `urban_flow`.
-4. Inner integer programme with both tails + reference zoning.
+4. **Built ahead of step 3, tested on a proxy dose (2026-09-29):** `zoning/`.
+   - `dose_table.py`: the programme's input, per-building dose per scenario (wind × release
+     zone) with probabilities. `from_runs` builds it from `urban_flow` theta fields + the
+     geometry's `envelope.i32`; `proxy` is a 2-D stand-in (not CFD) for testing.
+   - `zoning_milp.py`: home/work per building + occupancy (50–100 %), residents = P, jobs =
+     0.47 P, expected-dose objective, CVaR90 event-tail constraint (Rockafellar–Uryasev),
+     per-person cap (no homes above κ × the mean resident dose); 200 random zonings as the
+     exposure-blind reference; HiGHS, ~2 s for 122 buildings × 256 scenarios.
+   - `plot_zoning.py`, `zoning_proxy_demo.png`. On the proxy: optimum 7.9 % below the random
+     mean, but its CVaR90 is slightly WORSE than random (20.9 vs 20.4); along the front CVaR90
+     drops 7 % for +6 % mean. The mean-optimal pattern (workplaces on the perimeter facing the
+     environs, homes inside) comes from the proxy and is not a finding.
 5. One geometry end to end, 16 directions, on the GPU; then the outer search.
