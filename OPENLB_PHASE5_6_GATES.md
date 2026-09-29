@@ -130,6 +130,13 @@ left, in the order I would test them:
 3. Only then the floor model inside the bubble (reversed flow under `RoughWall`), by rerunning
    with `GROUND_MODEL=0` for the cube alone.
 
+**Lab result, dx = 2 m (H/dx = 20), 2026-09-29:** Xr/H **2.31** (from 2.63 at dx = 4), roof
+reversal now present, upstream horseshoe yes; identical to the printed digit on the CPU and the
+GPU build. Resolution is part of the answer but, extrapolated (Richardson, r = 2, order 1–2), the
+grid-converged value is ~2.0–2.2: still above 1.8. Inflow turbulence was already measured (item
+2). Next: the dx = 1 m level on an H100 (`cube_dx1`) and the dx = 4 sensitivity runs
+(`cube_sens`: floor model, inflow turbulence ×1.2, WALE constant).
+
 ## 6. The Mach sub-condition (6a′)
 
 The one free choice at fixed dx is the split between τ and the lattice velocity:

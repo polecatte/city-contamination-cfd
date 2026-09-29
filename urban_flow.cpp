@@ -1247,7 +1247,9 @@ int main(int argc, char* argv[]) {
     // ── verified ABL/RFG inlet ──
     gInlet.z0 = envd("ABL_Z0", 0.045); gInlet.d = 0.0; gInlet.wind_angle = WIND_DEG*M_PI/180.0;
     gInlet.L_turb = envd("ABL_LTURB", 20.0); gInlet.n_modes = envi("ABL_NMODES", 100);
-    gInlet.sigma_u_ratio=2.5; gInlet.sigma_v_ratio=1.9; gInlet.sigma_w_ratio=1.25;
+    // ABL_TI_SCALE scales all three sigma ratios (inflow-turbulence sensitivity, 6b); 1 = neutral ABL
+    { const double s = envd("ABL_TI_SCALE", 1.0);
+      gInlet.sigma_u_ratio=2.5*s; gInlet.sigma_v_ratio=1.9*s; gInlet.sigma_w_ratio=1.25*s; }
     gInlet.init(U_INLET, Z_REF, /*seed=*/(unsigned)envi("ABL_SEED", 1000));   // Gate 8 seed pairs
     clout << "ABL inlet u*=" << gInlet.u_star << " (verified: mean 0.10%, div 5.2%)" << std::endl;
     {   // (C1, continued) the converter's charU is U at Z_REF, but the log-law inlet is fastest

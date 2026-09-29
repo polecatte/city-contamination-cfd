@@ -101,3 +101,38 @@ GPU=1 ./lab_openlb.sh city               # the production city, two seeds
   (Xorg, Houdini); close Houdini for the long runs if it holds GPU memory — the city needs ~5 GB.
 - Errors: `no CUDA device was found` = driver/`nvidia-smi` problem, not the build;
   `CUDA driver version is insufficient` = driver older than CUDA 12's minimum (525).
+
+## 8. Showcase, 6b follow-ups, H100
+
+```bash
+GPU=1 ./lab_openlb.sh showcase    # small city end to end, ~1 h on the A4000, minutes on an H100
+GPU=1 ./lab_openlb.sh cube_sens   # three dx=4 cube variants, ~10 min each on the A4000
+GPU=1 ./lab_openlb.sh cube_dx1    # H100 only (>= 60 GB): the dx=1 m cube, 89 M cells
+```
+
+- **showcase**: a 400 m city (`gen_openlb_geom CITY_M=400 POP=8000`, 4.6 M cells: the fixed
+  15 H wake buffer is most of the domain) run through the whole pipeline: live flow, burst to
+  99 % clearance, Θ, deposition, J, and the figures (`showcase/figs/`). `showcase/SHOWCASE.txt`
+  is a scorecard of six checks: flow stable (Mach), wake closed before the outlet, mass budget
+  closed, clearance reached, J finite and positive, negative-Θ mass small. It runs on the CPU
+  build too (drop `GPU=1`), about 6× slower.
+- **cube_sens**: which knob moves the cube's Xr/H — floor model (`GROUND_MODEL=0`), inflow
+  turbulence ×1.2 (`ABL_TI_SCALE`), WALE constant 0.20 (`LES_CONST`). Compare with
+  gate6b_dx4's 2.63.
+- **cube_dx1**: the third grid level (dx 4 → 2 → 1 m gave / will give Xr/H 2.63 → 2.31 → ?),
+  which says whether the grid alone can reach 1.4–1.8. ~40 GB device memory and as much host
+  RAM, double precision.
+
+**On a different machine (the H100):** the GPU mode needs the CPU tree as the parity reference
+and for the geometries, so there:
+```bash
+git clone -b claude/gracious-lovelace-3wlllj https://github.com/polecatte/city-contamination-cfd.git && cd city-contamination-cfd
+./lab_openlb.sh setup                        # CPU build + geometries (~15 min)
+GPU=1 ./lab_openlb.sh setup                  # CUDA_ARCH 90 read from nvidia-smi
+GPU=1 ./lab_openlb.sh parity                 # must say ALL PASS on this GPU too
+GPU=1 ./lab_openlb.sh cube_dx1
+GPU=1 ./lab_openlb.sh showcase
+./lab_openlb.sh package
+```
+On a Slurm cluster, wrap each line in a batch job (`sbatch --gres=gpu:1 --wrap "…"`); the steps
+are resumable, so a job that hits its time limit just resumes on resubmission.

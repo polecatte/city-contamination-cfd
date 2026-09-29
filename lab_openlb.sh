@@ -11,6 +11,9 @@
 #   GPU=1 ./lab_openlb.sh setup|gates|city|all|status   # the same, on the GPU build
 #   GPU=1 ./lab_openlb.sh parity    # GPU vs CPU build on short cases (tests/device_parity.sh)
 #   ./lab_openlb.sh compare         # CPU and GPU gate numbers side by side
+#   [GPU=1] ./lab_openlb.sh showcase   # small city end to end: flow, burst, J, figures, scorecard
+#   [GPU=1] ./lab_openlb.sh cube_sens  # 6b sensitivity at dx=4: floor model, inflow turbulence, C_w
+#   GPU=1   ./lab_openlb.sh cube_dx1   # 6b at dx=1 m (H/dx=40, 89 M cells): needs >= 60 GB GPU (H100)
 #
 # Resumable: every step writes $WORK/done/<step> when it finishes and is skipped next time
 # (delete the marker to rerun one). Run it under tmux or nohup — it takes hours:
@@ -136,9 +139,49 @@ do_parity() {
   grep -E '^\[parity\]|rel.diff|worst' "$WORK/logs/parity.log" | sed 's/^/     /'
 }
 
+# A small city through the whole pipeline (geometry -> live flow -> burst to 99 % clearance ->
+# Theta, deposition, J -> figures), with a PASS/FAIL scorecard (tests/showcase_report.py).
+# 400 m of city; the domain is still ~1.8 km long, since the 15 H wake buffer is fixed.
+do_showcase() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  step geom_showcase sh -c "CITY_M=${SHOW_CITY_M:-400} POP=${SHOW_POP:-8000} OUT_DIR=geom_showcase ./gen_openlb_geom"
+  step showcase_run sh -c "STEP4=1 GEOM_DIR=geom_showcase OUT_DIR=showcase CHECK_EVERY=2000 TS_EVERY=500 '$BIN' > showcase.log 2>&1"
+  gate showcase python3 "$REPO/tests/showcase_report.py" geom_showcase showcase showcase.log
+  step showcase_viz python3 "$REPO/visualize_forward.py" showcase
+  say "scorecard: $WORK/showcase/SHOWCASE.txt   figures: $WORK/showcase/figs/"
+  cat "$WORK/showcase/SHOWCASE.txt"
+}
+
+# Gate 6b sensitivity on the dx=4 cube (each run = gate6b_dx4's cost): which knob moves Xr/H?
+#   gm0   plain bounce-back floor (top stress kept): the rough-wall model inside the bubble
+#   ti12  inflow turbulence x1.2 (I_u at roof height measured ~8 % under the neutral target)
+#   cw20  WALE constant 0.20 instead of 0.325 (less subgrid dissipation)
+do_cube_sens() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  local P="$REPO/tests" name envs
+  for v in "gm0|GROUND_MODEL=0 TOP_STRESS=1" "ti12|ABL_TI_SCALE=1.2" "cw20|LES_CONST=0.20"; do
+    name="${v%%|*}"; envs="${v#*|}"
+    gate "cube_$name" sh -c "env $envs GEOM_DIR=geom_cube OUT_DIR=out_6b_$name SPINUP_FT=4 AVG_FT=2 CHECK_EVERY=2000 '$BIN' > out_6b_$name.log 2>&1;
+      python3 '$P/gate6_analyze.py' cube geom_cube out_6b_$name"
+  done
+  grep -h 'Xr/H =' "$WORK"/logs/gate6b_dx4.log "$WORK"/logs/cube_*.log 2>/dev/null | sed 's/^/     /'
+}
+
+# Gate 6b at dx = 1 m (H/dx = 40): the third point of the grid study (dx 4 m: 2.63, dx 2 m: 2.31).
+# 840x440x241 = 89 M cells: ~40 GB of device memory in double, and the same again in host RAM.
+do_cube_dx1() {
+  [ "${GPU:-0}" = 1 ] || { echo "cube_dx1 is a GPU run: GPU=1 $0 cube_dx1"; exit 2; }
+  [ -x "$BIN" ] || { echo "run 'GPU=1 $0 setup' first"; exit 1; }
+  local mem; mem=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
+  [ "${mem:-0}" -ge 60000 ] || { echo "cube_dx1 needs >= 60 GB of GPU memory (this GPU: ${mem:-?} MiB)"; exit 1; }
+  step geom_cube_dx1 sh -c "CASE=cube DX=1 CUBE_H=40 OUT_DIR=geom_cube_dx1 ./gen_gate6_geom"
+  gate gate6b_dx1 sh -c "GEOM_DIR=geom_cube_dx1 OUT_DIR=out_6b_dx1 SPINUP_FT=4 AVG_FT=2 CHECK_EVERY=10000 '$BIN' > out_6b_dx1.log 2>&1;
+    python3 '$REPO/tests/gate6_analyze.py' cube geom_cube_dx1 out_6b_dx1"
+}
+
 # the gates' deciding numbers, CPU next to GPU
 do_compare() {
-  for g in gate6a gate6b_dx4 gate6b_dx2 gate7a gate7c gate7b gate8 wake; do
+  for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b gate8 wake showcase; do
     for side in cpu gpu; do
       local L="$WORK_CPU/logs/$g.log"; [ $side = gpu ] && L="$WORK_CPU/gpu/logs/$g.log"
       [ -f "$L" ] || continue
@@ -268,7 +311,9 @@ do_package() {
     files=( "summary_$ts.txt" logs done *.log g5_*.txt out_*/meta*.txt out_*/*.png out_*/*.csv \
             city_s*/meta*.txt city_s*/*.csv city_s*/figs lin7b/*/meta_flow.txt \
             gpu/summary.txt gpu/logs gpu/done gpu/*.log gpu/out_*/meta*.txt gpu/out_*/*.png gpu/out_*/*.csv \
-            gpu/city_s*/meta*.txt gpu/city_s*/*.csv gpu/city_s*/figs gpu/parity/*.log ) && \
+            gpu/city_s*/meta*.txt gpu/city_s*/*.csv gpu/city_s*/figs gpu/parity/*.log \
+            showcase/SHOWCASE.txt showcase/meta*.txt showcase/*.csv showcase/figs \
+            gpu/showcase/SHOWCASE.txt gpu/showcase/meta*.txt gpu/showcase/*.csv gpu/showcase/figs gpu/out_6b_*/*.png ) && \
     tar czf "olb_lab_$ts.tar.gz" "${files[@]}" )
   say "packaged $WORK/olb_lab_$ts.tar.gz"
   cat "$WORK/summary_$ts.txt"
@@ -280,6 +325,9 @@ case "${1:-status}" in
   city)    do_city ;;
   package) [ "${GPU:-0}" = 1 ] && { WORK="$WORK_CPU"; SUMMARY="$WORK/summary.txt"; }; do_package ;;
   parity)  do_parity ;;
+  showcase) do_showcase ;;
+  cube_sens) do_cube_sens ;;
+  cube_dx1) do_cube_dx1 ;;
   compare) do_compare ;;
   all)     do_setup; do_gates; do_city; do_package ;;
   status)  ls -1 "$WORK/done" 2>/dev/null | sed 's/^/done: /'; cat "$SUMMARY" 2>/dev/null || true ;;
