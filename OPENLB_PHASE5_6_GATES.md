@@ -257,10 +257,10 @@ Small tests (`gen_gate6_geom`: abl, cube, box) are unaffected.
    the main cause (§5), so resolution is the test that decides it.
 2. **Gate 8 to full clearance** on the 15 H production domain, two seeds, plus the wake check.
 3. **Upstream buffer** (§6): decide whether to lengthen `BUF_UP` to clear 6a at the city face.
-4. **Phase 8 (GPU).** Every host operator added here — `VeloGradRefresh`, `RoughWall`,
-   `TopStress`, the Step-4 inject/deposit/accumulate/flux loops — is a per-cell loop with no
-   cross-cell writes (the specular remap reads a snapshot), so each maps onto an OpenLB
-   post-processor one-to-one. That is the G2 rewrite, now with a known list.
+4. **Phase 8 (GPU)** — done as far as a GPU-less box allows: every host operator here now also
+   exists as an OpenLB operator (`urban_ops.h`), bitwise identical to the host loops on CPU, and
+   the CUDA build compiles. First GPU run and CPU-vs-GPU parity: `OPENLB_PHASE8_GPU.md`,
+   `LAB_RUNBOOK_OPENLB.md` §7.
 
 ## 11. Reproduce
 
@@ -268,7 +268,7 @@ All of this is scripted in `lab_openlb.sh`; the manual equivalent:
 
 ```bash
 export OLB_ROOT=…/release-1.8.1 && ./olbconfig.sh cpu-mt && (cd $OLB_ROOT && make -C external)
-# app dir: symlink urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h; Makefile from nozzle3d
+# app dir: symlink urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h urban_ops.h; Makefile from nozzle3d
 g++ -O2 -std=c++17 -I. gen_gate6_geom.cpp -o gen_gate6_geom
 for c in abl cube box; do CASE=$c OUT_DIR=geom_$c ./gen_gate6_geom; done
 

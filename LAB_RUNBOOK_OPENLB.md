@@ -10,8 +10,8 @@ far (4-core cloud box): `OPENLB_PHASE5_6_GATES.md`.
 - ~15 GB free under `~/olb_lab` (OpenLB tree + builds ~1 GB; the city runs' fields ~2 GB each)
 - Internet for the OpenLB 1.8.1 tarball (GitLab, falling back to Zenodo). No internet: download
   `release-1.8.1.tar.gz` elsewhere, unpack it on the box and pass `OLB_ROOT=/path/release-1.8.1`.
-- **CPU only, OpenMP.** Not MPI, not GPU: the Phase 5–7 host operators are neither MPI-reduced
-  nor on-device yet (Phase 8). `nvidia-smi` is irrelevant for these runs.
+- CPU runs: OpenMP. GPU runs (§7): an NVIDIA driver; the CUDA toolkit is fetched if needed.
+  Not MPI: the per-step operators assume one cuboid per process.
 
 ## 1. Get the code
 
@@ -71,3 +71,33 @@ time series, metadata, figures — not the large fields). That file is all I nee
   compiler lacks C++20.
 - A run aborts with `[DIVERGED]`: the log names the materials holding non-finite cells.
 - Want to watch a run: `tail -f ~/olb_lab/out_6b_dx2.log` (timer lines give MLUPS and ETA).
+
+## 7. GPU runs (Phase 8)
+
+The same gates and city runs on the CUDA build. Everything goes to `~/olb_lab/gpu/` (own OpenLB
+tree, logs, markers, summary); the geometries are shared with the CPU runs. It can run while a
+CPU run is going (it needs one CPU core), but not two GPU jobs at once.
+
+```bash
+cd city-contamination-cfd && git pull
+./lab_openlb.sh setup                    # CPU tree: needed as the parity reference (skips what's done)
+GPU=1 ./lab_openlb.sh setup              # ~10 min; installs CUDA 12.6 into ~/olb_lab/cuda126 if needed
+GPU=1 ./lab_openlb.sh parity             # ~15 min: GPU vs CPU on four short cases — run this FIRST
+GPU=1 ./lab_openlb.sh gates              # then the gates, and
+GPU=1 ./lab_openlb.sh city               # the production city, two seeds
+./lab_openlb.sh compare                  # CPU and GPU numbers side by side
+./lab_openlb.sh package                  # one tarball with both (send me this)
+```
+
+- **nvcc.** OpenLB 1.8 does not compile with CUDA 12.0 (Ubuntu 24.04's `nvidia-cuda-toolkit`):
+  `fields.h(36): call to consteval function std::source_location::current…`. Setup uses `$NVCC`,
+  else `nvcc` on PATH if ≥ 12.4, else installs CUDA 12.6 from conda-forge with micromamba (no
+  root, ~1 GB). The build is double precision, `CUDA_ARCH` from `nvidia-smi` (A4000 = 86).
+- **parity** must say `[parity] ALL PASS` before the gate numbers mean anything. It runs each
+  case with the CPU binary and the GPU binary and compares every output. `box7` (frozen wind,
+  linear) must agree to 1e-9; the three flow cases to 1e-4 (GPU rounding differs and the flow
+  amplifies it). A FAIL names the output and the size of the difference: send the package.
+- **Expected speed:** the GPU logs' `MLUPs :` lines. The A4000 is shared with the desktop
+  (Xorg, Houdini); close Houdini for the long runs if it holds GPU memory — the city needs ~5 GB.
+- Errors: `no CUDA device was found` = driver/`nvidia-smi` problem, not the build;
+  `CUDA driver version is insufficient` = driver older than CUDA 12's minimum (525).

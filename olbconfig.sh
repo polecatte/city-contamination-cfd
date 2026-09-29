@@ -36,7 +36,7 @@ if [ ! -f "$ORIG" ] && [ -f "$CFG" ]; then
   echo "saved pristine config as config.mk.orig"
 fi
 
-backup() { [ -f "$CFG" ] && cp "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"; }
+backup() { if [ -f "$CFG" ]; then cp "$CFG" "$CFG.bak.$(date +%Y%m%d-%H%M%S)"; fi; }
 
 # Rewrite a make variable: first uncommented assignment is replaced, any later
 # duplicates of it are deleted, and an absent variable is appended.
@@ -139,8 +139,8 @@ case "$MODE" in
     cp "$t" "$CFG"
     echo "seeded config.mk from $(basename "$t")"
 
-    ARCH=""
-    if command -v nvidia-smi >/dev/null 2>&1; then
+    ARCH="${CUDA_ARCH:-}"                 # env override, e.g. CUDA_ARCH=86 for an RTX A4000
+    if [ -z "$ARCH" ] && command -v nvidia-smi >/dev/null 2>&1; then
       ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
              | head -1 | tr -d ' .' || true)
     fi
@@ -150,6 +150,21 @@ case "$MODE" in
     else
       echo "WARNING: could not read compute_cap; leaving template's CUDA_ARCH as-is" >&2
     fi
+
+    # urban_flow computes in double (typedef double T) and the CPU reference is double, so
+    # the library is built double too; the shipped template says float.
+    setvar "$CFG" FLOATING_POINT_TYPE 'double'
+    # nvcc: $NVCC when given (e.g. a conda-forge CUDA 12.6, see lab_openlb.sh), else PATH.
+    # CUDA 12.0 cannot compile OpenLB 1.8 at all (fields.h: consteval source_location).
+    if [ -n "${NVCC:-}" ]; then setvar "$CFG" CXX "$NVCC"; setvar "$CFG" CC "$NVCC"; fi
+    # host compiler for nvcc, when the default g++ is newer than this CUDA supports
+    [ -n "${CUDA_HOST_CXX:-}" ] && echo "CXXFLAGS += -ccbin $CUDA_HOST_CXX" >> "$CFG"
+    # OpenLB compiles with -rdc=true but links without an arch, so nvcc device-links for its
+    # default sm_52: the binary then holds NO usable sm_$CUDA_ARCH kernels ("nvlink warning:
+    # SM Arch ('sm_52') not found"). Device-link for the configured arch.
+    echo 'LDFLAGS += --generate-code=arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)' >> "$CFG"
+    # a non-system CUDA: find its libcudart at run time, not the distro's older one
+    [ -n "${CUDA_LIBDIR:-}" ] && echo "LDFLAGS += -L$CUDA_LIBDIR -Xlinker -rpath=$CUDA_LIBDIR" >> "$CFG"
 
     # Every flag variable that must carry -std=c++20 -- OpenLB's headers hard
     # #error without it, and nvcc defaults to C++17.

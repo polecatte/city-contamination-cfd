@@ -45,6 +45,7 @@
 
 #include "geometry_loader.h"   // Stage-A material map + source mask reader/stamper
 #include "abl_inlet_olb.h"     // verified ABL/RFG inlet as AnalyticalF3D (with startup ramp)
+#include "urban_ops.h"         // the per-step work as OpenLB operators (CPU and GPU)
 
 #include <cstdlib>
 #include <string>
@@ -263,8 +264,7 @@ void setBoundaryValues(SuperLattice<T,DESCRIPTOR>& sLattice,
                         rampSteps>0 ? (T)iT/(T)rampSteps : T(1));
     bridge::AblVelocityF3D<T,DESCRIPTOR,UnitConverter<T,DESCRIPTOR>> ablU(converter, gInlet, physT, ramp);
     sLattice.defineU(superGeometry.getMaterialIndicator({MAT_INLET}), ablU);         // CONFIRM 1.8
-    // CONFIRM 1.8 (GPU): push host-side defineU changes to device, e.g.
-    //   sLattice.setProcessingContext(ProcessingContext::Simulation);
+    // CPU reference only: on a GPU lattice the inlet is urbanops::InletOp (DeviceNSE::inlet).
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,7 +278,7 @@ void setBoundaryValues(SuperLattice<T,DESCRIPTOR>& sLattice,
 //  (2) Under this build it returned sqrt(numeric_limits<double>::min()) = 1.49e-154 on a
 //      flow with |u|_lb ~ 1e-4 -- i.e. no cell contributed at all, so the guard was blind.
 // A scan costs about one collide sweep, and it runs every CHECK_EVERY steps. On GPU it needs
-// the Evaluation processing context first (Phase 8).
+// the Evaluation processing context first (pullNSE in main).
 // ─────────────────────────────────────────────────────────────────────────────
 static T scanMaxU(SuperLattice<T,DESCRIPTOR>& sLattice, SuperGeometry<T,3>& superGeometry, bool& finite) {
     T maxSq = 0; bool fin = true;
@@ -414,7 +414,8 @@ void exportLiveFlow(SuperLattice<T,DESCRIPTOR>& sLattice,
 // the half-cell ambiguity of where a bounce-back wall "is" is left to a sensitivity run.
 // Buildings stay smooth no-slip bounce-back (COST 732) -- only cells over MAT_GROUND get
 // this. Parks (MAT_POROUS) are excluded: their canopy drag is the porous model's job.
-// Host-side OpenMP loop over ~ nx*ny cells; for GPU it becomes a post-processor (Phase 8).
+// Host-side OpenMP loop over ~ nx*ny cells: the CPU reference. The operator version (and
+// the only one on GPU) is urbanops::RwSaveOp/RwApplyOp, registered on these same cells.
 // ─────────────────────────────────────────────────────────────────────────────
 struct RoughWall {
     T z0 = 0.045, zP = 4.0, kappa = 0.41;
@@ -569,8 +570,8 @@ struct TopStress {
 // sponge/porous cells their own dynamics, none of which read VELO_GRAD.
 // WALE_GRAD_CHECK=1 compares it once against the stock functor (see main).
 // Neighbour reads use the block's overlap layer, so under MPI the halo must be current
-// (it is after collideAndStream's communication). On GPU this is a host sweep -- Phase 8
-// must move it on-device alongside G2.
+// (it is after collideAndStream's communication). The CPU reference; the operator version
+// (and the only one on GPU) is urbanops::WaleVelOp + WaleGradOp.
 // ─────────────────────────────────────────────────────────────────────────────
 struct VeloGradRefresh {
     std::vector<std::vector<T>>       ubuf;
@@ -685,6 +686,149 @@ struct TimeMean {
     }
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DeviceNSE — host-side set-up of the operator path (urban_ops.h) for the airflow lattice.
+//
+// The operators are registered on EXACTLY the cells the host implementations touch: the same
+// material indicators, and the rough-wall / top-stress cell lists taken from RoughWall::init /
+// TopStress::init themselves. Per-cell flags go into UF_MASK once, here; the fields the
+// operators use are pushed to the device field by field (never the whole lattice, which
+// would overwrite device populations -- see urban_ops.h on data residency).
+// ─────────────────────────────────────────────────────────────────────────────
+struct DeviceNSE {
+    bool wale = false, rough = false, top = false, tmean = false;
+    std::unique_ptr<SuperFieldArrayD<T,DESCRIPTOR,urbanops::RFG_MODE>> modes;
+
+    void init(SuperLattice<T,DESCRIPTOR>& sL, SuperGeometry<T,3>& sg,
+              UnitConverter<T,DESCRIPTOR> const& conv, const abl::ABLInlet& in,
+              const RoughWall* rw, const TopStress* ts, bool doWale, bool doTmean,
+              T windRad) {
+        using namespace urbanops;
+        OstreamManager clout(std::cout, "deviceOps");
+        wale = doWale; rough = rw != nullptr; top = ts != nullptr; tmean = doTmean;
+        auto& load = sL.getLoadBalancer();
+        if (load.size() != 1)
+            throw std::runtime_error("device operators assume one cuboid per process (neighbour reads use the block padding)");
+        auto& block = sL.getBlock(0);
+        auto& bg    = sg.getBlockGeometry(0);
+        const int nx = bg.getNx(), ny = bg.getNy(), nz = bg.getNz(), pad = block.getPadding();
+        // allocate the dynamic fields
+        block.template getField<UF_MASK>(); block.template getField<UF_VBUF>();
+        block.template getField<RW_SAVE>(); block.template getField<TM_SUM>();
+        block.template getField<descriptors::LOCATION>();
+        // per-cell flags and zeroed buffers over the padded block (padding must read as
+        // "no fluid, u = 0", exactly what VeloGradRefresh assumes for material 0)
+        std::vector<int> rwBits((size_t)(nx+2*pad)*(ny+2*pad)*(nz+2*pad), 0);
+        auto P = [&](int x,int y,int z){ return ((size_t)(x+pad)*(ny+2*pad)+(y+pad))*(nz+2*pad)+(z+pad); };
+        if (rw) for (auto& L : rw->layers) for (size_t k=0; k<L.x.size(); ++k)
+            for (int d=0; d<4; ++d) if (L.partner[4*k+d] >= 0) rwBits[P(L.x[k],L.y[k],L.z)] |= (MASK_RW0 << d);
+        const Vector<T,3> z3(0,0,0); const Vector<T,4> z4(0,0,0,0); const Vector<T,6> z6(0,0,0,0,0,0);
+        for (int x=-pad; x<nx+pad; ++x) for (int y=-pad; y<ny+pad; ++y) for (int z=-pad; z<nz+pad; ++z) {
+            auto cell = block.get(x,y,z);
+            const bool core = x>=0 && x<nx && y>=0 && y<ny && z>=0 && z<nz;
+            int mk = 0;
+            if (core) {
+                if (VeloGradRefresh::carriesFluid(bg.get({x,y,z}))) mk |= MASK_FLUID;
+                const int c[3]={x,y,z}, n[3]={nx,ny,nz};
+                for (int j=0; j<3; ++j) if (c[j]-4 >= -1 && c[j]+4 < n[j]+1) mk |= (MASK_WIDE_X << j);
+                mk |= rwBits[P(x,y,z)];
+                if (bg.get({x,y,z}) == MAT_INLET) {
+                    Vector<T,3> physR; bg.getPhysR(physR, LatticeR<3>{x,y,z});
+                    cell.template setField<descriptors::LOCATION>(physR);
+                }
+            }
+            cell.template setField<UF_MASK>((T)mk);
+            cell.template setField<UF_VBUF>(z3);
+            cell.template setField<RW_SAVE>(z4);
+            cell.template setField<TM_SUM>(z6);
+        }
+        sL.template setProcessingContext<Array<UF_MASK>>(ProcessingContext::Simulation);
+        sL.template setProcessingContext<Array<UF_VBUF>>(ProcessingContext::Simulation);
+        sL.template setProcessingContext<Array<RW_SAVE>>(ProcessingContext::Simulation);
+        sL.template setProcessingContext<Array<TM_SUM>>(ProcessingContext::Simulation);
+        sL.template setProcessingContext<Array<descriptors::LOCATION>>(ProcessingContext::Simulation);
+
+        // inlet: RFG modes as a device array (layout k(3) p(3) q(3) omega), scalars as parameters
+        modes = std::make_unique<SuperFieldArrayD<T,DESCRIPTOR,RFG_MODE>>(sL.getCuboidDecomposition(), load);
+        auto& ma = modes->getBlock(0);
+        ma.resize(in.n_modes);
+        for (int n=0; n<in.n_modes; ++n) {
+            Vector<T,10> v(in.kx[n],in.ky[n],in.kz[n], in.px[n],in.py[n],in.pz[n],
+                           in.qx[n],in.qy[n],in.qz[n], in.omega[n]);
+            ma.set(n, v);
+        }
+        ma.setProcessingContext(ProcessingContext::Simulation);
+        if (!in.enable_turb) throw std::runtime_error("device inlet assumes enable_turb");
+        // Register FIRST, then set parameters: a parameter set before its operator is
+        // registered never reaches it (the OMEGA lesson from the CPU port, again).
+        sL.template addPostProcessor<urbanops::ustage::Inlet>(sg.getMaterialIndicator({MAT_INLET}), meta::id<InletOp>{});
+        block.template setParameter<P_MODES>(ma);
+        block.template setParameter<P_NMODES>((std::size_t)in.n_modes);
+        const double Tsc = in.L_turb / std::max(1e-6, in.u_star * in.sigma_u_ratio);   // ABLInlet::fluct
+        const double g   = std::sqrt(2.0 / in.n_modes);
+        Vector<T,12> a(in.u_star, in.z0, in.d, abl::KAPPA, std::cos(in.wind_angle), std::sin(in.wind_angle),
+                       in.sigma_u_ratio*in.u_star, in.sigma_v_ratio*in.u_star, in.sigma_w_ratio*in.u_star,
+                       in.L_turb, Tsc, conv.getConversionFactorVelocity());
+        sL.template setParameter<P_ABL>(a);
+        sL.template setParameter<P_GAIN>(Vector<T,3>(g*in.gx, g*in.gy, g*in.gz));
+
+        if (wale) {
+            sL.template addPostProcessor<urbanops::ustage::WaleVel>(
+                sg.getMaterialIndicator({MAT_FLUID,MAT_INLET,MAT_OUTLET,MAT_POROUS,MAT_SPONGE}), meta::id<WaleVelOp>{});
+            sL.template addPostProcessor<urbanops::ustage::WaleGrad>(sg.getMaterialIndicator({MAT_FLUID}), meta::id<WaleGradOp>{});
+        }
+        if (rw) {
+            for (auto& L : rw->layers) for (size_t k=0; k<L.x.size(); ++k) {
+                block.addPostProcessor(typeid(urbanops::ustage::RwSave),  LatticeR<3>{L.x[k],L.y[k],L.z}, meta::id<RwSaveOp>{});
+                block.addPostProcessor(typeid(urbanops::ustage::RwApply), LatticeR<3>{L.x[k],L.y[k],L.z}, meta::id<RwApplyOp>{});
+            }
+            sL.template setParameter<P_LNZ>((T)std::log(rw->zP/rw->z0));
+            sL.template setParameter<P_KAPPA>(rw->kappa);
+        }
+        if (ts) {
+            for (auto& c : ts->cells[0]) block.addPostProcessor(typeid(urbanops::ustage::Top), LatticeR<3>{c[0],c[1],c[2]}, meta::id<TopOp>{});
+            sL.template setParameter<P_TOPDIR>(Vector<T,2>(ts->dirX, ts->dirY));
+        }
+        if (tmean) {
+            sL.template addPostProcessor<urbanops::ustage::TMean>(meta::id<TMeanOp>{});
+            sL.template setParameter<P_CVEL>(conv.getConversionFactorVelocity());
+        }
+        clout << "operator path: inlet" << (wale?" + WALE gradient":"") << (rough?" + rough wall":"")
+              << (top?" + top stress":"") << (tmean?" + time mean":"") << " on the lattice's platform" << std::endl;
+        (void)windRad;
+    }
+    // per-step pieces, in urban_flow's order
+    void inlet(SuperLattice<T,DESCRIPTOR>& sL, T physT, T ramp) {
+        sL.template setParameter<urbanops::P_TIME>(physT);
+        sL.template setParameter<urbanops::P_RAMP>(ramp);
+        sL.executePostProcessors(urbanops::ustage::Inlet{});
+    }
+    void waleGrad(SuperLattice<T,DESCRIPTOR>& sL) {
+        if (!wale) return;
+        sL.executePostProcessors(urbanops::ustage::WaleVel{});
+        sL.executePostProcessors(urbanops::ustage::WaleGrad{});
+    }
+    void floor(SuperLattice<T,DESCRIPTOR>& sL, T topDu) {
+        if (rough) { sL.executePostProcessors(urbanops::ustage::RwSave{});
+                     sL.executePostProcessors(urbanops::ustage::RwApply{}); }
+        if (top)   { sL.template setParameter<urbanops::P_TOPDU>(topDu);
+                     sL.executePostProcessors(urbanops::ustage::Top{}); }
+    }
+    void sample(SuperLattice<T,DESCRIPTOR>& sL) { sL.executePostProcessors(urbanops::ustage::TMean{}); }
+    // pull the accumulated time mean into a TimeMean (so the write arithmetic is shared)
+    void fetchMean(SuperLattice<T,DESCRIPTOR>& sL, SuperGeometry<T,3>& sg, TimeMean& tm, long nSamples) {
+        sL.template setProcessingContext<Array<urbanops::TM_SUM>>(ProcessingContext::Evaluation);
+        auto& block = sL.getBlock(0); auto& bg = sg.getBlockGeometry(0);
+        const size_t N = (size_t)tm.nx*tm.ny*tm.nz;
+        for (int x=0;x<bg.getNx();++x) for (int y=0;y<bg.getNy();++y) for (int z=0;z<bg.getNz();++z) {
+            const auto s = block.get(x,y,z).template getField<urbanops::TM_SUM>();
+            const size_t id=(size_t)z*tm.ny*tm.nx+(size_t)y*tm.nx+x;
+            for (int c=0;c<6;++c) tm.sum[c*N+id] = s[c];
+        }
+        tm.nSamples = nSamples;
+    }
+};
+
 // ══════════════════ STEP 4: advection–diffusion transport + deposition ══════════════════
 // Physics (CONTAMINANT_BC.md §1): the AD scalar rides the LIVE NSE flow (not a frozen mean);
 // solid walls carry zero advective flux + a dry-deposition sink; the inlet carries clean air
@@ -695,9 +839,9 @@ struct TimeMean {
 // LINEARITY (§6.2): the AD lattice + Eulerian deposition are linear, so J(Σsᵢ)=ΣJ(sᵢ). Gate 7b
 // (tests/linearity_guard.cpp) checks Θ_{a+b} = Θ_a + Θ_b through SRC_CELLS.
 //
-// Runtime-enabled (STEP4=1). Host operators are OpenMP block loops (G2): fine for the 40³
-// gate box, a full-domain sweep per step on the city, and on GPU they must become
-// post-processors (Phase 8). The NSE→AD velocity copy is OpenLB's own coupling operator.
+// Runtime-enabled (STEP4=1). Ops below are the host reference (OpenMP block loops); DeviceAD
+// runs the same steps as urban_ops.h operators (the only path on GPU). The NSE→AD velocity
+// copy is OpenLB's own coupling operator.
 //
 // Units. C is the AD lattice density (concentration per cell, lattice units), so mass = Σ C.
 // S2: deposition removes the fraction v_d·dt/dx of C per step per deposition face (v_d in
@@ -908,6 +1052,112 @@ struct Ops {
 };
 } // namespace step4
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DeviceAD — operator path for Step 4 (urban_ops.h). Registered on the cell lists
+// step4::Ops::init builds (source, deposition, fluid-ish, flux planes), so the two paths act
+// on identical cells. Per-step work stays on the device; the host pulls fields only at report
+// steps and at the end. Emission is counted on the host (cells x Q per pulse step).
+// ─────────────────────────────────────────────────────────────────────────────
+struct DeviceAD {
+    long nSrcCV = 0, nSrcOut = 0;
+    bool settle = false;
+    void init(step4::ADLat& ad, SuperGeometry<T,3>& sg, step4::Ops& ops, T dt, T wsLB) {
+        using namespace urbanops;
+        auto& block = ad.getBlock(0);
+        const int pad = block.getPadding();
+        block.template getField<AD_SEL>(); block.template getField<AD_RATE>();
+        block.template getField<AD_THETA>(); block.template getField<AD_DEP>(); block.template getField<AD_FLUX>();
+        auto& B = ops.blk[0];
+        for (int x=-pad;x<B.bnx+pad;++x) for (int y=-pad;y<B.bny+pad;++y) for (int z=-pad;z<B.bnz+pad;++z) {
+            auto c = block.get(x,y,z);
+            c.template setField<AD_SEL>(T(0)); c.template setField<AD_RATE>(T(0));
+            c.template setField<AD_THETA>(T(0)); c.template setField<AD_DEP>(T(0)); c.template setField<AD_FLUX>(T(0));
+        }
+        std::vector<int> sel((size_t)B.bnx*B.bny*B.bnz, 0);
+        auto I = [&](int x,int y,int z){ return ((size_t)x*B.bny+y)*B.bnz+z; };
+        for (size_t k=0;k<B.sx.size();++k) {
+            sel[I(B.sx[k],B.sy[k],B.sz[k])] |= 1;
+            const int X = B.gx0+B.sx[k]; if (X>=ops.xLo && X<=ops.xHi) ++nSrcCV; else ++nSrcOut;
+        }
+        for (int x=0;x<B.bnx;++x) {                                  // Ops::faceFlux planes
+            const int X = B.gx0+x; int code = FLUX_NONE;
+            if      (X == ops.xHi+1) code = FLUX_DN_PLUS;
+            else if (X == ops.xHi)   code = FLUX_DN_MINUS;
+            else if (X == 0)         code = FLUX_UP_PLUS;
+            else if (X == 1)         code = FLUX_UP_MINUS;
+            if (code) for (int y=0;y<B.bny;++y) for (int z=0;z<B.bnz;++z) sel[I(x,y,z)] |= (code << 1);
+        }
+        for (int x=0;x<B.bnx;++x) for (int y=0;y<B.bny;++y) for (int z=0;z<B.bnz;++z)
+            if (sel[I(x,y,z)]) block.get(x,y,z).template setField<AD_SEL>((T)sel[I(x,y,z)]);
+        for (size_t k=0;k<B.rate.size();++k) block.get(B.dxv[k],B.dyv[k],B.dzv[k]).template setField<AD_RATE>(B.rate[k]);
+        ad.template setProcessingContext<Array<AD_SEL>>(ProcessingContext::Simulation);
+        ad.template setProcessingContext<Array<AD_RATE>>(ProcessingContext::Simulation);
+        ad.template setProcessingContext<Array<AD_THETA>>(ProcessingContext::Simulation);
+        ad.template setProcessingContext<Array<AD_DEP>>(ProcessingContext::Simulation);
+        ad.template setProcessingContext<Array<AD_FLUX>>(ProcessingContext::Simulation);
+        // registration, per cell from the same lists
+        for (int x=0;x<B.bnx;++x) for (int y=0;y<B.bny;++y) for (int z=0;z<B.bnz;++z)
+            if (sel[I(x,y,z)] >> 1) block.addPostProcessor(typeid(urbanops::ustage::AdFlux), LatticeR<3>{x,y,z}, meta::id<AdFluxOp>{});
+        for (size_t k=0;k<B.sx.size();++k)
+            block.addPostProcessor(typeid(urbanops::ustage::AdInject), LatticeR<3>{B.sx[k],B.sy[k],B.sz[k]}, meta::id<AdInjectOp>{});
+        for (size_t k=0;k<B.rate.size();++k)
+            block.addPostProcessor(typeid(urbanops::ustage::AdDeposit), LatticeR<3>{B.dxv[k],B.dyv[k],B.dzv[k]}, meta::id<AdDepositOp>{});
+        ad.template addPostProcessor<urbanops::ustage::AdTheta>(sg.getMaterialIndicator({MAT_FLUID,MAT_POROUS,MAT_SPONGE}), meta::id<AdThetaOp>{});
+        ad.template setParameter<P_DT>(dt);
+        settle = wsLB > 0;
+        if (settle) {
+            for (size_t k=0;k<B.ag.size();++k)
+                block.addPostProcessor(typeid(urbanops::ustage::AdSettle), LatticeR<3>{B.ax[k],B.ay[k],B.az[k]}, meta::id<AdSettleOp>{});
+            ad.template setParameter<P_WS>(wsLB);
+        }
+    }
+    // after adLattice.collideAndStream(): Ops' order is flux, inject, deposit, accumulate
+    void step(step4::ADLat& ad, bool pulseOn, T q, double& emit, double& emitOut) {
+        ad.executePostProcessors(urbanops::ustage::AdFlux{});
+        if (pulseOn) {
+            ad.template setParameter<urbanops::P_Q>(q);
+            ad.executePostProcessors(urbanops::ustage::AdInject{});
+            emit += (double)nSrcCV*q; emitOut += (double)nSrcOut*q;
+        }
+        ad.executePostProcessors(urbanops::ustage::AdDeposit{});
+        ad.executePostProcessors(urbanops::ustage::AdTheta{});
+    }
+    void settleStep(step4::ADLat& ad) { if (settle) ad.executePostProcessors(urbanops::ustage::AdSettle{}); }
+    // host reductions at a report step: the same sums step4::Ops keeps per step
+    void report(step4::ADLat& ad, SuperGeometry<T,3>& sg, step4::Ops& ops,
+                double& airCV, double& airAll, double& depCV, double& depOut,
+                double& outDown, double& outUp, double& wTheta) {
+        ad.setProcessingContext(ProcessingContext::Evaluation);
+        auto& b = ad.getBlock(0); auto& bg = sg.getBlockGeometry(0); auto& B = ops.blk[0];
+        double cv=0, all=0, dc=0, dq=0, fd=0, fu=0, wt=0;
+        const bool hasW = !ops.w.empty();
+        for (size_t k=0;k<B.ag.size();++k) {
+            auto c = b.get(B.ax[k],B.ay[k],B.az[k]);
+            const T C = step4::Ops::conc(c);
+            if (B.acv[k]) cv += C;
+            const int m = bg.get({B.ax[k],B.ay[k],B.az[k]});
+            if (m==MAT_FLUID||m==MAT_POROUS||m==MAT_SPONGE) { all += C;
+                if (hasW) wt += (double)ops.w[B.ag[k]] * c.template getField<urbanops::AD_THETA>(); }
+            const int X = B.gx0+B.ax[k];
+            const T dp = c.template getField<urbanops::AD_DEP>();
+            if (dp != 0) { if (X>=ops.xLo && X<=ops.xHi) dc += dp; else dq += dp; }
+            const T fl = c.template getField<urbanops::AD_FLUX>();
+            if (fl != 0) { if (X >= ops.xHi) fd += fl; else fu += fl; }
+        }
+        airCV=cv; airAll=all; depCV=dc; depOut=dq; outDown=fd; outUp=fu; wTheta=wt;
+    }
+    // final fields for export (theta, deposition)
+    void fetch(step4::ADLat& ad, step4::Ops& ops) {
+        ad.setProcessingContext(ProcessingContext::Evaluation);
+        auto& b = ad.getBlock(0); auto& B = ops.blk[0];
+        for (size_t k=0;k<B.ag.size();++k) {
+            auto c = b.get(B.ax[k],B.ay[k],B.az[k]);
+            ops.theta[B.ag[k]] = c.template getField<urbanops::AD_THETA>();
+            ops.dep[B.ag[k]]   = c.template getField<urbanops::AD_DEP>();
+        }
+    }
+};
+
 // write Θ and deposition fields in the project 5-int format for Stage C (J = ⟨w,Θ⟩/|Ω|)
 static void writeField5(const std::string& fn,const std::vector<float>& d,int nx,int ny,int nz,double dx){
     FILE* f=fopen(fn.c_str(),"wb"); if(!f)return; int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1};
@@ -1054,22 +1304,6 @@ int main(int argc, char* argv[]) {
     const T ustarLB = converter.getLatticeVelocity((T)gInlet.u_star);
     if (TOP_STRESS) { topStress.init(superGeometry, nz, WIND_DEG*M_PI/180.0);
         clout << "top: shear stress u*^2 (u*=" << gInlet.u_star << " m/s) on " << topStress.nCells << " cells" << std::endl; }
-    int floorIT = 0;                                         // step counter for the ramp
-    auto floorStep = [&]{
-        if (GROUND_MODEL==1) roughWall.apply(sLattice);
-        if (TOP_STRESS) {
-            const T r = bridge::AblVelocityF3D<T,DESCRIPTOR,UnitConverter<T,DESCRIPTOR>>::smoothstep(
-                            rampSteps>0 ? (T)floorIT/(T)rampSteps : T(1));
-            topStress.apply(sLattice, ustarLB*r);
-        }
-        ++floorIT;
-    };
-
-    const T cvel = converter.getConversionFactorVelocity();
-    T peakU = 0;
-    util::Timer<T> timer(MAX_STEPS, superGeometry.getStatistics().getNvoxel());
-    timer.start();
-
 #if COLLISION_MODEL==0
     VeloGradRefresh veloGrad;                             // WALE needs VELO_GRAD every step
     auto refreshWALE = [&]{ veloGrad(sLattice, superGeometry); };
@@ -1079,11 +1313,62 @@ int main(int argc, char* argv[]) {
     const int GRAD_CHECK_AT = -1;
 #endif
 
+    // HOST_OPS=1 runs the original host loops: the CPU reference the operator path must
+    // reproduce bitwise (tests/device_parity.sh). A GPU lattice cannot use them at all.
+    //
+    // Default: host loops on a CPU lattice (OpenLB's CPU operator dispatch resolves dynamic
+    // fields per access and ran the operator path at ~0.45x the host loops' speed), the
+    // operator path on a GPU lattice, where the host loops cannot run. HOST_OPS=0 on CPU runs
+    // the operator path, bitwise identical to the host loops (tests/device_parity.sh).
+    const bool gpuLattice = sLattice.getLoadBalancer().platform(0) == Platform::GPU_CUDA;
+    const bool HOST_OPS = envi("HOST_OPS", gpuLattice ? 0 : 1) != 0;
+    if (HOST_OPS && gpuLattice) {
+        clout << "HOST_OPS=1 is the CPU reference path; it cannot run on a GPU lattice" << std::endl; return 2; }
+    clout << "lattice platform: " << (gpuLattice ? "GPU_CUDA" : "CPU") << ", per-step work: "
+          << (HOST_OPS ? "host loops (CPU reference)" : "operators (urban_ops.h)") << std::endl;
+    DeviceNSE dev;
+    if (!HOST_OPS)
+        dev.init(sLattice, superGeometry, converter, gInlet,
+                 GROUND_MODEL==1 ? &roughWall : nullptr, TOP_STRESS ? &topStress : nullptr,
+                 COLLISION_MODEL==0, AVG_FT>0, WIND_DEG*M_PI/180.0);
+    // Whole-lattice pull for host-side reads (guard scan, checks, export). A no-op on CPU.
+    auto pullNSE = [&]{ sLattice.setProcessingContext(ProcessingContext::Evaluation); };
+
+    int floorIT = 0;                                         // step counter for the ramp
+    auto floorStep = [&]{
+        const T r = bridge::AblVelocityF3D<T,DESCRIPTOR,UnitConverter<T,DESCRIPTOR>>::smoothstep(
+                        rampSteps>0 ? (T)floorIT/(T)rampSteps : T(1));
+        const T us = ustarLB*r;
+        if (HOST_OPS) {
+            if (GROUND_MODEL==1) roughWall.apply(sLattice);
+            if (TOP_STRESS) topStress.apply(sLattice, us);
+        } else dev.floor(sLattice, us*us);                 // TopStress::apply: du = u*_lb^2
+        ++floorIT;
+    };
+    // inlet + WALE gradient, before each collide
+    auto preCollide = [&](int iStep, int ramp_steps) {
+        if (HOST_OPS) {
+            setBoundaryValues(sLattice, converter, superGeometry, iStep, ramp_steps);
+            refreshWALE();
+        } else {
+            dev.inlet(sLattice, converter.getPhysTime(iStep),
+                      bridge::AblVelocityF3D<T,DESCRIPTOR,UnitConverter<T,DESCRIPTOR>>::smoothstep(
+                          ramp_steps>0 ? (T)iStep/(T)ramp_steps : T(1)));
+            dev.waleGrad(sLattice);
+        }
+    };
+
+    const T cvel = converter.getConversionFactorVelocity();
+    T peakU = 0;
+    util::Timer<T> timer(MAX_STEPS, superGeometry.getStatistics().getNvoxel());
+    timer.start();
+
+
     for (int iT=0; iT<MAX_STEPS; ++iT) {
-        setBoundaryValues(sLattice, converter, superGeometry, iT, rampSteps);   // C3
-        refreshWALE();
+        preCollide(iT, rampSteps);                                              // C3 + WALE
 #if COLLISION_MODEL==0
         if (iT == GRAD_CHECK_AT) {
+            pullNSE();
             // One-shot check of VeloGradRefresh against OpenLB's own functor, on MAT_FLUID
             // cells whose +-4 neighbourhood carries fluid on every axis, where both take the
             // 8th-order central branch. Must agree to round-off; else an indexing/layout bug.
@@ -1111,7 +1396,10 @@ int main(int argc, char* argv[]) {
 #endif
         sLattice.collideAndStream();                                            // CONFIRM 1.8
         floorStep();                                                            // C2
-        if (iT>=avgStart && (iT-avgStart)%AVG_EVERY==0) tmean.sample(sLattice, superGeometry, cvel);
+        if (iT>=avgStart && (iT-avgStart)%AVG_EVERY==0) {
+            if (HOST_OPS) tmean.sample(sLattice, superGeometry, cvel);
+            else { dev.sample(sLattice); ++tmean.nSamples; }
+        }
 
         if (ADM_EVERY>0 && iT%ADM_EVERY==0) {                                   // C6 optional ADM filter
             // CONFIRM 1.8: SuperLatticeADM3D<T,DESCRIPTOR> admF(sLattice, adm_sigma, adm_order);
@@ -1119,6 +1407,7 @@ int main(int argc, char* argv[]) {
         }
         if (iT%CHECK==0) {
             T maxU = 0;
+            pullNSE();
             if (!healthy(sLattice, superGeometry, &maxU)) { return 2; }         // C4 abort on divergence
             peakU = std::max(peakU, maxU);
             timer.update(iT); timer.printStep();
@@ -1127,9 +1416,11 @@ int main(int argc, char* argv[]) {
                         rampSteps>0?(T)iT/(T)rampSteps:T(1)) << std::endl;
         }
     }
+    pullNSE();
     { T maxU = 0; if (!healthy(sLattice, superGeometry, &maxU)) return 2; peakU = std::max(peakU, maxU); }
     timer.stop(); timer.printSummary();
     clout << "peak lattice |u| over run = " << peakU << " (Mach " << peakU*std::sqrt(3.0) << ")" << std::endl;
+    if (AVG_FT>0 && !HOST_OPS) dev.fetchMean(sLattice, superGeometry, tmean, tmean.nSamples);
     if (AVG_FT>0) { tmean.write(OUT+"/uavg.f32", dx);
         clout << "wrote time mean " << OUT << "/uavg.f32 (" << tmean.nSamples << " samples)" << std::endl; }
 
@@ -1205,6 +1496,7 @@ int main(int argc, char* argv[]) {
                                   names::NavierStokes{}, sLattice, names::Concentration0{}, adLattice);
     coupling.restrictTo(superGeometry.getMaterialIndicator({MAT_FLUID,MAT_POROUS,MAT_SPONGE,MAT_INLET,MAT_OUTLET}));
     if (uniform) { ops.uniformVelocity(adLattice, converter.getLatticeVelocity(U_UNIFORM));
+                   adLattice.template setProcessingContext<Array<descriptors::VELOCITY>>(ProcessingContext::Simulation);
                    cl4 << "frozen uniform wind " << U_UNIFORM << " m/s (NSE not stepped)" << std::endl; }
     const T wsLB = converter.getLatticeVelocity(envd("W_SETTLE", 0.0));
 
@@ -1215,40 +1507,49 @@ int main(int argc, char* argv[]) {
     const int TS_EVERY = envi("TS_EVERY", 200);
     // emit is the CV's emission (what the budget closes against); emitOut is Ω beyond the CV.
     double emit=0, emitOut=0, depCV=0, depOut=0, outDown=0, outUp=0, airCV=0, airAll=0, peakAir=0; int endStep=MAXB;
+    double wTheta=0;
     { double a0=0; const double m0 = ops.accumulate(adLattice, superGeometry, 0, a0);
       cl4 << "pre-release CV mass " << m0 << " (must be 0)" << std::endl; }
+    DeviceAD dad;
+    if (!HOST_OPS) dad.init(adLattice, superGeometry, ops, dt, wsLB);
     FILE* ts=fopen((OUT+"/exposure_timeseries.csv").c_str(),"w");
     if(ts) fprintf(ts,"step,t_s,airborne_cv,deposited_cv,emitted,out_downstream,out_upstream,budget_resid,airborne_all,J\n");
 
+    // Totals, the clearance test and the NaN check are evaluated at report steps (every
+    // TS_EVERY and the last step), in both paths: on a GPU they need a device->host pull.
     for (int iB=0; iB<MAXB; ++iB) {
         if (!uniform) {
-            setBoundaryValues(sLattice, converter, superGeometry, MAX_STEPS+iB, 0);   // inlet stays live
-            refreshWALE();
+            preCollide(MAX_STEPS+iB, 0);                                              // inlet stays live
             sLattice.collideAndStream();                                              // NSE (live)
             floorStep();
             coupling.execute();                                                       // u -> AD VELOCITY
-            ops.settle(adLattice, wsLB);                                              // −w_s ẑ
+            if (HOST_OPS) ops.settle(adLattice, wsLB); else dad.settleStep(adLattice); // −w_s ẑ
         }
         adLattice.collideAndStream();
-        double fd=0, fu=0; ops.faceFlux(adLattice, fd, fu); outDown+=fd; outUp+=fu;
         const bool pulseOn = (iB*dt) < PULSE_S;
-        if (pulseOn) emit += ops.inject(adLattice, Q_RATE, emitOut);
-        depCV += ops.deposit(adLattice, depOut);
-        airCV = ops.accumulate(adLattice, superGeometry, dt, airAll);
+        if (HOST_OPS) {
+            double fd=0, fu=0; ops.faceFlux(adLattice, fd, fu); outDown+=fd; outUp+=fu;
+            if (pulseOn) emit += ops.inject(adLattice, Q_RATE, emitOut);
+            depCV += ops.deposit(adLattice, depOut);
+            airCV = ops.accumulate(adLattice, superGeometry, dt, airAll);
+            wTheta = ops.wTheta;
+        } else dad.step(adLattice, pulseOn, Q_RATE, emit, emitOut);
+        const bool report = (iB%TS_EVERY==0) || (iB==MAXB-1);
+        if (!report) continue;
+        if (!HOST_OPS) dad.report(adLattice, superGeometry, ops, airCV, airAll, depCV, depOut, outDown, outUp, wTheta);
         peakAir = std::max(peakAir, airCV);
         const double resid = emit>0 ? (emit-(depCV+airCV+outDown+outUp))/emit : 0.0;
         if (!std::isfinite(airCV)) { OstreamManager c(std::cout,"DIVERGED"); c<<"AD non-finite at burst step "<<iB<<std::endl; if(ts)fclose(ts); return 2; }
-        if (iB%TS_EVERY==0) {
-            // J(t) = <w,Θ(t)>/M_released: Stage C's J accumulated so far (lattice units)
-            const double Jt = (emit+emitOut)>0 ? ops.wTheta/(emit+emitOut) : 0.0;
-            if (ts) { fprintf(ts,"%d,%.4f,%.9e,%.9e,%.9e,%.9e,%.9e,%.3e,%.9e,%.9e\n",iB,iB*dt,airCV,depCV,emit,outDown,outUp,resid,airAll,Jt); fflush(ts); }
-            cl4 << "iB=" << iB << " t=" << iB*dt << "s air=" << airCV << " dep=" << depCV
-                << " out=" << outDown << "+" << outUp << " emit=" << emit << " resid=" << resid
-                << " airborne_frac=" << ((emit+emitOut)>0 ? airAll/(emit+emitOut) : 0.0) << " J=" << Jt << std::endl;
-        }
+        // J(t) = <w,Θ(t)>/M_released: Stage C's J accumulated so far (lattice units)
+        const double Jt = (emit+emitOut)>0 ? wTheta/(emit+emitOut) : 0.0;
+        if (ts) { fprintf(ts,"%d,%.4f,%.9e,%.9e,%.9e,%.9e,%.9e,%.3e,%.9e,%.9e\n",iB,iB*dt,airCV,depCV,emit,outDown,outUp,resid,airAll,Jt); fflush(ts); }
+        cl4 << "iB=" << iB << " t=" << iB*dt << "s air=" << airCV << " dep=" << depCV
+            << " out=" << outDown << "+" << outUp << " emit=" << emit << " resid=" << resid
+            << " airborne_frac=" << ((emit+emitOut)>0 ? airAll/(emit+emitOut) : 0.0) << " J=" << Jt << std::endl;
         if (CLEAR>0 && !pulseOn && peakAir>0 && airCV < CLEAR*peakAir) { endStep=iB+1; break; }
     }
     if (ts) fclose(ts);
+    if (!HOST_OPS) dad.fetch(adLattice, ops);
 
     // export Θ = ∫C dt and the deposition map for Stage C (J = ⟨w,Θ⟩/|Ω|)
     std::vector<float> th(ops.theta.begin(), ops.theta.end()), de(ops.dep.begin(), ops.dep.end());

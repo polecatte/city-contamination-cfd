@@ -8,6 +8,10 @@
 #   ./lab_openlb.sh all       # the four above, in order
 #   ./lab_openlb.sh status    # what has run, what passed
 #
+#   GPU=1 ./lab_openlb.sh setup|gates|city|all|status   # the same, on the GPU build
+#   GPU=1 ./lab_openlb.sh parity    # GPU vs CPU build on short cases (tests/device_parity.sh)
+#   ./lab_openlb.sh compare         # CPU and GPU gate numbers side by side
+#
 # Resumable: every step writes $WORK/done/<step> when it finishes and is skipped next time
 # (delete the marker to rerun one). Run it under tmux or nohup — it takes hours:
 #   tmux new -s olb './lab_openlb.sh all 2>&1 | tee -a ~/olb_lab/lab.log; read -p "[done - Enter to close]"'
@@ -16,10 +20,15 @@
 #   WORK      working directory (default ~/olb_lab): OpenLB tree, geometries, outputs, logs
 #   OLB_ROOT  an existing OpenLB 1.8.1 tree to use instead of downloading one
 #   THREADS   OpenMP threads (default: nproc)
+#   GPU=1     use the CUDA build: its own OpenLB tree and outputs under $WORK/gpu, the
+#             geometries shared with the CPU runs. Needs an NVIDIA driver; nvcc >= 12.4 is
+#             taken from PATH or $NVCC, else CUDA 12.6 is installed from conda-forge into
+#             $WORK/cuda126 (no root). CUDA_ARCH defaults to nvidia-smi's compute capability.
 #
-# CPU/OpenMP only. The host operators added in Phases 5-7 (WALE gradient refresh, rough wall,
-# top stress, the Step-4 loops) are not MPI-reduced and not yet on-device, so neither
-# PARALLEL_MODE=MPI nor the GPU build is valid for these runs (Phase 8).
+# Every per-step operator (inlet, WALE gradient, rough wall, top stress, time mean, Step-4
+# flux/inject/deposit/theta/settle) exists twice: host loops (the CPU reference, default on
+# CPU) and OpenLB operators in urban_ops.h (default on GPU, HOST_OPS=0 on CPU). The two agree
+# bitwise on CPU (tests/device_parity.sh STRICT=1). Not MPI: one cuboid per process.
 # Results and what each gate means: OPENLB_PHASE5_6_GATES.md.
 set -euo pipefail
 
@@ -30,8 +39,15 @@ OLB_URL_GITLAB="https://gitlab.com/openlb/release/-/archive/1.8.1/release-1.8.1.
 OLB_URL_ZENODO="https://zenodo.org/records/15440776/files/release-1.8.1.tar.gz?download=1"
 export OMP_NUM_THREADS="$THREADS"
 
+WORK_CPU="$WORK"
+CPU_BIN="$WORK_CPU/release-1.8.1/examples/urban/urban_flow/urban_flow"
+if [ "${GPU:-0}" = 1 ]; then
+  WORK="$WORK_CPU/gpu"
+  OLB_ROOT="${OLB_ROOT_GPU:-$WORK/release-1.8.1}"
+else
+  OLB_ROOT="${OLB_ROOT:-$WORK/release-1.8.1}"
+fi
 mkdir -p "$WORK/done" "$WORK/logs"
-OLB_ROOT="${OLB_ROOT:-$WORK/release-1.8.1}"
 APP="$OLB_ROOT/examples/urban/urban_flow"
 BIN="$APP/urban_flow"
 SUMMARY="$WORK/summary.txt"
@@ -61,7 +77,7 @@ build() {
   if ! "$@" > "$WORK/logs/build_$name.log" 2>&1; then
     say "FAIL build $name. First errors:"
     { grep -m 20 -E 'error|Error|fatal|undefined reference|cannot find' "$WORK/logs/build_$name.log" || tail -n 30 "$WORK/logs/build_$name.log"; } | sed 's/^/     /'
-    say "compiler: $(g++ --version | head -1)"
+    say "compiler: $(g++ --version | head -1)${NVCC_USED:+; nvcc: $("$NVCC_USED" --version | tail -2 | head -1)}"
     exit 1
   fi
 }
@@ -79,15 +95,80 @@ gate() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# nvcc for the GPU build. OpenLB 1.8 needs CUDA >= 12.4 or so: 12.0 rejects its consteval
+# std::source_location (src/core/fields.h). Order: $NVCC, nvcc on PATH if new enough, a
+# conda-forge CUDA 12.6 in $WORK_CPU/cuda126 (installed here with micromamba if missing).
+cuda_toolchain() {
+  command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,memory.used --format=csv,noheader \
+    | sed 's/^/     GPU: /' || say "WARNING: nvidia-smi not found — the GPU build will compile but cannot run here"
+  local v
+  if [ -n "${NVCC:-}" ]; then NVCC_USED="$NVCC"
+  elif command -v nvcc >/dev/null && v=$(nvcc --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1 \2/p') \
+       && [ "${v% *}" -gt 12 -o \( "${v% *}" -eq 12 -a "${v#* }" -ge 4 \) ]; then NVCC_USED="$(command -v nvcc)"
+  else
+    local C="$WORK_CPU/cuda126"
+    if [ ! -x "$C/bin/nvcc" ]; then
+      say "no nvcc >= 12.4 (found: $(command -v nvcc >/dev/null && nvcc --version | tail -2 | head -1 || echo none)); installing CUDA 12.6 from conda-forge into $C"
+      [ -x "$WORK_CPU/micromamba" ] || curl -fL -o "$WORK_CPU/micromamba" \
+        https://github.com/mamba-org/micromamba-releases/releases/latest/download/micromamba-linux-64
+      chmod +x "$WORK_CPU/micromamba"
+      MAMBA_ROOT_PREFIX="$WORK_CPU/mamba" "$WORK_CPU/micromamba" create -y -q -p "$C" -c conda-forge \
+        "cuda-nvcc=12.6" "cuda-cudart-dev=12.6" "cuda-driver-dev=12.6" > "$WORK/logs/cuda_install.log" 2>&1 \
+        || { say "FAIL installing CUDA (log: $WORK/logs/cuda_install.log)"; exit 1; }
+    fi
+    NVCC_USED="$C/bin/nvcc"; CUDA_LIBDIR="$C/lib"
+  fi
+  # CUDA 12.x accepts gcc <= 13 as host compiler
+  local gv; gv=$(g++ -dumpversion | cut -d. -f1)
+  if [ -z "${CUDA_HOST_CXX:-}" ] && [ "$gv" -gt 13 ]; then
+    for c in g++-13 g++-12; do command -v $c >/dev/null && { CUDA_HOST_CXX=$c; break; }; done
+    [ -n "${CUDA_HOST_CXX:-}" ] || say "WARNING: g++ $gv is newer than CUDA 12 supports and no g++-13/12 found"
+  fi
+  say "nvcc: $NVCC_USED ($("$NVCC_USED" --version | tail -2 | head -1))${CUDA_HOST_CXX:+, host compiler $CUDA_HOST_CXX}"
+}
+
+# GPU build vs CPU build on four short cases that execute every operator (see the script).
+do_parity() {
+  [ "${GPU:-0}" = 1 ] || { echo "parity compares the GPU build against the CPU one: run it as GPU=1 $0 parity"; exit 2; }
+  [ -x "$BIN" ] || { echo "run 'GPU=1 $0 setup' first"; exit 1; }
+  [ -x "$CPU_BIN" ] || { echo "no CPU build at $CPU_BIN: run '$0 setup' first"; exit 1; }
+  gate parity env REF="$CPU_BIN" TEST="$BIN" "$REPO/tests/device_parity.sh" "$WORK_CPU" "$WORK/parity"
+  grep -E '^\[parity\]|rel.diff|worst' "$WORK/logs/parity.log" | sed 's/^/     /'
+}
+
+# the gates' deciding numbers, CPU next to GPU
+do_compare() {
+  for g in gate6a gate6b_dx4 gate6b_dx2 gate7a gate7c gate7b gate8 wake; do
+    for side in cpu gpu; do
+      local L="$WORK_CPU/logs/$g.log"; [ $side = gpu ] && L="$WORK_CPU/gpu/logs/$g.log"
+      [ -f "$L" ] || continue
+      grep -E '^\[(6a|6b|7a|7c|7b|8|J|wake)\]|drift|Xr/H|closure|PASS|FAIL' "$L" | tail -6 | sed "s/^/$g $side: /"
+    done
+  done
+  grep -h -E 'MLUPs :' "$WORK_CPU"/out_*.log "$WORK_CPU"/gpu/out_*.log 2>/dev/null | head -20 || true
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 do_setup() {
   command -v g++ >/dev/null || { echo "need g++ (C++20)"; exit 1; }
   if [ ! -d "$OLB_ROOT/src" ]; then
     say "fetching OpenLB 1.8.1"
-    ( cd "$WORK" && { curl -fL -o olb.tar.gz "$OLB_URL_GITLAB" || curl -fL -o olb.tar.gz "$OLB_URL_ZENODO"; } \
-      && tar xzf olb.tar.gz )
+    if [ -f "$WORK_CPU/olb.tar.gz" ] && [ "$WORK" != "$WORK_CPU" ]; then
+      ( cd "$WORK" && tar xzf "$WORK_CPU/olb.tar.gz" )        # the GPU tree: same tarball
+    else
+      ( cd "$WORK" && { curl -fL -o olb.tar.gz "$OLB_URL_GITLAB" || curl -fL -o olb.tar.gz "$OLB_URL_ZENODO"; } \
+        && tar xzf olb.tar.gz )
+    fi
     [ -d "$OLB_ROOT/src" ] || { echo "no src/ under $OLB_ROOT after extracting — check the tarball's top directory"; exit 1; }
   fi
-  step olb_config    env OLB_ROOT="$OLB_ROOT" "$REPO/olbconfig.sh" cpu-mt
+  if [ "${GPU:-0}" = 1 ]; then
+    cuda_toolchain
+    step olb_config env OLB_ROOT="$OLB_ROOT" NVCC="$NVCC_USED" CUDA_LIBDIR="${CUDA_LIBDIR:-}" \
+         CUDA_HOST_CXX="${CUDA_HOST_CXX:-}" CUDA_ARCH="${CUDA_ARCH:-}" "$REPO/olbconfig.sh" gpu
+    grep -E '^(CXX|CUDA_ARCH|FLOATING_POINT_TYPE) ' "$OLB_ROOT/config.mk" | sed 's/^/     /'
+  else
+    step olb_config env OLB_ROOT="$OLB_ROOT" "$REPO/olbconfig.sh" cpu-mt
+  fi
   step olb_external  make -C "$OLB_ROOT/external"
   # OpenLB's core library and any app objects must match the configured mode. A tree built
   # earlier in another mode (serial for Phases 1-4) keeps objects that no longer link
@@ -96,22 +177,31 @@ do_setup() {
   local cfg; cfg="$(md5sum "$OLB_ROOT/config.mk" | cut -c1-12)"
   step "olb_core_$cfg" sh -c "make -C '$OLB_ROOT' clean-core && make -C '$OLB_ROOT' -j$THREADS core"
   mkdir -p "$APP"
-  for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h; do ln -sf "$REPO/$f" "$APP/$f"; done
+  for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h urban_ops.h; do ln -sf "$REPO/$f" "$APP/$f"; done
   printf 'EXAMPLE = urban_flow\nOLB_ROOT := ../../..\ninclude $(OLB_ROOT)/default.mk\n' > "$APP/Makefile"
   # the app is always rebuilt: it is cheap next to a run and the sources may have been pulled
   rm -f "${APP:?}"/*.o "${APP:?}"/*.d "${APP:?}/urban_flow"
   build app       make -C "$APP"
+  if [ "${GPU:-0}" = 1 ] && command -v cuobjdump >/dev/null; then
+    cuobjdump --list-elf "$BIN" 2>/dev/null | grep -q "sm_$(grep -E '^CUDA_ARCH' "$OLB_ROOT/config.mk" | awk '{print $3}')" \
+      && say "app holds sm_$(grep -E '^CUDA_ARCH' "$OLB_ROOT/config.mk" | awk '{print $3}') kernels" \
+      || say "WARNING: no kernels for the configured CUDA_ARCH in $BIN (cuobjdump --list-elf)"
+  fi
   build gen_openlb_geom g++ -O3 -std=c++17 -I"$REPO" -DCELL_SIZE_M=4.0 "$REPO/gen_openlb_geom.cpp" -o "$WORK/gen_openlb_geom"
   build gen_gate6_geom  g++ -O2 -std=c++17 -I"$REPO" "$REPO/gen_gate6_geom.cpp" -o "$WORK/gen_gate6_geom"
   build linearity_guard g++ -O2 -std=c++17 -I"$REPO" "$REPO/tests/linearity_guard.cpp" -o "$WORK/linearity_guard"
   python3 -c 'import numpy, matplotlib' 2>/dev/null || say "WARNING: python3 numpy/matplotlib missing — analysers need numpy"
+  if [ "$WORK" != "$WORK_CPU" ] && [ -f "$WORK_CPU/done/geometry" ]; then
+    for g in geom_prod geom_abl geom_cube geom_cube_dx2 geom_box; do ln -sfn "$WORK_CPU/$g" "$WORK/$g"; done
+    mark geometry; say "geometry: shared with the CPU runs ($WORK_CPU)"
+  fi
   step geometry sh -c '
     OUT_DIR=geom_prod ./gen_openlb_geom &&
     CASE=abl  OUT_DIR=geom_abl  ./gen_gate6_geom &&
     CASE=cube OUT_DIR=geom_cube ./gen_gate6_geom &&
     CASE=cube DX=2 CUBE_H=20 OUT_DIR=geom_cube_dx2 ./gen_gate6_geom &&
     CASE=box  OUT_DIR=geom_box  ./gen_gate6_geom'
-  grep -E 'Voxel grid|Omega|GATE' "$WORK/logs/geometry.log" | head -4 | sed 's/^/     /'
+  { grep -E 'Voxel grid|Omega|GATE' "$WORK/logs/geometry.log" 2>/dev/null || true; } | head -4 | sed 's/^/     /'
 }
 
 do_gates() {
@@ -169,12 +259,16 @@ do_package() {
     echo "repo commit: $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     cat "$SUMMARY" 2>/dev/null || true
     grep -h -E 'MLUPs :' "$WORK"/out_*.log "$WORK"/city_s*.log 2>/dev/null | sed 's/^/throughput /' || true
+    if [ -f "$WORK/gpu/summary.txt" ]; then echo "== GPU build =="; cat "$WORK/gpu/summary.txt"
+      grep -h -E 'MLUPs :' "$WORK"/gpu/out_*.log "$WORK"/gpu/city_s*.log 2>/dev/null | sed 's/^/gpu throughput /' || true; fi
   } > "$WORK/summary_$ts.txt"
   # Only what exists: a pattern that matches nothing (e.g. no run logs yet) is dropped rather
   # than handed to tar as a literal name.
   ( cd "$WORK" && shopt -s nullglob && \
     files=( "summary_$ts.txt" logs done *.log g5_*.txt out_*/meta*.txt out_*/*.png out_*/*.csv \
-            city_s*/meta*.txt city_s*/*.csv city_s*/figs lin7b/*/meta_flow.txt ) && \
+            city_s*/meta*.txt city_s*/*.csv city_s*/figs lin7b/*/meta_flow.txt \
+            gpu/summary.txt gpu/logs gpu/done gpu/*.log gpu/out_*/meta*.txt gpu/out_*/*.png gpu/out_*/*.csv \
+            gpu/city_s*/meta*.txt gpu/city_s*/*.csv gpu/city_s*/figs gpu/parity/*.log ) && \
     tar czf "olb_lab_$ts.tar.gz" "${files[@]}" )
   say "packaged $WORK/olb_lab_$ts.tar.gz"
   cat "$WORK/summary_$ts.txt"
@@ -184,7 +278,9 @@ case "${1:-status}" in
   setup)   do_setup ;;
   gates)   do_gates ;;
   city)    do_city ;;
-  package) do_package ;;
+  package) [ "${GPU:-0}" = 1 ] && { WORK="$WORK_CPU"; SUMMARY="$WORK/summary.txt"; }; do_package ;;
+  parity)  do_parity ;;
+  compare) do_compare ;;
   all)     do_setup; do_gates; do_city; do_package ;;
   status)  ls -1 "$WORK/done" 2>/dev/null | sed 's/^/done: /'; cat "$SUMMARY" 2>/dev/null || true ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;

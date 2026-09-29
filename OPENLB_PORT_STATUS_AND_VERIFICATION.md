@@ -369,6 +369,10 @@ Then `visualize_forward.py` + `render_domain.py` on the output directory.
 
 ### Phase 8 — GPU (only after Phase 7 is green on CPU)
 
+> **Status 2026-09-29:** implemented — see `OPENLB_PHASE8_GPU.md` (operators in `urban_ops.h`,
+> bitwise CPU parity, CUDA 12.6 build, lab parity script). The config below is superseded by
+> `./olbconfig.sh gpu`: CUDA 12.0 cannot compile OpenLB 1.8, and the link line needs the arch.
+
 ```make
 CXX := nvcc
 CC  := nvcc
