@@ -137,6 +137,14 @@ grid-converged value is ~2.0–2.2: still above 1.8. Inflow turbulence was alrea
 2). Next: the dx = 1 m level on an H100 (`cube_dx1`) and the dx = 4 sensitivity runs
 (`cube_sens`: floor model, inflow turbulence ×1.2, WALE constant).
 
+**Floor model tested (container, dx = 4 m, 2026-09-29):** plain no-slip bounce-back under the
+cube (`GROUND_MODEL=0 TOP_STRESS=1`) gives Xr/H **3.37** (min near-ground u_x −0.41 m/s),
+against 2.63 with the rough wall. The rough wall is not what lengthens the bubble; removing it
+makes the bubble longer. The test also changes the approach flow (the no-slip floor drifts 42 %
+in 6a), so it says that more near-ground momentum and turbulence shortens reattachment, which
+is consistent with resolution and inflow turbulence being the levers. `cube_sens`' `gm0` case
+repeats this on the lab GPU; the `ti12` and `cw20` cases remain open.
+
 ## 6. The Mach sub-condition (6a′)
 
 The one free choice at fixed dx is the split between τ and the lattice velocity:
