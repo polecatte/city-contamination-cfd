@@ -119,7 +119,23 @@ Validation before use:
 
 ## Build order
 
-1. Generator form-only mode + per-building floor area / capacity output.
+1. **Done (2026-09-29):** `gen_form_city.cpp` (+ `render_form_city.py`, `form_city_examples.png`).
+   - Parameters as in the outer-level table, via environment variables; fixed rules as above.
+   - Every building has the same footprint (block_size² at the given aspect), so the GFA is met
+     by distributing whole floors: 2 floors minimum, H_MAX = 100 m and the slenderness cap as
+     maxima; achieved GFA within ±0.2 % over 332 test designs (the 32 corners of the five
+     geometric knobs + 300 random), all feasible; no envelope cell shared between buildings.
+   - Outputs: material map (inlet on x = 0 for now), `source_mask.u8` (one release cell per plan
+     cell over city + environs, on the roof where built), `release_zone.u8` (4 × 4 tiles),
+     `envelope.i32` (per-building air cells for dose), `dep_vel.f32`, `buildings.csv`
+     (floors, floor area, resident and job capacity), `meta_geom.txt`.
+   - Domain is design-independent: 610 × 318 × 101 = 19.6 M cells at dx 4 m (2.5 M at dx 8 m),
+     set by the environs ring (300 m) and the 15 × H_MAX wake buffer (1500 m). The wake buffer
+     is the largest single cost; lowering H_MAX to 80 m would cut it by a fifth.
+   - Checked end to end at dx 8 m: `urban_flow` loads it, all release cells are accepted as
+     sources, scalar budget closes to 6e-16.
+   - Interaction to be aware of: park_layout 0 puts parks on the central slots, so a central
+     height core then forms a ring of towers around a central park.
 2. Oblique inlets (two-face inflow and outflow, per-direction domain layout) + the four
    validation tests above.
 3. Labelled release-zone tracers and per-building dose output in `urban_flow`.
