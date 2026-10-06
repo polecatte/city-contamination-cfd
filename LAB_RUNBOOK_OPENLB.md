@@ -136,3 +136,25 @@ GPU=1 ./lab_openlb.sh showcase
 ```
 On a Slurm cluster, wrap each line in a batch job (`sbatch --gres=gpu:1 --wrap "…"`); the steps
 are resumable, so a job that hits its time limit just resumes on resubmission.
+
+## 9. Phase 9: HRR, guideline domain, ranking study
+
+Background and design: `OPENLB_PHASE9_FIDELITY.md`. `git pull` first; every command is resumable.
+
+```bash
+cd ~/cfd_gpu && git pull
+# HRR (+ corrected WALE) build, on the lab GPU and/or the H100
+MODEL=hrr GPU=1 ~/cfd_gpu/lab_openlb.sh setup
+MODEL=hrr GPU=1 ~/cfd_gpu/lab_openlb.sh gates        # 6a, 6b dx4/dx2 etc. at tau 0.5001
+# ranking study: the old model (lab A4000), then the corrected model (H100: dx 4; else dx 8)
+GPU=1 ~/cfd_gpu/lab_openlb.sh setup                   # rebuilds the default app with the new code
+GPU=1 ~/cfd_gpu/lab_openlb.sh rank
+MODEL=hrr GPU=1 ~/cfd_gpu/lab_openlb.sh rank
+~/cfd_gpu/lab_openlb.sh rank_report                   # -> ~/olb_lab/rank_report.txt
+```
+
+What to send back: `rank_report.txt`, `hrr/summary.txt` (or `gpu/hrr/summary.txt`) and the
+`logs/` of any FAIL. The rank runs on the two machines write to their own `~/olb_lab`; copy the
+H100's `rank_manifest.txt` plus the `rank_*` run directories' `theta.f32`/`meta_flow.txt` and the
+`rank_geom_*` `receptor_w.f32` back if you want one combined report, or send both reports.
+The guideline domain at dx 4 (32.5 M cells) needs ≈ 20 GB of GPU memory: H100 only.

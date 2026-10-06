@@ -916,10 +916,20 @@ using ADLat = SuperLattice<T,AD_DESCRIPTOR>;
 // AD dynamics + BCs. OMEGA is set LAST: the Dirichlet inlet and zero-gradient outlet install
 // their own AD-RLB mixin dynamics, which a parameter set earlier would not reach (the same
 // trap as the NSE lattice).
-inline void prepare(ADLat& ad, SuperGeometry<T,3>& sg, T omegaAD) {
+// localD: the bulk takes its relaxation from the cell's OMEGA field, which the coupling fills
+// from the local eddy viscosity every step (urbanles::VelocityEddyDiffusivityCoupling); the
+// inlet/outlet mixins keep the lattice-wide omegaAD.
+template <typename TT, typename DD>
+using AD_LOCAL_DYNAMICS = dynamics::ParameterFromCell<descriptors::OMEGA, AD_DYNAMICS<TT,DD>>;
+inline void prepare(ADLat& ad, SuperGeometry<T,3>& sg, T omegaAD, bool localD = false) {
     OstreamManager clout(std::cout,"step4");
     auto fluidish = sg.getMaterialIndicator({MAT_FLUID,MAT_POROUS,MAT_SPONGE});
-    ad.template defineDynamics<AD_DYNAMICS>(sg.getMaterialIndicator({MAT_FLUID,MAT_POROUS,MAT_SPONGE,MAT_INLET,MAT_OUTLET}));
+    auto bulk = [&]{ return sg.getMaterialIndicator({MAT_FLUID,MAT_POROUS,MAT_SPONGE,MAT_INLET,MAT_OUTLET}); };
+    if (localD) {
+        ad.template defineDynamics<AD_LOCAL_DYNAMICS>(bulk());
+        AnalyticalConst3D<T,T> om(omegaAD);               // until the first coupling step
+        ad.template defineField<descriptors::OMEGA>(bulk(), om);
+    } else ad.template defineDynamics<AD_DYNAMICS>(bulk());
     ad.template defineDynamics<NoDynamics>(sg, MAT_VOID);
     // zero-flux solids and faces: buildings, ground, box edges, lateral + top (NSE slip)
     for (int m : {MAT_WALL, MAT_GROUND, MAT_FRAME, MAT_SLIP}) ad.template defineDynamics<BounceBack>(sg, m);
@@ -1521,7 +1531,19 @@ int main(int argc, char* argv[]) {
     if (1/omegaAD < 0.505) cl4 << "WARNING: tau_AD < 0.505" << std::endl;
 
     step4::ADLat adLattice(superGeometry);
-    step4::prepare(adLattice, superGeometry, omegaAD);
+    // D_LOCAL=1: per-cell D(x) = D_mol + (nu_0 + nu_t(x))/Sc_t from the WALE eddy viscosity,
+    // tau_AD floored at TAU_AD_MIN. Needs the live flow (ignored with STEP4_UNIFORM_U) and the
+    // corrected WALE (the only one that stores EFFECTIVE_OMEGA). With HRR at tau 0.5001 nu_0 is
+    // ~1/50 of the BGK floor, so the constant D_eff above is ~0.03 m^2/s: there the local
+    // closure is the meaningful one.
+    const bool D_LOCAL = envi("D_LOCAL", 0) != 0 && envd("STEP4_UNIFORM_U", 0.0) <= 0;
+    const T TAU_AD_MIN = envd("TAU_AD_MIN", 0.505);
+#if !USES_WALE || defined(WALE_OPENLB)
+    if (D_LOCAL) { cl4 << "D_LOCAL needs the corrected WALE (COLLISION_MODEL 0 or 3, no WALE_OPENLB)" << std::endl; return 2; }
+#endif
+    if (D_LOCAL) cl4 << "D_LOCAL: D(x) = D_mol + (nu_0 + nu_t)/Sc_t, Sc_t=" << SC_T << ", tau_AD >= " << TAU_AD_MIN
+                     << " (D >= " << (TAU_AD_MIN - 0.5) / descriptors::invCs2<T,AD_DESCRIPTOR>() * dx * dx / dt << " m^2/s)" << std::endl;
+    step4::prepare(adLattice, superGeometry, omegaAD, D_LOCAL);
     step4::Ops ops;
     ops.init(superGeometry, mat, src, vd, dt/(T)dx);
     { bridge::GridField<float> wg; if (bridge::read_grid(GEOM+"/receptor_w.f32", wg) && wg.size()==(size_t)nx*ny*nz) ops.w = wg.data;
@@ -1532,9 +1554,45 @@ int main(int argc, char* argv[]) {
 
     const T U_UNIFORM = envd("STEP4_UNIFORM_U", 0.0);
     const bool uniform = U_UNIFORM > 0;
-    SuperLatticeCoupling coupling(NavierStokesAdvectionDiffusionVelocityCoupling{},
+    // velocity copy as OpenLB's NavierStokesAdvectionDiffusionVelocityCoupling (identical
+    // arithmetic) + the per-cell OMEGA that only the D_LOCAL dynamics read
+    using EddyCoupling = urbanles::VelocityEddyDiffusivityCoupling;
+    SuperLatticeCoupling coupling(EddyCoupling{},
                                   names::NavierStokes{}, sLattice, names::Concentration0{}, adLattice);
     coupling.restrictTo(superGeometry.getMaterialIndicator({MAT_FLUID,MAT_POROUS,MAT_SPONGE,MAT_INLET,MAT_OUTLET}));
+    coupling.template setParameter<EddyCoupling::OMEGA_NSE>(converter.getLatticeRelaxationFrequency());
+    coupling.template setParameter<EddyCoupling::D_MOL_LB>(D_MOL * dt / (dx * dx));
+    coupling.template setParameter<EddyCoupling::INV_SC_T>(T(1) / SC_T);
+    coupling.template setParameter<EddyCoupling::TAU_MIN>(TAU_AD_MIN);
+#ifdef AD_TRT_MAGIC
+    coupling.template setParameter<EddyCoupling::TRT_MAGIC>(T(AD_TRT_MAGIC));
+#else
+    coupling.template setParameter<EddyCoupling::TRT_MAGIC>(T(0));
+#endif
+    // D_LOCAL statistics over the bulk AD cells: mean / max D (m^2/s), share at the tau floor
+    auto dStats = [&](const char* when) {
+        if (!D_LOCAL) return;
+        adLattice.template setProcessingContext<Array<descriptors::OMEGA>>(ProcessingContext::Evaluation);
+        double sum = 0, mx = 0; long n = 0, nFloor = 0;
+        const double toPhys = dx * dx / dt, inv = descriptors::invCs2<T,AD_DESCRIPTOR>();
+        for (int iC = 0; iC < adLattice.getLoadBalancer().size(); ++iC) {
+            auto& b = adLattice.getBlock(iC); auto& bg = superGeometry.getBlockGeometry(iC);
+            for (int x = 0; x < bg.getNx(); ++x) for (int y = 0; y < bg.getNy(); ++y) for (int z = 0; z < bg.getNz(); ++z) {
+                const int m = bg.get(x, y, z);
+                if (m != MAT_FLUID && m != MAT_POROUS) continue;
+                const double om = b.get(x, y, z).template getField<descriptors::OMEGA>();
+#ifdef AD_TRT_MAGIC
+                const double tau = 0.5 + AD_TRT_MAGIC / (1 / om - 0.5);
+#else
+                const double tau = 1 / om;
+#endif
+                const double D = (tau - 0.5) / inv * toPhys;
+                sum += D; mx = std::max(mx, D); ++n; if (tau <= TAU_AD_MIN * (1 + 1e-9)) ++nFloor;
+            }
+        }
+        cl4 << "D_LOCAL " << when << ": mean D " << (n ? sum / n : 0) << " m^2/s, max " << mx
+            << ", at the tau floor " << (n ? 100.0 * nFloor / n : 0) << "% of " << n << " cells" << std::endl;
+    };
     if (uniform) { ops.uniformVelocity(adLattice, converter.getLatticeVelocity(U_UNIFORM));
                    adLattice.template setProcessingContext<Array<descriptors::VELOCITY>>(ProcessingContext::Simulation);
                    cl4 << "frozen uniform wind " << U_UNIFORM << " m/s (NSE not stepped)" << std::endl; }
@@ -1613,7 +1671,8 @@ int main(int argc, char* argv[]) {
             preCollide(MAX_STEPS+iB, 0);                                              // inlet stays live
             sLattice.collideAndStream();                                              // NSE (live)
             floorStep();
-            coupling.execute();                                                       // u -> AD VELOCITY
+            coupling.execute();                                                       // u (+ D) -> AD
+            if (iB == 0) dStats("at release");
             if (HOST_OPS) ops.settle(adLattice, wsLB); else dad.settleStep(adLattice); // −w_s ẑ
         }
         adLattice.collideAndStream();
@@ -1643,6 +1702,7 @@ int main(int argc, char* argv[]) {
         if (stop) { endStep=iB+1; break; }
     }
     if (ts) fclose(ts);
+    if (!uniform) dStats("at the end");
     if (!HOST_OPS) dad.fetch(adLattice, ops);
 
     // export Θ = ∫C dt and the deposition map for Stage C (J = ⟨w,Θ⟩/|Ω|)
@@ -1655,6 +1715,7 @@ int main(int argc, char* argv[]) {
     { FILE* mf=fopen((OUT+"/meta_flow.txt").c_str(),"w"); if(mf){
         fprintf(mf,"grid %d %d %d\ndx_m %.4f\nomega_cells %ld\n",nx,ny,nz,dx,ops.nSrc);
         fprintf(mf,"burst_steps %d\ndt_s %.6g\nD_eff_m2s %.6g\ntau_AD %.6g\n",endStep,(double)dt,(double)D_EFF,(double)(1/omegaAD));
+        fprintf(mf,"D_local %d\nSc_t %.4g\ntau_AD_min %.6g\n",(int)D_LOCAL,(double)SC_T,(double)TAU_AD_MIN);
         fprintf(mf,"# control volume x in [%d,%d]; budget: emitted = deposited + airborne + drained\n",ops.xLo,ops.xHi);
         fprintf(mf,"mass_emitted %.9e\nmass_deposited %.9e\nmass_airborne %.9e\nmass_drained %.9e\n",emit,depCV,airCV,drained);
         fprintf(mf,"mass_emitted_beyond_cv %.9e\nmass_emitted_total %.9e\n",emitOut,emit+emitOut);

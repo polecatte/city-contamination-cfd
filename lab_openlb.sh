@@ -16,6 +16,8 @@
 #   [GPU=1] ./lab_openlb.sh cube_sens  # 6b sensitivity at dx=4: floor model, inflow turbulence, C_w
 #   GPU=1   ./lab_openlb.sh cube_dx1   # 6b at dx=1 m (H/dx=40, 89 M cells): needs >= 60 GB GPU (H100)
 #
+#   [MODEL=hrr] [GPU=1] ./lab_openlb.sh rank   # ranking study: 5 designs x 2 seeds (see do_rank)
+#   ./lab_openlb.sh rank_report                 # its table: noise, spread, ANOVA, Spearman old vs new
 #   MODEL=hrr [GPU=1] ./lab_openlb.sh setup|gates|...  # the same with HRR collision + corrected
 #             WALE (COLLISION_MODEL=3) at TAU=0.5001: its own app dir (urban_hrr) and outputs
 #             under $WORK/hrr (GPU: $WORK/gpu/hrr); geometries shared with the default model
@@ -205,6 +207,57 @@ do_cube_dx1() {
     python3 '$REPO/tests/gate6_analyze.py' cube geom_cube_dx1 out_6b_dx1"
 }
 
+# Ranking study: does a spread of designs give a spread of exposure beyond the inlet-seed noise,
+# and does the old model rank the designs the way the corrected one does? Five contrasting
+# designs from gen_openlb_geom (all <= 88 m, blockage < 3 % in the guideline domain), each with
+# RANK_SEEDS inlet seeds (common to all designs). Configuration from MODEL:
+#   wale: the old model: BGK+WALE tau 0.505, compact domain, legacy release set, constant D,
+#         dx 4 (7.3 M cells: fits the A4000)
+#   hrr:  the corrected model: HRR + corrected WALE tau 0.5001, COST 732 domain, release over
+#         city + environs ring, per-cell D (D_LOCAL=1); dx RANK_DX, default 4 on a >= 40 GB
+#         GPU (32.5 M cells, H100), else 8 (4.1 M cells)
+# Every run appends "config design seed geom out" to $WORK/rank_manifest.txt; the report
+# (tests/rank_report.py) reads every manifest under $WORK_CPU, so both configurations land in
+# one table with Spearman/Kendall between them.
+RANK_DESIGNS=(
+  "base|"
+  "core|PEAK_H=50 EMP_CENTERS=1 EMP_CONC=0.9"
+  "low|PEAK_H=22 STREET_W=28 PARK_FRAC=0.25"
+  "fine|BLOCK_W=36 BLOCK_D=36 STREET_W=12 PEAK_H=40"
+  "coarse|BLOCK_W=80 BLOCK_D=80 STREET_W=30 PEAK_H=35"
+)
+do_rank() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  local dx="${RANK_DX:-}" cfg genv runv gen n e s mem
+  if [ "$MODEL" = hrr ]; then
+    if [ -z "$dx" ]; then
+      mem=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
+      dx=8; [ "${GPU:-0}" = 1 ] && [ "${mem:-0}" -ge 40000 ] && dx=4
+    fi
+    cfg="new_dx$dx"; genv=""; runv="D_LOCAL=1"
+  else
+    dx="${dx:-4}"; cfg="old_dx$dx"; genv="DOMAIN=compact"; runv=""
+  fi
+  case "$dx" in 4) gen=./gen_openlb_geom ;; 8) gen=./gen_openlb_geom8 ;; *) echo "RANK_DX must be 4 or 8"; exit 2 ;; esac
+  say "ranking study: configuration $cfg ($MODEL), designs: ${RANK_DESIGNS[*]%%|*}"
+  for v in "${RANK_DESIGNS[@]}"; do
+    n="${v%%|*}"; e="${v#*|}"
+    step "rank_geom_${cfg}_$n" sh -c "env $genv $e OUT_DIR=rank_geom_${cfg}_$n $gen"
+    for s in ${RANK_SEEDS:-1000 2000}; do
+      step "rank_${cfg}_${n}_s$s" sh -c "env $runv STEP4=1 ABL_SEED=$s GEOM_DIR=rank_geom_${cfg}_$n OUT_DIR=rank_${cfg}_${n}_s$s CHECK_EVERY=2000 TS_EVERY=1000 '$BIN' > rank_${cfg}_${n}_s$s.log 2>&1"
+      local line="$cfg $n $s $WORK/rank_geom_${cfg}_$n $WORK/rank_${cfg}_${n}_s$s"
+      grep -qxF "$line" "$WORK/rank_manifest.txt" 2>/dev/null || echo "$line" >> "$WORK/rank_manifest.txt"
+    done
+  done
+  do_rank_report
+}
+do_rank_report() {
+  local m; m=$(find "$WORK_CPU" -maxdepth 3 -name rank_manifest.txt | sort)
+  [ -n "$m" ] || { echo "no rank_manifest.txt under $WORK_CPU yet"; exit 1; }
+  # shellcheck disable=SC2086
+  python3 "$REPO/tests/rank_report.py" $m | tee "$WORK_CPU/rank_report.txt"
+}
+
 # the gates' deciding numbers, CPU next to GPU
 do_compare() {
   for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b gate8 wake showcase; do
@@ -258,6 +311,7 @@ do_setup() {
       || say "WARNING: no kernels for the configured CUDA_ARCH in $BIN (cuobjdump --list-elf)"
   fi
   build gen_openlb_geom g++ -O3 -std=c++17 -I"$REPO" -DCELL_SIZE_M=4.0 "$REPO/gen_openlb_geom.cpp" -o "$WORK/gen_openlb_geom"
+  build gen_openlb_geom8 g++ -O3 -std=c++17 -I"$REPO" -DCELL_SIZE_M=8.0 "$REPO/gen_openlb_geom.cpp" -o "$WORK/gen_openlb_geom8"
   build gen_gate6_geom  g++ -O2 -std=c++17 -I"$REPO" "$REPO/gen_gate6_geom.cpp" -o "$WORK/gen_gate6_geom"
   build linearity_guard g++ -O2 -std=c++17 -I"$REPO" "$REPO/tests/linearity_guard.cpp" -o "$WORK/linearity_guard"
   python3 -c 'import numpy, matplotlib' 2>/dev/null || say "WARNING: python3 numpy/matplotlib missing — analysers need numpy"
@@ -359,6 +413,8 @@ case "${1:-status}" in
   cube_sens) do_cube_sens ;;
   cube_dx1) do_cube_dx1 ;;
   compare) do_compare ;;
+  rank)    do_rank ;;
+  rank_report) do_rank_report ;;
   all)     do_setup; do_gates; do_city; do_package ;;
   status)  ls -1 "$WORK/done" 2>/dev/null | sed 's/^/done: /'; cat "$SUMMARY" 2>/dev/null || true ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;

@@ -1,5 +1,9 @@
 # OpenLB port — Phases 5–7: first runs, gate results
 
+> **Read with OPENLB_PHASE9_FIDELITY.md.** The runs below used OpenLB 1.8's stock WALE, which has
+> three summation slips (near-zero eddy viscosity in a boundary layer; dissipation came from the
+> tau 0.505 floor), and the compact domain (10.5 % blockage). Phase 9 corrects both and adds HRR.
+
 Date: 2026-09-27/28. Branch `claude/gracious-lovelace-3wlllj` (built on `claude/charming-allen-8pfsrc`,
 Gate 5 green). Everything below was **run**, not reasoned about: OpenLB 1.8.1 (the GitLab
 release tarball) built in a 4-core cloud container with the new `./olbconfig.sh cpu-mt`

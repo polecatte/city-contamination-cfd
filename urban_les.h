@@ -69,4 +69,46 @@ struct WaleCorrected {
   using type = WaleCorrectedImpl<COLLISION, DESCRIPTOR, MOMENTA, EQUILIBRIUM>;
 };
 
+// Velocity coupling (as OpenLB's NavierStokesAdvectionDiffusionVelocityCoupling) plus a per-cell
+// scalar diffusivity from the flow's local eddy viscosity, the usual LES closure for a passive
+// scalar:  D(x) = D_mol + (nu_0 + nu_t(x)) / Sc_t,  nu_0 + nu_t = (1/omega_eff - 1/2)/3 read from
+// the NSE cell's EFFECTIVE_OMEGA (written by WaleCorrected). Cells without a valid
+// EFFECTIVE_OMEGA (0 before the first WALE collision, boundary dynamics) use the base omega,
+// i.e. nu_t = 0. tau_D is floored at TAU_MIN for stability and written into the AD cell's OMEGA
+// for dynamics::ParameterFromCell<OMEGA, ...>; with TRT_MAGIC > 0 it is converted to the even
+// rate the same way step4::prepare does (OpenLB's TRT takes OMEGA = 1/tau+).
+struct VelocityEddyDiffusivityCoupling {
+  static constexpr OperatorScope scope = OperatorScope::PerCellWithParameters;
+  struct OMEGA_NSE : public descriptors::FIELD_BASE<1> { };   // base NSE omega (nu_0)
+  struct D_MOL_LB  : public descriptors::FIELD_BASE<1> { };   // molecular diffusivity, lattice
+  struct INV_SC_T  : public descriptors::FIELD_BASE<1> { };   // 1 / Sc_t
+  struct TAU_MIN   : public descriptors::FIELD_BASE<1> { };   // floor on tau_D
+  struct TRT_MAGIC : public descriptors::FIELD_BASE<1> { };   // 0: BGK
+  using parameters = meta::list<OMEGA_NSE, D_MOL_LB, INV_SC_T, TAU_MIN, TRT_MAGIC>;
+
+  template <typename CELLS, typename PARAMETERS>
+  void apply(CELLS& cells, PARAMETERS& parameters) any_platform {
+    using V = typename CELLS::template value_t<names::NavierStokes>::value_t;
+    using NSE = typename CELLS::template value_t<names::NavierStokes>::descriptor_t;
+    using ADE = typename CELLS::template value_t<names::Concentration0>::descriptor_t;
+    auto& cellNSE = cells.template get<names::NavierStokes>();
+    auto& cellADE = cells.template get<names::Concentration0>();
+    V u[NSE::d] { };
+    cellNSE.computeU(u);
+    cellADE.template setField<descriptors::VELOCITY>(u);
+
+    const V w0 = parameters.template get<OMEGA_NSE>();
+    V w = cellNSE.template getField<descriptors::EFFECTIVE_OMEGA>();
+    if (!(w > V(0) && w <= w0)) w = w0;                     // also catches NaN
+    const V nu = (V(1) / w - V(0.5)) / V(3);
+    V tauD = V(0.5) + descriptors::invCs2<V,ADE>() *
+             (parameters.template get<D_MOL_LB>() + nu * parameters.template get<INV_SC_T>());
+    const V tauMin = parameters.template get<TAU_MIN>();
+    if (tauD < tauMin) tauD = tauMin;
+    const V magic = parameters.template get<TRT_MAGIC>();
+    const V om = magic > V(0) ? V(1) / (V(0.5) + magic / (tauD - V(0.5))) : V(1) / tauD;
+    cellADE.template setField<descriptors::OMEGA>(om);
+  }
+};
+
 } // namespace urbanles
