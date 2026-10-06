@@ -16,6 +16,10 @@
 #   [GPU=1] ./lab_openlb.sh cube_sens  # 6b sensitivity at dx=4: floor model, inflow turbulence, C_w
 #   GPU=1   ./lab_openlb.sh cube_dx1   # 6b at dx=1 m (H/dx=40, 89 M cells): needs >= 60 GB GPU (H100)
 #
+#   MODEL=hrr [GPU=1] ./lab_openlb.sh setup|gates|...  # the same with HRR collision + corrected
+#             WALE (COLLISION_MODEL=3) at TAU=0.5001: its own app dir (urban_hrr) and outputs
+#             under $WORK/hrr (GPU: $WORK/gpu/hrr); geometries shared with the default model
+#
 # Resumable: every step writes $WORK/done/<step> when it finishes and is skipped next time
 # (delete the marker to rerun one). Run it under tmux or nohup — it takes hours:
 #   tmux new -s olb './lab_openlb.sh all 2>&1 | tee -a ~/olb_lab/lab.log; read -p "[done - Enter to close]"'
@@ -24,6 +28,7 @@
 #   WORK      working directory (default ~/olb_lab): OpenLB tree, geometries, outputs, logs
 #   OLB_ROOT  an existing OpenLB 1.8.1 tree to use instead of downloading one
 #   THREADS   OpenMP threads (default: nproc)
+#   MODEL     wale (default: BGK + WALE, tau 0.505) or hrr (HRR + corrected WALE, tau 0.5001)
 #   GPU=1     use the CUDA build: its own OpenLB tree and outputs under $WORK/gpu, the
 #             geometries shared with the CPU runs. Needs an NVIDIA driver; nvcc >= 12.4 is
 #             taken from PATH or $NVCC, else CUDA 12.6 is installed from conda-forge into
@@ -51,8 +56,17 @@ if [ "${GPU:-0}" = 1 ]; then
 else
   OLB_ROOT="${OLB_ROOT:-$WORK/release-1.8.1}"
 fi
-mkdir -p "$WORK/done" "$WORK/logs"
 APP="$OLB_ROOT/examples/urban/urban_flow"
+MODEL="${MODEL:-wale}"
+case "$MODEL" in
+  wale) ;;
+  hrr)  # HRR (Jacob et al. 2018) + corrected WALE: near-inviscid lattice, tau 0.5001
+        WORK="$WORK/hrr"; APP="$OLB_ROOT/examples/urban/urban_hrr"
+        CPU_BIN="$WORK_CPU/release-1.8.1/examples/urban/urban_hrr/urban_flow"
+        export TAU="${TAU:-0.5001}" ;;
+  *) echo "MODEL must be wale or hrr"; exit 2 ;;
+esac
+mkdir -p "$WORK/done" "$WORK/logs"
 BIN="$APP/urban_flow"
 SUMMARY="$WORK/summary.txt"
 
@@ -145,7 +159,7 @@ do_parity() {
 # 400 m of city; the domain is still ~1.8 km long, since the 15 H wake buffer is fixed.
 do_showcase() {
   [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
-  step geom_showcase sh -c "CITY_M=${SHOW_CITY_M:-400} POP=${SHOW_POP:-8000} OUT_DIR=geom_showcase ./gen_openlb_geom"
+  step geom_showcase sh -c "DOMAIN=compact CITY_M=${SHOW_CITY_M:-400} POP=${SHOW_POP:-8000} OUT_DIR=geom_showcase ./gen_openlb_geom"
   step showcase_run sh -c "STEP4=1 GEOM_DIR=geom_showcase OUT_DIR=showcase CHECK_EVERY=2000 TS_EVERY=500 '$BIN' > showcase.log 2>&1"
   gate showcase python3 "$REPO/tests/showcase_report.py" geom_showcase showcase showcase.log
   step showcase_viz python3 "$REPO/visualize_forward.py" showcase
@@ -209,9 +223,9 @@ do_setup() {
   if [ ! -d "$OLB_ROOT/src" ]; then
     say "fetching OpenLB 1.8.1"
     if [ -f "$WORK_CPU/olb.tar.gz" ] && [ "$WORK" != "$WORK_CPU" ]; then
-      ( cd "$WORK" && tar xzf "$WORK_CPU/olb.tar.gz" )        # the GPU tree: same tarball
+      ( cd "$(dirname "$OLB_ROOT")" && tar xzf "$WORK_CPU/olb.tar.gz" )        # the GPU tree: same tarball
     else
-      ( cd "$WORK" && { curl -fL -o olb.tar.gz "$OLB_URL_GITLAB" || curl -fL -o olb.tar.gz "$OLB_URL_ZENODO"; } \
+      ( cd "$(dirname "$OLB_ROOT")" && { curl -fL -o olb.tar.gz "$OLB_URL_GITLAB" || curl -fL -o olb.tar.gz "$OLB_URL_ZENODO"; } \
         && tar xzf olb.tar.gz )
     fi
     [ -d "$OLB_ROOT/src" ] || { echo "no src/ under $OLB_ROOT after extracting — check the tarball's top directory"; exit 1; }
@@ -232,8 +246,9 @@ do_setup() {
   local cfg; cfg="$(md5sum "$OLB_ROOT/config.mk" | cut -c1-12)"
   step "olb_core_$cfg" sh -c "make -C '$OLB_ROOT' clean-core && make -C '$OLB_ROOT' -j$THREADS core"
   mkdir -p "$APP"
-  for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h urban_ops.h; do ln -sf "$REPO/$f" "$APP/$f"; done
+  for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h urban_ops.h urban_les.h; do ln -sf "$REPO/$f" "$APP/$f"; done
   printf 'EXAMPLE = urban_flow\nOLB_ROOT := ../../..\ninclude $(OLB_ROOT)/default.mk\n' > "$APP/Makefile"
+  [ "$MODEL" = hrr ] && echo 'CXXFLAGS += -DCOLLISION_MODEL=3' >> "$APP/Makefile"
   # the app is always rebuilt: it is cheap next to a run and the sources may have been pulled
   rm -f "${APP:?}"/*.o "${APP:?}"/*.d "${APP:?}/urban_flow"
   build app       make -C "$APP"
@@ -246,12 +261,13 @@ do_setup() {
   build gen_gate6_geom  g++ -O2 -std=c++17 -I"$REPO" "$REPO/gen_gate6_geom.cpp" -o "$WORK/gen_gate6_geom"
   build linearity_guard g++ -O2 -std=c++17 -I"$REPO" "$REPO/tests/linearity_guard.cpp" -o "$WORK/linearity_guard"
   python3 -c 'import numpy, matplotlib' 2>/dev/null || say "WARNING: python3 numpy/matplotlib missing — analysers need numpy"
+  # GPU and HRR runs share the default CPU geometries
   if [ "$WORK" != "$WORK_CPU" ] && [ -f "$WORK_CPU/done/geometry" ]; then
     for g in geom_prod geom_abl geom_cube geom_cube_dx2 geom_box; do ln -sfn "$WORK_CPU/$g" "$WORK/$g"; done
     mark geometry; say "geometry: shared with the CPU runs ($WORK_CPU)"
   fi
   step geometry sh -c '
-    OUT_DIR=geom_prod ./gen_openlb_geom &&
+    DOMAIN=compact OUT_DIR=geom_prod ./gen_openlb_geom &&
     CASE=abl  OUT_DIR=geom_abl  ./gen_gate6_geom &&
     CASE=cube OUT_DIR=geom_cube ./gen_gate6_geom &&
     CASE=cube DX=2 CUBE_H=20 OUT_DIR=geom_cube_dx2 ./gen_gate6_geom &&

@@ -144,6 +144,18 @@ struct WaleVelOp {                       // pass 1: u into UF_VBUF on fluid-carr
   }
 };
 
+// HRR (COLLISION_MODEL 3) needs the strain rate S = (g + g^T)/2 in OpenLB's TENSOR field
+// (order xx, xy, xz, yy, yz, zz; lattice units), from the same gradient WALE uses. A no-op
+// on descriptors without TENSOR.
+template <typename CELL, typename V>
+void writeStrain(CELL& cell, const Vector<V,9>& g) any_platform {
+  using DESC = typename CELL::descriptor_t;
+  if constexpr (DESC::template provides<descriptors::TENSOR>()) {
+    Vector<V,6> s(g[0], V(0.5)*(g[1]+g[3]), V(0.5)*(g[2]+g[6]), g[4], V(0.5)*(g[5]+g[7]), g[8]);
+    cell.template setField<descriptors::TENSOR>(s);
+  }
+}
+
 struct WaleGradOp {                      // pass 2: differences into VELO_GRAD on MAT_FLUID
   static constexpr OperatorScope scope = OperatorScope::PerCell;
   int getPriority() const { return 0; }
@@ -177,6 +189,7 @@ struct WaleGradOp {                      // pass 2: differences into VELO_GRAD o
       }
     }
     cell.template setField<descriptors::VELO_GRAD>(g);
+    writeStrain(cell, g);
   }
 };
 

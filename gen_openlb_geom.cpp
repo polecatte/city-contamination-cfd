@@ -38,7 +38,12 @@ int main(){
     // ── city morphology — forward_city.cpp defaults ──
     const double CITY_M = envd("CITY_M", 600.0);
     const double POP    = envd("POP",   20000.0);
-    const double BUF_UP    = envd("BUF_UP",    40.0);
+    // Domain extents follow COST Action 732 (Franke et al. 2007) / AIJ (Tominaga et al. 2008):
+    // 5 H upstream, 6 H to each side (5 H gives 3.1 % blockage here), 5 H above the tallest building, 15 H downstream, with
+    // H = H_REF_M for every design (a domain that resized with the design would make J step
+    // discontinuous). DOMAIN=compact restores the pre-guideline extents (40 m upstream, 35 m
+    // lateral, 3 x the design's own height above) for quick tests only.
+    const bool COMPACT = getenv("DOMAIN") && std::string(getenv("DOMAIN")) == "compact";
     // Downstream buffer: 15 x the tallest building (COST 732, Franke et al. 2007) so the
     // city's wake closes before the outlet. At 70 m (inherited from forward_city) the near-
     // ground flow was reversed over the last ~100 m, i.e. the wake reached the pressure
@@ -48,8 +53,10 @@ int main(){
     // building at the default knobs; re-derive it if the design space grows taller.
     constexpr double H_REF_M = 88.0;
     const double BUF_DOWN  = envd("BUF_DOWN",  15.0 * H_REF_M);   // 1320 m
-    const double BUF_LAT   = envd("BUF_LAT",   35.0);
-    const double HEADROOM_H = envd("HEADROOM_H", 3.0);
+    const double BUF_UP    = envd("BUF_UP",  COMPACT ? 40.0 : 5.0 * H_REF_M);    // 440 m
+    // 6 H rather than 5 H: at 5 H the production city still blocks 3.1 % (> 3 %)
+    const double BUF_LAT   = envd("BUF_LAT", COMPACT ? 35.0 : 6.0 * H_REF_M);    // 528 m
+    const double HEADROOM_H = envd("HEADROOM_H", COMPACT ? 3.0 : 5.0);         // above H_REF_M
     const double WIND_DEG   = envd("WIND_DEG",   0.0);
 
     Params p{};
@@ -94,32 +101,82 @@ int main(){
 
     // ── voxelize solid buildings; relaxed vertical headroom (matches forward_city) ──
     int maxHC=0; for(auto& b: r.blocks) maxHC=std::max(maxHC, b.height_cells);
-    int nz_relaxed = std::max(4, maxHC + (int)std::ceil(HEADROOM_H*(double)maxHC) + 1);
+    // guideline: fixed height (1 + HEADROOM_H) x H_REF_M for every design; compact: the old
+    // design-dependent relaxed headroom
+    int nz_relaxed = COMPACT ? std::max(4, maxHC + (int)std::ceil(HEADROOM_H*(double)maxHC) + 1)
+                             : (int)std::ceil((1.0 + HEADROOM_H) * H_REF_M / (double)CELL) + 1;
     // size-resolved surface deposition (Zhang 2001) for a representative bin — feeds the
     // Step-4 deposition sink via dep_vel.f32. DEP_DP<=0 falls back to constant per-usage v_d.
     const double DEP_DP=envd("DEP_DP",2.5e-6), DEP_RHO=envd("DEP_RHO",1800.0), DEP_USTAR=envd("DEP_USTAR",0.5);
     VoxelGrid g = voxelize(p, r, /*solid_buildings=*/true, DEP_DP, DEP_RHO, DEP_USTAR, /*nz_fixed=*/nz_relaxed);
     print_voxel_summary(g);
+    // blockage ratio: the buildings' frontal area seen by the (+x) wind over the domain
+    // cross-section above the ground; COST 732 asks for < 3 %
+    double blockage = 0;
+    { long fa = 0;
+      for (int z = 1; z < g.nz; ++z) for (int y = 0; y < g.ny; ++y) {
+          bool hit = false;
+          for (int x = 0; x < g.nx && !hit; ++x) { size_t id = g.idx(x, y, z);
+              hit = g.type[id] == CELL_SHELL && g.perm[id] < 0.5f; }
+          if (hit) ++fa; }
+      blockage = (double)fa / ((double)g.ny * (g.nz - 1));
+      printf("[gen_openlb_geom] domain %s: upstream %.0f m, lateral %.0f m, top %.0f m, downstream %.0f m; "
+             "blockage %.2f%% %s\n", COMPACT ? "COMPACT (not guideline)" : "COST 732", BUF_UP, BUF_LAT,
+             (g.nz - 1) * (double)CELL, BUF_DOWN, 100 * blockage, blockage < 0.03 ? "(< 3 %, ok)" : "(ABOVE the 3 % guideline)"); }
 
     const int nx=g.nx, ny=g.ny, nz=g.nz; const size_t N=(size_t)nx*ny*nz;
     const double dx = g.cell_size;
     auto IDX=[&](int x,int y,int z){ return (size_t)z*ny*nx + (size_t)y*nx + x; };
 
-    // ── source set Ω (forward_city.cpp's rule, over forward_city's footprint) ──
-    // Every open ground cell, but only up to OMEGA_DOWN (70 m, the old downstream buffer) past
-    // the city. The long wake buffer above is there for the FLOW; without this cut its
-    // ground would join Ω (75 083 cells instead of 22 812) and J would average in releases
-    // that never pass over the city.
-    const double OMEGA_DOWN = envd("OMEGA_DOWN", 70.0);
-    const int xOmegaEnd = (int)std::floor((BUF_UP + CITY_M + OMEGA_DOWN)/dx);   // exclusive
-    std::vector<uint8_t> srcmask(N, 0);
-    long nOmega=0; const int zsrc=1;
-    for(int y=0;y<ny;++y)for(int x=0;x<std::min(nx,xOmegaEnd);++x){
-        size_t id=IDX(x,y,zsrc); uint8_t t=g.type[id];
-        bool open=(t==CELL_FLUID), parkg=(t==CELL_SHELL && g.perm[id]>0.5f);
-        if(open||parkg){ srcmask[id]=1; ++nOmega; }
+    // ── release set Ω ──
+    // environs (default): one release cell per plan cell over the city plus a ring of
+    // ENVIRON_FRAC x city size around it (300 m here, inside the guideline buffers), at ground
+    // level, or on the first fluid cell above the roof where a building stands. Uniform per unit
+    // area and the same plan area for every design, so J compares designs on one release
+    // distribution. release_zone.u8 tiles it ZONES x ZONES (tail constraint, labelled tracers).
+    // legacy: forward_city's rule, open ground cells (streets + parks) over the city + 40 m
+    // upstream, 35 m lateral, OMEGA_DOWN = 70 m downstream; design-dependent (no roofs), kept for
+    // comparison with the earlier results. Default for DOMAIN=compact, where the ring does not fit.
+    const bool OMEGA_LEGACY = getenv("OMEGA") ? std::string(getenv("OMEGA")) == "legacy" : COMPACT;
+    const double ENV_FRAC = envd("ENVIRON_FRAC", 0.5);
+    const int ZONES = std::max(1, std::min(15, envi("ZONES", 4)));
+    double ringUp, ringDown, ringLat;
+    if (OMEGA_LEGACY) { ringUp = 40.0; ringLat = 35.0; ringDown = envd("OMEGA_DOWN", 70.0); }
+    else { ringUp = ringDown = ringLat = ENV_FRAC * CITY_M; }
+    if (ringUp > BUF_UP + 1e-9 || ringLat > BUF_LAT + 1e-9 || ringDown > BUF_DOWN + 1e-9) {
+        fprintf(stderr, "[gen_openlb_geom] FATAL release ring (%.0f/%.0f/%.0f m) does not fit the buffers "
+                "(%.0f/%.0f/%.0f m); use OMEGA=legacy or larger buffers\n", ringUp, ringLat, ringDown, BUF_UP, BUF_LAT, BUF_DOWN);
+        return 2;
     }
-    printf("[gen_openlb_geom] source Omega = %ld ground cells (streets + parks)\n", nOmega);
+    // legacy keeps the old loop's bounds exactly (it reached the boundary rows); environs stays
+    // one cell inside the domain faces
+    const int lo = OMEGA_LEGACY ? 0 : 1;
+    const int rx0 = std::max(lo, (int)std::lround((BUF_UP - ringUp) / dx));
+    const int rx1 = OMEGA_LEGACY ? std::min(nx, (int)std::floor((BUF_UP + CITY_M + ringDown) / dx))   // exclusive
+                                 : std::min(nx - 1, (int)std::lround((BUF_UP + CITY_M + ringDown) / dx));
+    const int ry0 = std::max(lo, (int)std::lround((BUF_LAT - ringLat) / dx));
+    const int ry1 = std::min(ny - lo, (int)std::lround((BUF_LAT + CITY_M + ringLat) / dx));
+    std::vector<uint8_t> srcmask(N, 0), zone(N, 0);
+    long nOmega = 0, nRoof = 0;
+    for (int y = ry0; y < ry1; ++y) for (int x = rx0; x < rx1; ++x) {
+        int z = 1;
+        if (OMEGA_LEGACY) {
+            const size_t id = IDX(x, y, z); const uint8_t t = g.type[id];
+            if (!(t == CELL_FLUID || (t == CELL_SHELL && g.perm[id] > 0.5f))) continue;   // streets + parks
+        } else {
+            while (z < nz - 1 && g.type[IDX(x, y, z)] == CELL_SHELL && g.perm[IDX(x, y, z)] < 0.5f) ++z;   // above a roof
+            if (z >= nz - 1) continue;
+            if (z > 1) ++nRoof;
+        }
+        const size_t id = IDX(x, y, z);
+        srcmask[id] = 1; ++nOmega;
+        const int zx = std::min(ZONES - 1, (x - rx0) * ZONES / std::max(1, rx1 - rx0));
+        const int zy = std::min(ZONES - 1, (y - ry0) * ZONES / std::max(1, ry1 - ry0));
+        zone[id] = (uint8_t)(1 + zx * ZONES + zy);
+    }
+    printf("[gen_openlb_geom] release Omega (%s): x %.0f..%.0f m, y %.0f..%.0f m; %ld cells (%ld on roofs) in %d zones\n",
+           OMEGA_LEGACY ? "legacy: ground, streets + parks" : "environs: uniform, ground or roof",
+           rx0 * dx, rx1 * dx, ry0 * dx, ry1 * dx, nOmega, nRoof, ZONES * ZONES);
 
     // ── per-cell surface deposition velocity (size-resolved) → Step-4 sink ──
     { FILE* f=fopen((OUT+"/dep_vel.f32").c_str(),"wb");
@@ -179,6 +236,8 @@ int main(){
       if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f); fwrite(g.type.data(),1,N,f); fclose(f);} }
     { FILE* f=fopen((OUT+"/source_mask.u8").c_str(),"wb");
       if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f); fwrite(srcmask.data(),1,N,f); fclose(f);} }
+    { FILE* f=fopen((OUT+"/release_zone.u8").c_str(),"wb");
+      if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f); fwrite(zone.data(),1,N,f); fclose(f);} }
     // per-cell surface DRY-DEPOSITION velocity (m/s) — consumed by Stage B's deposition
     // sink (Step 4). 0 on fluid/indoor; usage-specific on building/park/ground faces.
     { FILE* f=fopen((OUT+"/dep_vel.f32").c_str(),"wb");
@@ -192,10 +251,13 @@ int main(){
         fprintf(f,"# gen_openlb_geom — OpenLB Stage-A geometry-bridge metadata\n");
         fprintf(f,"grid_nx %d\ngrid_ny %d\ngrid_nz %d\ndx_m %.4f\n",nx,ny,nz,dx);
         fprintf(f,"wind_deg %.1f\n",WIND_DEG);
-        fprintf(f,"omega_source_cells %ld\n",nOmega);
+        fprintf(f,"omega_source_cells %ld\nomega_mode %s\nomega_roof_cells %ld\nenviron_frac %.3f\nrelease_zones %d\n",
+                nOmega, OMEGA_LEGACY ? "legacy" : "environs", nRoof, OMEGA_LEGACY ? 0.0 : ENV_FRAC, ZONES * ZONES);
         fprintf(f,"material_scheme 0=donothing 1=fluid 2=wall(buildings) 3=inlet 4=outlet 5=slip 6=porous(parks) 7=ground(rough-wall)\n");
         fprintf(f,"material_map_layout 5xint32[nx,ny,nz,dx*1000,ncomp=1] then nx*ny*nz int32\n");
         fprintf(f,"reconcile_gate %s\n", gate?"PASS":"FAIL");
+        fprintf(f,"domain %s\nbuf_up_m %.1f\nbuf_lat_m %.1f\nbuf_down_m %.1f\nh_ref_m %.1f\nblockage %.5f\n",
+                COMPACT ? "compact" : "cost732", BUF_UP, BUF_LAT, BUF_DOWN, H_REF_M, blockage);
         fclose(f);} }
 
     printf("[gen_openlb_geom] wrote material_map.dat, source_mask.u8, geom_type.u8, meta_geom.txt to %s/\n", OUT.c_str());

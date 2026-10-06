@@ -57,22 +57,45 @@ using namespace olb;
 using namespace olb::descriptors;
 typedef double T;
 
-// ── LES collision selection (C6) ──  -DCOLLISION_MODEL=0|1|2  (default 0 = WALE)
+// ── LES collision selection (C6) ──  -DCOLLISION_MODEL=0|1|2|3  (default 0 = WALE)
+//   3 = WALE + hybrid recursive regularized (HRR; Jacob, Malaspinas & Sagaut 2018,
+//       OpenLB collision::HRR). Stable much closer to tau = 1/2, so the lattice viscosity
+//       floor no longer sets the building-scale Reynolds number; WALE's nu_t does.
 #ifndef COLLISION_MODEL
 #define COLLISION_MODEL 0
 #endif
 // B6: WALED3Q19Descriptor is D3Q19<EFFECTIVE_OMEGA,VELO_GRAD> and carries NO POROSITY
 // field, so PorousBGKdynamics cannot instantiate on it. Spell the descriptor out with
 // POROSITY added rather than using the alias.
+#if COLLISION_MODEL==3
+using UrbanD3Q19Descriptor = D3Q19<EFFECTIVE_OMEGA,VELO_GRAD,POROSITY,TENSOR>;   // TENSOR: strain for HRR
+#else
 using UrbanD3Q19Descriptor = D3Q19<EFFECTIVE_OMEGA,VELO_GRAD,POROSITY>;
+#endif
 #define DESCRIPTOR UrbanD3Q19Descriptor
+#include "urban_les.h"   // WALE with OpenLB 1.8's inner-product slips corrected
+// WALE_OPENLB=1 builds with OpenLB's stock WALE instead (to measure what the correction changes).
+#ifndef WALE_OPENLB
+  template <typename COLL> using UrbanWale = urbanles::WaleCorrected<COLL>;
+#else
+  template <typename COLL> using UrbanWale = collision::WaleEffectiveOmega<COLL>;
+#endif
 #if   COLLISION_MODEL==0
-  #define BULK_DYNAMICS WALEBGKdynamics                 // CONFIRM 1.8
+  template <typename T_, typename DESCRIPTOR_>
+  using WALEBGKurban = dynamics::Tuple<T_, DESCRIPTOR_, momenta::BulkTuple, equilibria::SecondOrder,
+                                       UrbanWale<collision::BGK>>;
+  #define BULK_DYNAMICS WALEBGKurban
 #elif COLLISION_MODEL==1
   #define BULK_DYNAMICS ConStrainSmagorinskyBGKdynamics // consistent-strain Smagorinsky (more dissipative/stable)
+#elif COLLISION_MODEL==3
+  template <typename T_, typename DESCRIPTOR_>
+  using WALEHRRdynamics = dynamics::Tuple<T_, DESCRIPTOR_, momenta::BulkTuple, equilibria::ThirdOrder,
+                                          UrbanWale<collision::HRR>>;
+  #define BULK_DYNAMICS WALEHRRdynamics
 #else
   #define BULK_DYNAMICS RLBdynamics                     // regularized LB (most robust, more diffusive)
 #endif
+#define USES_WALE (COLLISION_MODEL==0 || COLLISION_MODEL==3)
 
 static double envd(const char* k,double d){const char* e=getenv(k);return e?atof(e):d;}
 static int    envi(const char* k,int d){const char* e=getenv(k);return e?atoi(e):d;}
@@ -141,7 +164,13 @@ static bool preflight(UnitConverter<T,DESCRIPTOR> const& c) {
     // sat at tau = 0.5000001 and passed it by 1.4e-7 while carrying effectively zero
     // viscosity. BGK/WALE with no resolved SGS contribution (the flow is at rest when the
     // inlet ramp starts, and WALE's nu_t vanishes in pure shear) needs a real floor.
+#if COLLISION_MODEL==3
+    // HRR filters the non-hydrodynamic content that destabilises BGK near tau = 1/2, so the
+    // floor is far lower; the turbulence model, not the base viscosity, then sets dissipation.
+    need(tau >= 0.50001,            "relaxation tau >= 0.50001 (HRR)");
+#else
     need(tau >= 0.505,              "relaxation tau >= 0.505 (non-vanishing base viscosity)");
+#endif
     need(Ma  < 0.1,                 "inlet Mach < 0.1 (safe low-compressibility regime)");
     need(uLB < 0.1,                 "lattice velocity < 0.1 (CFL / stability margin)");
     clout << "preflight " << (ok?"PASS — cleared to run":"FAIL — refusing to run (set FORCE=1 to override)") << std::endl;
@@ -235,8 +264,15 @@ void prepareLattice(SuperLattice<T,DESCRIPTOR>& sLattice,
     // One lattice-global constant (G3), read by the bulk model AND the sponge's Smagorinsky.
     // WALE uses it as C_w (collisionLES.h: preFactor = C^2); 0.325 is the project's value
     // (WALE_MODEL.md). For consistent-strain Smagorinsky OpenLB's tgv3d uses 0.033.
-    const T lesConst = envd("LES_CONST", COLLISION_MODEL==0 ? 0.325 : COLLISION_MODEL==1 ? 0.033 : 0.0);
+    const T lesConst = envd("LES_CONST", USES_WALE ? 0.325 : COLLISION_MODEL==1 ? 0.033 : 0.0);
     sLattice.setParameter<collision::LES::SMAGORINSKY>(lesConst);
+#if COLLISION_MODEL==3
+    // HRR blend sigma: 1 = pure recursive regularization; < 1 mixes in the finite-difference
+    // stress (TENSOR), which adds hyperviscosity only at sharp gradients. 0.98 as the old solver.
+    const T hrrSigma = envd("HRR_SIGMA", 0.98);
+    sLattice.setParameter<collision::HYBRID>(hrrSigma);
+    clout << "HRR hybrid sigma=" << hrrSigma << std::endl;
+#endif
     clout << "omega=" << omega << "  LES constant=" << lesConst << std::endl;
 
     AnalyticalConst3D<T,T> rhoOne(T(1));
@@ -632,7 +668,9 @@ struct VeloGradRefresh {
                         g[3*i+j] = d;
                     }
                 }
-                block.get(x,y,z).template setField<descriptors::VELO_GRAD>(g);
+                auto cl = block.get(x,y,z);
+                cl.template setField<descriptors::VELO_GRAD>(g);
+                urbanops::writeStrain(cl, g);
             }
         }
     }
@@ -1306,7 +1344,7 @@ int main(int argc, char* argv[]) {
     const T ustarLB = converter.getLatticeVelocity((T)gInlet.u_star);
     if (TOP_STRESS) { topStress.init(superGeometry, nz, WIND_DEG*M_PI/180.0);
         clout << "top: shear stress u*^2 (u*=" << gInlet.u_star << " m/s) on " << topStress.nCells << " cells" << std::endl; }
-#if COLLISION_MODEL==0
+#if USES_WALE
     VeloGradRefresh veloGrad;                             // WALE needs VELO_GRAD every step
     auto refreshWALE = [&]{ veloGrad(sLattice, superGeometry); };
     const int GRAD_CHECK_AT = envi("WALE_GRAD_CHECK",0) ? std::min(MAX_STEPS-1, stepsPerFT/2) : -1;
@@ -1332,7 +1370,7 @@ int main(int argc, char* argv[]) {
     if (!HOST_OPS)
         dev.init(sLattice, superGeometry, converter, gInlet,
                  GROUND_MODEL==1 ? &roughWall : nullptr, TOP_STRESS ? &topStress : nullptr,
-                 COLLISION_MODEL==0, AVG_FT>0, WIND_DEG*M_PI/180.0);
+                 USES_WALE, AVG_FT>0, WIND_DEG*M_PI/180.0);
     // Whole-lattice pull for host-side reads (guard scan, checks, export). A no-op on CPU.
     auto pullNSE = [&]{ sLattice.setProcessingContext(ProcessingContext::Evaluation); };
 
@@ -1368,7 +1406,7 @@ int main(int argc, char* argv[]) {
 
     for (int iT=0; iT<MAX_STEPS; ++iT) {
         preCollide(iT, rampSteps);                                              // C3 + WALE
-#if COLLISION_MODEL==0
+#if USES_WALE
         if (iT == GRAD_CHECK_AT) {
             pullNSE();
             // One-shot check of VeloGradRefresh against OpenLB's own functor, on MAT_FLUID
