@@ -1507,6 +1507,11 @@ int main(int argc, char* argv[]) {
     const T   CLEAR    = envd("CLEAR_FRAC", 0.01);          // 0 = run all MAX_BURST_STEPS
     const int MAXB     = envi("MAX_BURST_STEPS", 20*stepsPerFT);
     const int TS_EVERY = envi("TS_EVERY", 200);
+    // Clearance and NaN checks run on their own cadence, NOT only at time-series steps: a gate
+    // that sets TS_EVERY large to keep the CSV short must still stop at clearance. Every step on
+    // the host path (as before Phase 8); every CLEAR_EVERY steps on a GPU, where each check
+    // pulls the scalar lattice to the host (~3 % of run time at 100).
+    const int CLEAR_EVERY = std::max(1, envi("CLEAR_EVERY", HOST_OPS ? 1 : 100));
     // emit is the CV's emission (what the budget closes against); emitOut is Ω beyond the CV.
     double emit=0, emitOut=0, depCV=0, depOut=0, outDown=0, outUp=0, airCV=0, airAll=0, peakAir=0; int endStep=MAXB;
     double wTheta=0;
@@ -1517,8 +1522,8 @@ int main(int argc, char* argv[]) {
     FILE* ts=fopen((OUT+"/exposure_timeseries.csv").c_str(),"w");
     if(ts) fprintf(ts,"step,t_s,airborne_cv,deposited_cv,emitted,out_downstream,out_upstream,budget_resid,airborne_all,J\n");
 
-    // Totals, the clearance test and the NaN check are evaluated at report steps (every
-    // TS_EVERY and the last step), in both paths: on a GPU they need a device->host pull.
+    // Totals, the clearance test and the NaN check are evaluated at check steps (every
+    // CLEAR_EVERY, every TS_EVERY and the last step); the time series is written at TS_EVERY.
     for (int iB=0; iB<MAXB; ++iB) {
         if (!uniform) {
             preCollide(MAX_STEPS+iB, 0);                                              // inlet stays live
@@ -1537,18 +1542,19 @@ int main(int argc, char* argv[]) {
             wTheta = ops.wTheta;
         } else dad.step(adLattice, pulseOn, Q_RATE, emit, emitOut);
         const bool report = (iB%TS_EVERY==0) || (iB==MAXB-1);
-        if (!report) continue;
+        if (!report && iB%CLEAR_EVERY!=0) continue;
         if (!HOST_OPS) dad.report(adLattice, superGeometry, ops, airCV, airAll, depCV, depOut, outDown, outUp, wTheta);
         peakAir = std::max(peakAir, airCV);
         const double resid = emit>0 ? (emit-(depCV+airCV+outDown+outUp))/emit : 0.0;
         if (!std::isfinite(airCV)) { OstreamManager c(std::cout,"DIVERGED"); c<<"AD non-finite at burst step "<<iB<<std::endl; if(ts)fclose(ts); return 2; }
         // J(t) = <w,Θ(t)>/M_released: Stage C's J accumulated so far (lattice units)
         const double Jt = (emit+emitOut)>0 ? wTheta/(emit+emitOut) : 0.0;
-        if (ts) { fprintf(ts,"%d,%.4f,%.9e,%.9e,%.9e,%.9e,%.9e,%.3e,%.9e,%.9e\n",iB,iB*dt,airCV,depCV,emit,outDown,outUp,resid,airAll,Jt); fflush(ts); }
-        cl4 << "iB=" << iB << " t=" << iB*dt << "s air=" << airCV << " dep=" << depCV
+        const bool stop = CLEAR>0 && !pulseOn && peakAir>0 && airCV < CLEAR*peakAir;
+        if ((report || stop) && ts) { fprintf(ts,"%d,%.4f,%.9e,%.9e,%.9e,%.9e,%.9e,%.3e,%.9e,%.9e\n",iB,iB*dt,airCV,depCV,emit,outDown,outUp,resid,airAll,Jt); fflush(ts); }
+        if (report || stop) cl4 << "iB=" << iB << " t=" << iB*dt << "s air=" << airCV << " dep=" << depCV
             << " out=" << outDown << "+" << outUp << " emit=" << emit << " resid=" << resid
             << " airborne_frac=" << ((emit+emitOut)>0 ? airAll/(emit+emitOut) : 0.0) << " J=" << Jt << std::endl;
-        if (CLEAR>0 && !pulseOn && peakAir>0 && airCV < CLEAR*peakAir) { endStep=iB+1; break; }
+        if (stop) { endStep=iB+1; break; }
     }
     if (ts) fclose(ts);
     if (!HOST_OPS) dad.fetch(adLattice, ops);

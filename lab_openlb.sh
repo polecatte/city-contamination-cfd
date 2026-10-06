@@ -306,7 +306,7 @@ do_package() {
       grep -h -E 'MLUPs :' "$WORK"/gpu/out_*.log "$WORK"/gpu/city_s*.log 2>/dev/null | sed 's/^/gpu throughput /' || true; fi
   } > "$WORK/summary_$ts.txt"
   # Only what exists: a pattern that matches nothing (e.g. no run logs yet) is dropped rather
-  # than handed to tar as a literal name.
+  # than handed to tar as a literal name; plain names (no wildcard) are kept only if they exist.
   ( cd "$WORK" && shopt -s nullglob && \
     files=( "summary_$ts.txt" logs done *.log g5_*.txt out_*/meta*.txt out_*/*.png out_*/*.csv \
             city_s*/meta*.txt city_s*/*.csv city_s*/figs lin7b/*/meta_flow.txt \
@@ -314,7 +314,8 @@ do_package() {
             gpu/city_s*/meta*.txt gpu/city_s*/*.csv gpu/city_s*/figs gpu/parity/*.log \
             showcase/SHOWCASE.txt showcase/meta*.txt showcase/*.csv showcase/figs \
             gpu/showcase/SHOWCASE.txt gpu/showcase/meta*.txt gpu/showcase/*.csv gpu/showcase/figs gpu/out_6b_*/*.png ) && \
-    tar czf "olb_lab_$ts.tar.gz" "${files[@]}" )
+    present=() && for f in "${files[@]}"; do if [ -e "$f" ]; then present+=("$f"); fi; done && \
+    tar czf "olb_lab_$ts.tar.gz" "${present[@]}" )
   say "packaged $WORK/olb_lab_$ts.tar.gz"
   cat "$WORK/summary_$ts.txt"
 }
