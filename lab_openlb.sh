@@ -11,6 +11,7 @@
 #   GPU=1 ./lab_openlb.sh setup|gates|city|all|status   # the same, on the GPU build
 #   GPU=1 ./lab_openlb.sh parity    # GPU vs CPU build on short cases (tests/device_parity.sh)
 #   ./lab_openlb.sh compare         # CPU and GPU gate numbers side by side
+#   [GPU=1] ./lab_openlb.sh frames     # production city (seed 1000) again with snapshots -> GIFs + stills
 #   [GPU=1] ./lab_openlb.sh showcase   # small city end to end: flow, burst, J, figures, scorecard
 #   [GPU=1] ./lab_openlb.sh cube_sens  # 6b sensitivity at dx=4: floor model, inflow turbulence, C_w
 #   GPU=1   ./lab_openlb.sh cube_dx1   # 6b at dx=1 m (H/dx=40, 89 M cells): needs >= 60 GB GPU (H100)
@@ -150,6 +151,17 @@ do_showcase() {
   step showcase_viz python3 "$REPO/visualize_forward.py" showcase
   say "scorecard: $WORK/showcase/SHOWCASE.txt   figures: $WORK/showcase/figs/"
   cat "$WORK/showcase/SHOWCASE.txt"
+}
+
+# The production city once more with street-level snapshots every FRAME_EVERY burst steps
+# (urban_flow FRAMES=1), then visualize_forward.py: airflow.gif, concentration.gif, three-time
+# ground maps, deposition maps, the 3-D cloud at half clearance. ~130 MB of frames at 500.
+do_frames() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  python3 -c 'import matplotlib' 2>/dev/null || { echo "needs matplotlib: pip install --user matplotlib"; exit 1; }
+  step city_frames sh -c "STEP4=1 ABL_SEED=1000 FRAMES=1 TS_EVERY=${FRAME_EVERY:-500} GEOM_DIR=geom_prod OUT_DIR=city_frames CHECK_EVERY=2000 '$BIN' > city_frames.log 2>&1"
+  step frames_viz python3 "$REPO/visualize_forward.py" city_frames
+  say "figures: $WORK/city_frames/figs/"; ls -1 "$WORK/city_frames/figs/" | sed 's/^/     /'
 }
 
 # Gate 6b sensitivity on the dx=4 cube (each run = gate6b_dx4's cost): which knob moves Xr/H?
@@ -327,6 +339,7 @@ case "${1:-status}" in
   package) [ "${GPU:-0}" = 1 ] && { WORK="$WORK_CPU"; SUMMARY="$WORK/summary.txt"; }; do_package ;;
   parity)  do_parity ;;
   showcase) do_showcase ;;
+  frames)  do_frames ;;
   cube_sens) do_cube_sens ;;
   cube_dx1) do_cube_dx1 ;;
   compare) do_compare ;;

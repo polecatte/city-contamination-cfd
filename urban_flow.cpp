@@ -1519,6 +1519,52 @@ int main(int argc, char* argv[]) {
       cl4 << "pre-release CV mass " << m0 << " (must be 0)" << std::endl; }
     DeviceAD dad;
     if (!HOST_OPS) dad.init(adLattice, superGeometry, ops, dt, wsLB);
+    // FRAMES=1: at every time-series step, street-level maps for visualize_forward.py's
+    // animations and three-time maps: OUT/frames/vel_NNNNN.bin (ux then uy, m/s),
+    // conc_NNNNN.f32 (C) and dep_NNNNN.f32 (deposited, column sum). Header: int nx, int ny.
+    // Frame i pairs with time-series row i. Single cuboid only (as the device path).
+    const bool FRAMES = envi("FRAMES", 0) != 0 && adLattice.getLoadBalancer().size() == 1;
+    const int zped = std::max(1, std::min(nz - 1, (int)std::lround(2.0 / dx)));
+    int nFrame = 0;
+    if (FRAMES) { std::string c = "mkdir -p '" + OUT + "/frames'"; if (system(c.c_str())) {}
+                  cl4 << "frames: street level z=" << zped << " every " << TS_EVERY << " burst steps -> " << OUT << "/frames/" << std::endl; }
+    auto writeFrame = [&]() {
+        pullNSE();                                         // device -> host (no-op on CPU)
+        auto& nb = sLattice.getBlock(0); auto& ab = adLattice.getBlock(0);
+        std::vector<float> u(2 * (size_t)nx * ny, 0.f), cc((size_t)nx * ny, 0.f), dd((size_t)nx * ny, 0.f);
+        for (int y = 0; y < ny; ++y) for (int x = 0; x < nx; ++x) {
+            const size_t k = (size_t)y * nx + x;
+            const int m = mat.data[mat.idx(x, y, zped)];
+            if (m == MAT_FLUID || m == MAT_POROUS || m == MAT_SPONGE || m == MAT_INLET || m == MAT_OUTLET) {
+                T uu[3]; nb.get(x, y, zped).computeU(uu);
+                u[k] = (float)(uu[0] * cvel); u[(size_t)nx * ny + k] = (float)(uu[1] * cvel);
+                cc[k] = (float)step4::Ops::conc(ab.get(x, y, zped));
+            }
+            double col = 0;
+            for (int z = 0; z < nz; ++z)
+                col += HOST_OPS ? ops.dep[ops.gidx(x, y, z)]
+                                : (double)ab.get(x, y, z).template getField<urbanops::AD_DEP>();
+            dd[k] = (float)col;
+        }
+        char nm[64]; const int hd[2] = {nx, ny};
+        auto wr = [&](const char* pre, const char* ext, const std::vector<float>& v) {
+            snprintf(nm, sizeof nm, "/frames/%s_%05d.%s", pre, nFrame, ext);
+            if (FILE* f = fopen((OUT + nm).c_str(), "wb")) { fwrite(hd, sizeof(int), 2, f); fwrite(v.data(), sizeof(float), v.size(), f); fclose(f); } };
+        wr("vel", "bin", u); wr("conc", "f32", cc); wr("dep", "f32", dd);
+        ++nFrame;
+    };
+    bool wroteMid = false;                                 // FRAMES: one 3-D cloud for concentration_3d
+    auto writeMid3d = [&]() {
+        auto& ab = adLattice.getBlock(0);
+        std::vector<float> c3((size_t)nx * ny * nz, 0.f);
+        for (int z = 0; z < nz; ++z) for (int y = 0; y < ny; ++y) for (int x = 0; x < nx; ++x) {
+            const int m = mat.data[mat.idx(x, y, z)];
+            if (m == MAT_FLUID || m == MAT_POROUS || m == MAT_SPONGE)
+                c3[(size_t)z * ny * nx + (size_t)y * nx + x] = (float)step4::Ops::conc(ab.get(x, y, z));
+        }
+        writeField5(OUT + "/conc3d_mid.f32", c3, nx, ny, nz, dx);
+        wroteMid = true;
+    };
     FILE* ts=fopen((OUT+"/exposure_timeseries.csv").c_str(),"w");
     if(ts) fprintf(ts,"step,t_s,airborne_cv,deposited_cv,emitted,out_downstream,out_upstream,budget_resid,airborne_all,J\n");
 
@@ -1551,6 +1597,8 @@ int main(int argc, char* argv[]) {
         const double Jt = (emit+emitOut)>0 ? wTheta/(emit+emitOut) : 0.0;
         const bool stop = CLEAR>0 && !pulseOn && peakAir>0 && airCV < CLEAR*peakAir;
         if ((report || stop) && ts) { fprintf(ts,"%d,%.4f,%.9e,%.9e,%.9e,%.9e,%.9e,%.3e,%.9e,%.9e\n",iB,iB*dt,airCV,depCV,emit,outDown,outUp,resid,airAll,Jt); fflush(ts); }
+        if (FRAMES && (report || stop)) writeFrame();
+        if (FRAMES && !wroteMid && !pulseOn && peakAir > 0 && airCV < 0.5 * peakAir) writeMid3d();
         if (report || stop) cl4 << "iB=" << iB << " t=" << iB*dt << "s air=" << airCV << " dep=" << depCV
             << " out=" << outDown << "+" << outUp << " emit=" << emit << " resid=" << resid
             << " airborne_frac=" << ((emit+emitOut)>0 ? airAll/(emit+emitOut) : 0.0) << " J=" << Jt << std::endl;
