@@ -315,8 +315,8 @@ do_package() {
             showcase/SHOWCASE.txt showcase/meta*.txt showcase/*.csv showcase/figs \
             gpu/showcase/SHOWCASE.txt gpu/showcase/meta*.txt gpu/showcase/*.csv gpu/showcase/figs gpu/out_6b_*/*.png ) && \
     present=() && for f in "${files[@]}"; do if [ -e "$f" ]; then present+=("$f"); fi; done && \
-    tar czf "olb_lab_$ts.tar.gz" "${present[@]}" )
-  say "packaged $WORK/olb_lab_$ts.tar.gz"
+    tar czf "olb_lab_$ts.tar.gz" --exclude='*.gif' --exclude='*.f32' "${present[@]}" )
+  say "packaged $WORK/olb_lab_$ts.tar.gz ($(du -h "$WORK/olb_lab_$ts.tar.gz" | cut -f1); animations and fields left out)"
   cat "$WORK/summary_$ts.txt"
 }
 
