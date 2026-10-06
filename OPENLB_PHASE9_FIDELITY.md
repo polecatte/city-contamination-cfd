@@ -7,7 +7,7 @@ found five gaps; this phase fixes the four that are code and sets up the runs th
 | gap | effect | fix | where |
 |---|---|---|---|
 | lattice viscosity floor: tau 0.505 → nu ≈ 0.83 m²/s at dx 4 m, building Re_H ≈ 100–500 | wakes and canyon vortices of a low-Re flow (Snyder 1981: Re_H ≳ 1.1e4 for independence) | HRR collision at tau 0.5001 (nu ≈ 0.017 m²/s, cube Re_H ≈ 14 000) | `COLLISION_MODEL=3` |
-| OpenLB 1.8's WALE has three slips | nu_t depends on zz components only | `urban_les.h` | default for models 0 and 3 |
+| OpenLB 1.8's (and 1.9's) WALE has three slips | nu_t depends on the zz entries only: 0 for in-plane rotation, up to ~9× high in plane strain | `urban_les.h` | default for models 0 and 3 |
 | compact domain: 40 m upstream, 35 m lateral | blockage 10.5 % (COST 732: < 3 %) | 5H / 6H / 5H / 15H with H_ref = 88 m: 2.79 % | `gen_openlb_geom` default |
 | one scalar diffusivity everywhere: D = D_mol + nu_0/Sc_t | under HRR nu_0 is tiny: tau_AD = 0.50019, D ≈ 0.05 m²/s, no subgrid mixing | D(x) = D_mol + (nu_0 + nu_t(x))/Sc_t from the WALE nu_t | `D_LOCAL=1` |
 | no dispersion validation, no grid convergence of J | | runs below | lab / H100 |
@@ -19,19 +19,50 @@ Nicoud & Ducros (1999):
     nu_t = (C_w Δ)² (Sd:Sd)^{3/2} / ((S:S)^{5/2} + (Sd:Sd)^{5/4}),
     Sd_ij = ½(g²_ij + g²_ji) − ⅓ δ_ij tr(g²),   S = ½(g + gᵀ)
 
-The stock code:
+The stock code (1.8.1 line numbers; **unchanged in 1.9.0**, lines 453/462/469, which only
+replaced the zero-denominator guard by `+ 1e-12`):
 
-- accumulates Sd:Sd with `=` instead of `+=` (line ~401), so only the last (z,z) term survives;
-- does the same for S:S (line ~410);
-- subtracts ⅓ Σ_i g_ii² instead of ⅓ tr(g²) = ⅓ g_kl g_lk (line ~417).
+- line 410: `G_ip = G[i][j]*G[i][j]` inside the double loop, `=` instead of `+=`, so Sd:Sd
+  becomes Sd_zz² only;
+- line 417: the same for S:S, which becomes S_zz² = (∂w/∂z)²;
+- line 401: subtracts ⅓ Σ_i g_ii² instead of ⅓ tr(g²) = ⅓ g_kl g_lk, so the "traceless" part is
+  not traceless.
 
-The result is an eddy viscosity driven by ∂w/∂z alone. In a boundary layer, where the dominant
-gradient is ∂u/∂z, it is close to zero. `urban_les.h` (`urbanles::WaleCorrected<COLL>`) is the
-same wrapper with the sums done properly. It also stores the effective omega in
-`EFFECTIVE_OMEGA` for the scalar. `-DWALE_OPENLB` restores the stock model for comparison.
+The stock eddy viscosity is therefore a function of two numbers, (g²)_zz − ⅓Σg_ii² and ∂w/∂z,
+whatever the rest of the gradient. `urban_les.h` (`urbanles::WaleCorrected<COLL>`) is the same
+wrapper with the sums done properly. It also stores the effective omega in `EFFECTIVE_OMEGA`
+for the scalar. `-DWALE_OPENLB` restores the stock model for comparison.
 
-Consequence for earlier results: every Phase 5–8 number ran with near-zero subgrid viscosity on
-top of the tau 0.505 floor. The floor was the real dissipation, which is why the runs were stable.
+**Verification** (`tests/wale_verify/`): the stock function compiled verbatim, against an
+independent numpy transcription of Nicoud & Ducros (1999) and the `urban_les.h` formula. Values
+are tau_t = 3 nu_t (lattice units), C_w = 0.325, |g| ~ 0.01.
+
+| velocity gradient | Nicoud & Ducros | urban_les.h | OpenLB 1.8.1 |
+|---|---|---|---|
+| pure shear ∂u/∂z | 0 | 0 | 0 |
+| solid-body rotation (x-y) | 2.86e-3 | 2.86e-3 | **0** |
+| axisymmetric strain | 4.77e-4 | 4.77e-4 | 6.73e-4 |
+| plane strain in x-y | 2.76e-4 | 2.76e-4 | **2.59e-3** (9×) |
+| shear + rotation in x-y | 6.79e-5 | 6.79e-5 | **0** |
+| 6 random traceless tensors | — | = reference (all) | 0.2× to 8× the reference |
+
+`urban_les.h` matches the reference to all printed digits. The stock value equals the
+"(z,z)-entries only" prediction exactly in every case, which confirms the reading of the code.
+I found no bug report, forum thread or changelog entry about it (searched openlb.net and the
+1.9 release notes, 2026-10-06).
+
+Correction to an earlier statement of mine: the stock model is *not* "near zero in a boundary
+layer". In pure shear the correct WALE is also zero; that is the model's designed wall
+behaviour. The stock error is in both directions, by large factors, depending on how the local
+gradient is oriented relative to z:
+
+- zero for any motion confined to the x-y plane (rotation or shear there);
+- several times too large for horizontal plane strain.
+
+Consequence for earlier results: every Phase 5–8 run had a subgrid viscosity that was wrong
+cell by cell. Whether it was too high or too low on average in those flows has not been
+measured. The cube gate can measure it: rerun with and without `-DWALE_OPENLB` at the same tau.
+The tau 0.505 floor (ν ≈ 0.83 m²/s) was present in all of them either way.
 
 ## 2. HRR (model 3)
 
