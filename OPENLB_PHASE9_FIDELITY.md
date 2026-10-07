@@ -77,9 +77,15 @@ handmade solver).
 - Build: `MODEL=hrr ./lab_openlb.sh setup`. This builds `examples/urban/urban_hrr` with
   `-DCOLLISION_MODEL=3` and runs under `$WORK/hrr` at `TAU=0.5001`.
 
-Validation (cube, gate 6b, dx 4, tau 0.5001, nu = 0.0167 m²/s): *running*. It was stable
-through the inflow ramp. Xr/H is to be compared with BGK's 2.63 (dx 4) / 2.31 (dx 2) and the
-experiments' ≈ 1.4–1.6.
+Validation (cube, gate 6b, dx 4, tau 0.5001, ν = 0.0167 m²/s), **not yet decided**:
+
+- In the cloud container (4 threads, 3–5 MLUPs) the run was stable through 5 000 steps: the full
+  inflow ramp to 86 %, peak lattice |u| 0.08.
+- Both attempts were then killed by the container: a 30-minute task limit, then the container
+  being reclaimed while idle. Neither was a solver failure.
+- A full run (26 k steps, ≈ 2–3 h at that speed) belongs on the lab rig or the H100:
+  `MODEL=hrr GPU=1 ./lab_openlb.sh gates`, whose gate6b_dx4 / gate6b_dx2 run at tau 0.5001.
+- To compare: Xr/H with BGK 2.63 (dx 4) / 2.31 (dx 2), and experiments ≈ 1.4–1.6.
 
 ## 3. Domain (COST 732 / AIJ)
 
