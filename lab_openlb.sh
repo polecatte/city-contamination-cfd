@@ -224,7 +224,7 @@ do_cube_dx1() {
 
 # Ranking study: does a spread of designs give a spread of exposure beyond the inlet-seed noise,
 # and does the old model rank the designs the way the corrected one does? Five contrasting
-# designs from gen_openlb_geom (all <= 88 m, blockage < 3 % in the guideline domain), each with
+# designs from gen_openlb_geom (builder rev 9: same floor area, <= 100 m), each with
 # RANK_SEEDS inlet seeds (common to all designs). Configuration from MODEL:
 #   wale: the old model: BGK+WALE tau 0.505, compact domain, legacy release set, constant D,
 #         dx 4 (7.3 M cells: fits the A4000)
@@ -236,10 +236,10 @@ do_cube_dx1() {
 # one table with Spearman/Kendall between them.
 RANK_DESIGNS=(
   "base|"
-  "core|PEAK_H=50 EMP_CENTERS=1 EMP_CONC=0.9"
-  "low|PEAK_H=22 STREET_W=28 PARK_FRAC=0.25"
-  "fine|BLOCK_W=36 BLOCK_D=36 STREET_W=12 PEAK_H=40"
-  "coarse|BLOCK_W=80 BLOCK_D=80 STREET_W=30 PEAK_H=35"
+  "core|HEIGHT_CONC=1 EMP_CENTERS=1 EMP_CONC=0.9"
+  "flat|HEIGHT_CONC=0 ROUGH=0 STREET_W=28 PARK_FRAC=0.25"
+  "fine|BLOCK_W=32 BLOCK_D=32 STREET_W=12"
+  "coarse|BLOCK_W=100 BLOCK_D=100 STREET_W=30"
 )
 do_rank() {
   [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
@@ -327,7 +327,7 @@ do_setup() {
   local cfg; cfg="$(md5sum "$OLB_ROOT/config.mk" | cut -c1-12)"
   step "olb_core_$cfg" sh -c "make -C '$OLB_ROOT' clean-core && make -C '$OLB_ROOT' -j$THREADS core"
   mkdir -p "$APP"
-  for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h urban_ops.h urban_les.h; do ln -sf "$REPO/$f" "$APP/$f"; done
+  for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h urban_ops.h urban_les.h tail_fit.h; do ln -sf "$REPO/$f" "$APP/$f"; done
   printf 'EXAMPLE = urban_flow\nOLB_ROOT := ../../..\ninclude $(OLB_ROOT)/default.mk\n' > "$APP/Makefile"
   [ "$MODEL" = hrr ] && echo 'CXXFLAGS += -DCOLLISION_MODEL=3' >> "$APP/Makefile"
   # the app is always rebuilt: it is cheap next to a run and the sources may have been pulled

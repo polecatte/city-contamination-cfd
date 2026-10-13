@@ -52,7 +52,12 @@ int main(){
     // that resizes with the design makes J step-discontinuous across designs (the same reason
     // nz_cost732 replaced power-of-two rounding). 88 m is the production city's tallest
     // building at the default knobs; re-derive it if the design space grows taller.
-    constexpr double H_REF_M = 88.0;
+    // Builder revision 9 (default): heights scaled so total floor area houses the population,
+    // capped at the height limit H_MAX, which therefore also sets the domain (every design
+    // fits the same guideline domain). BUILDER=legacy: revision 8 and the earlier fixed 88 m.
+    const bool LEGACY_BUILDER = getenv("BUILDER") && std::string(getenv("BUILDER")) == "legacy";
+    const double H_MAX = envd("H_MAX", 100.0);
+    const double H_REF_M = LEGACY_BUILDER ? 88.0 : H_MAX;
     const double BUF_DOWN  = envd("BUF_DOWN",  15.0 * H_REF_M);   // 1320 m
     const double BUF_UP    = envd("BUF_UP",  COMPACT ? 40.0 : 5.0 * H_REF_M);    // 440 m
     // 6 H rather than 5 H: at 5 H the production city still blocks 3.1 % (> 3 %)
@@ -74,6 +79,8 @@ int main(){
     p.cbd_aspect=1; p.cbd_angle=0; p.biz_inner_frac=0; p.biz_aspect=1;
     p.park_centrality = 0.5;
     p.buf_xn = BUF_UP; p.buf_xp = BUF_DOWN; p.buf_yn = p.buf_yp = BUF_LAT;
+    p.rev = LEGACY_BUILDER ? 8 : 9;
+    p.h_max = LEGACY_BUILDER ? 0.0 : H_MAX;
     p.Sx = p.buf_xn + p.city_w + p.buf_xp;
     p.Sy = p.buf_yn + p.city_h + p.buf_yp;
     double dom_cx = p.buf_xn + p.city_w*0.5, dom_cy = p.buf_yn + p.city_h*0.5;
@@ -82,7 +89,8 @@ int main(){
 
     MixedZoningParams mzp{};
     mzp.dens_enable       = true;
-    mzp.peak_height       = envd("PEAK_H",         45.0);
+    mzp.peak_height       = envd("PEAK_H",         45.0);   // legacy builder only
+    mzp.height_conc       = envd("HEIGHT_CONC",     0.6);   // rev 9: 0 uniform canopy .. 1 heights follow density
     mzp.emp_centers       = envi("EMP_CENTERS",     3);
     mzp.emp_centrality    = envd("EMP_CTR",         0.55);
     mzp.emp_concentration = envd("EMP_CONC",        0.5);
@@ -96,6 +104,30 @@ int main(){
     Result r  = rezone(p, r0, mzp);
     printf("[gen_openlb_geom] city: blocks=%d biz=%d maxH=%.0fm pop=%.0f inhab=%.0f\n",
            r.num_blocks, r.counts[1], r.max_height, r.population, r.total_inhabitance);
+    if (!LEGACY_BUILDER)
+        printf("[gen_openlb_geom] floor area %.0f m2 for a need of %.0f m2 (height scale %.3f, height limit %.0f m)%s\n",
+               r.gfa_m2, r.gfa_target_m2, r.height_scale, H_MAX, r.feasible ? "" : "  INFEASIBLE");
+
+    // STATS_ONLY=1: layout statistics on one line, no voxels or files (parameter surveys and
+    // the optimizer's feasibility pre-check). Frontal area for wind along +x.
+    if (envi("STATS_ONLY", 0)) {
+        double cityA = CITY_M * CITY_M, foot = 0, front = 0, hsum = 0, hfa = 0, fa = 0; int nb = 0, npk = 0;
+        for (const auto& b : r.blocks) {
+            if (b.usage == PARK) { ++npk; continue; }
+            const double h = b.height_cells * (double)CELL, A = b.footprint_m2, f = A * b.n_floors;
+            ++nb; foot += A; front += (b.y1 - b.y0) * (double)CELL * h; hsum += h; hfa += h * f; fa += f;
+        }
+        printf("STATS feasible=%d buildings=%d parks=%d max_h=%.1f mean_h=%.2f fa_weighted_h=%.2f lambda_p=%.4f "
+               "lambda_f=%.4f gfa=%.0f gfa_target=%.0f height_scale=%.4f biz=%d\n",
+               (int)r.feasible, nb, npk, r.max_height, nb ? hsum / nb : 0.0, fa > 0 ? hfa / fa : 0.0,
+               foot / cityA, front / cityA, r.gfa_m2, r.gfa_target_m2, r.height_scale, r.counts[1]);
+        return r.feasible ? 0 : 3;
+    }
+    if (!r.feasible) {
+        fprintf(stderr, "[gen_openlb_geom] INFEASIBLE: at the %.0f m height limit the blocks hold %.0f of the %.0f m2 "
+                "of floor area the population needs\n", H_MAX, r.gfa_m2, r.gfa_target_m2);
+        return 3;
+    }
     if (r.max_height > H_REF_M)
         printf("[gen_openlb_geom] WARNING: tallest building %.0f m exceeds H_REF_M = %.0f m; "
                "BUF_DOWN = %.0f m is under 15 H_max for this design\n", r.max_height, H_REF_M, BUF_DOWN);
@@ -289,6 +321,8 @@ int main(){
         fprintf(f,"material_scheme 0=donothing 1=fluid 2=wall(buildings) 3=inlet 4=outlet 5=slip 6=porous(parks) 7=ground(rough-wall)\n");
         fprintf(f,"material_map_layout 5xint32[nx,ny,nz,dx*1000,ncomp=1] then nx*ny*nz int32\n");
         fprintf(f,"reconcile_gate %s\n", gate?"PASS":"FAIL");
+        fprintf(f,"builder_rev %d\nh_max_m %.1f\ngfa_m2 %.1f\ngfa_target_m2 %.1f\nheight_scale %.5f\n",
+                p.rev, LEGACY_BUILDER ? 0.0 : H_MAX, r.gfa_m2, r.gfa_target_m2, r.height_scale);
         fprintf(f,"domain %s\nbuf_up_m %.1f\nbuf_lat_m %.1f\nbuf_down_m %.1f\nh_ref_m %.1f\nblockage %.5f\n",
                 COMPACT ? "compact" : "cost732", BUF_UP, BUF_LAT, BUF_DOWN, H_REF_M, blockage);
         fclose(f);} }
