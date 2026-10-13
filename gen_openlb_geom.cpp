@@ -19,6 +19,7 @@
 #include "city_zoning.h"
 #include "voxelize.h"
 #include "openlb_geometry.h"
+#include "occupancy.h"
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -184,22 +185,42 @@ int main(){
              fwrite(g.dep_vel.data(),sizeof(float),N,f); fclose(f);
              printf("[gen_openlb_geom] wrote dep_vel.f32 (rep. bin dp=%.2g m)\n", DEP_DP);} }
 
-    // ── receptor field w (F_inf infiltration weighting; ported from forward_city.cpp) ──
-    // w = f_in·F_inf·(per-building inhabitance, spread over its outdoor envelope cells)
-    //   + f_out (pedestrian band around the built area at z_ped). This is the Stage-C
-    // contraction weight: J = (1/|Omega|) Σ_x w(x)·Θ(x).
+    // ── receptor field w: person-time per cell, so that J = <w, Theta> / M is dose per release ──
+    // The builder already turns population into person-time per building (eff_inh, NHAPS
+    // time budget, city_builder7.h): residents x 0.69 (home), workers x 0.18 (other indoor),
+    // park visitors x 0.038. The remaining 0.093 (in-vehicle + sidewalk) is the street
+    // pathway of occupancy.h. Each pathway breathes:
+    //   indoor  : the air at the building's envelope (fluid cells touching walls or roof),
+    //             reduced by the infiltration factor F_INF (Chen & Zhao 2011, PM2.5 0.3-0.82);
+    //   park    : the air in the park's ground-level cells, unfiltered;
+    //   street  : ground-level road cells next to each building, weighted by that building's
+    //             person-time and normalised to the street total (occupancy.h), unfiltered.
+    // RECEPTOR=legacy restores forward_city's weights (indoor x F_IN 0.87 on top of the time
+    // budget, 0.075 per cell in a band around the built area, no parks) for comparisons.
+    const bool REC_LEGACY = getenv("RECEPTOR") && std::string(getenv("RECEPTOR")) == "legacy";
     const double z_ped = envd("Z_PED", 2.0);
     float FINF=(float)envd("FINF",0.62), F_IN=(float)envd("F_IN",0.87), F_OUT=(float)envd("F_OUT",0.075);
     if(FINF>1.f) FINF=1.f;
     const bool FLAT_W = envi("FLAT_W",0)!=0;
     const int zped = std::min(nz-1, std::max(1,(int)std::llround(z_ped/dx)));
     std::vector<float> w(N,0.f); std::vector<int> stamp(N,-1);
-    double wEnv=0; long nEnvTot=0; int bxmin=nx,bxmax=-1,bymin=ny,bymax=-1;
+    double wEnv=0, wPark=0; long nEnvTot=0, nParkTot=0; int bxmin=nx,bxmax=-1,bymin=ny,bymax=-1;
     for(int bi=0;bi<(int)r.blocks.size();++bi){
         const Block& b=r.blocks[bi];
-        if(b.usage==PARK) continue; int hc=b.height_cells; if(hc<1) continue;
         int x0=std::max(0,b.x0),x1=std::min(nx,b.x1),y0=std::max(0,b.y0),y1=std::min(ny,b.y1);
-        if(x1<=x0||y1<=y0) continue; int hz=std::min(hc,nz-1);
+        if(x1<=x0||y1<=y0) continue;
+        if(b.usage==PARK){                                   // park visitors: ground-level park air
+            if(REC_LEGACY || b.eff_inh<=0.0) continue;
+            std::vector<size_t> cells;
+            for(int y=y0;y<y1;++y)for(int x=x0;x<x1;++x){ size_t id=IDX(x,y,zped);
+                if(g.type[id]==CELL_FLUID || (g.type[id]==CELL_SHELL && g.perm[id]>0.5f)) cells.push_back(id); }
+            if(cells.empty()) continue;
+            const double per=b.eff_inh/(double)cells.size();
+            for(size_t id:cells){ w[id]+=(float)per; wPark+=per; ++nParkTot; }
+            continue;
+        }
+        int hc=b.height_cells; if(hc<1) continue;
+        int hz=std::min(hc,nz-1);
         bxmin=std::min(bxmin,x0);bxmax=std::max(bxmax,x1-1);bymin=std::min(bymin,y0);bymax=std::max(bymax,y1-1);
         if(b.eff_inh<=0.0) continue;
         std::vector<size_t> env; const int dxn[6]={1,-1,0,0,0,0},dyn[6]={0,0,1,-1,0,0},dzn[6]={0,0,0,0,1,-1};
@@ -210,21 +231,31 @@ int main(){
                 size_t nid=IDX(xx,yy,zz); if(g.type[nid]!=CELL_FLUID) continue;
                 if(stamp[nid]==bi) continue; stamp[nid]=bi; env.push_back(nid); } }
         if(env.empty()) continue;
-        double per=(double)F_IN*FINF*(FLAT_W?1.0:b.eff_inh)/(double)env.size();
+        const double fin = REC_LEGACY ? (double)F_IN : 1.0;   // legacy counted indoor time twice
+        double per=fin*FINF*(FLAT_W?1.0:b.eff_inh)/(double)env.size();
         for(size_t nid:env){ w[nid]+=(float)per; wEnv+=per; ++nEnvTot; }
     }
     double wPed=0; long nPed=0;
-    if(bxmax>=bxmin){ int mg=std::max(2,(int)std::llround(10.0/dx));
+    if(REC_LEGACY){
+      if(bxmax>=bxmin){ int mg=std::max(2,(int)std::llround(10.0/dx));
         int px0=std::max(1,bxmin-mg),px1=std::min(nx-2,bxmax+mg),py0=std::max(1,bymin-mg),py1=std::min(ny-2,bymax+mg);
         int z=std::min(zped,nz-2);
         for(int y=py0;y<=py1;++y)for(int x=px0;x<=px1;++x){ size_t id=IDX(x,y,z);
             if(g.type[id]==CELL_FLUID){ w[id]+=F_OUT; wPed+=F_OUT; ++nPed; } } }
-    double wsum=wEnv+wPed;
+    } else {
+        // street occupants (occupancy.h): P x (in-vehicle + sidewalk share of outdoors)
+        const double streetPop = r.population * street_fraction(nhaps_average(), OUTDOOR_PARK_SHARE);
+        StreetField sf = build_street_occupancy(p, r, g, streetPop);
+        for(int y=0;y<ny;++y)for(int x=0;x<nx;++x){ const float v=sf.weight[(size_t)y*nx+x];
+            if(v>0.f){ w[IDX(x,y,sf.z)]+=v; wPed+=v; ++nPed; } }
+    }
+    const double wsum=wEnv+wPark+wPed;
     { FILE* f=fopen((OUT+"/receptor_w.f32").c_str(),"wb");
       if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f);
              fwrite(w.data(),sizeof(float),N,f); fclose(f);} }
-    printf("[gen_openlb_geom] receptor w: indoor %ld cells (w=%.4g) + outdoor %ld cells (w=%.4g), wsum=%.4g\n",
-           nEnvTot,wEnv,nPed,wPed,wsum);
+    printf("[gen_openlb_geom] receptor w (%s): indoor %.4g on %ld envelope cells (F_INF %.2f), park %.4g on %ld cells, "
+           "street %.4g on %ld cells; wsum %.4g (population %.0f)\n", REC_LEGACY ? "legacy" : "person-time",
+           wEnv, nEnvTot, (double)FINF, wPark, nParkTot, wPed, nPed, wsum, r.population);
     if(wsum<=0){ fprintf(stderr,"[gen_openlb_geom] WARN empty receptor field\n"); }
 
     // ── build + write the OpenLB material map ──
@@ -251,6 +282,8 @@ int main(){
         fprintf(f,"# gen_openlb_geom — OpenLB Stage-A geometry-bridge metadata\n");
         fprintf(f,"grid_nx %d\ngrid_ny %d\ngrid_nz %d\ndx_m %.4f\n",nx,ny,nz,dx);
         fprintf(f,"wind_deg %.1f\n",WIND_DEG);
+        fprintf(f,"receptor_mode %s\nw_indoor %.6g\nw_park %.6g\nw_street %.6g\nf_inf %.4f\npopulation %.1f\n",
+                REC_LEGACY ? "legacy" : "person_time", wEnv, wPark, wPed, (double)FINF, r.population);
         fprintf(f,"omega_source_cells %ld\nomega_mode %s\nomega_roof_cells %ld\nenviron_frac %.3f\nrelease_zones %d\n",
                 nOmega, OMEGA_LEGACY ? "legacy" : "environs", nRoof, OMEGA_LEGACY ? 0.0 : ENV_FRAC, ZONES * ZONES);
         fprintf(f,"material_scheme 0=donothing 1=fluid 2=wall(buildings) 3=inlet 4=outlet 5=slip 6=porous(parks) 7=ground(rough-wall)\n");
