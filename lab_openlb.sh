@@ -18,6 +18,7 @@
 #
 #   [MODEL=hrr] [GPU=1] ./lab_openlb.sh rank   # ranking study: 5 designs x 2 seeds (see do_rank)
 #   ./lab_openlb.sh rank_report                 # its table: noise, spread, ANOVA, Spearman old vs new
+#   ./lab_openlb.sh opt_setup                   # optimizer venv (CPU torch + BoTorch) + smoke test
 #   MODEL=hrr [GPU=1] ./lab_openlb.sh setup|gates|...  # the same with HRR collision + corrected
 #             WALE (COLLISION_MODEL=3) at TAU=0.5001: its own app dir (urban_hrr) and outputs
 #             under $WORK/hrr (GPU: $WORK/gpu/hrr); geometries shared with the default model
@@ -258,6 +259,19 @@ do_rank_report() {
   python3 "$REPO/tests/rank_report.py" $m | tee "$WORK_CPU/rank_report.txt"
 }
 
+# Optimizer environment: a venv at $WORK_CPU/optenv with CPU torch + BoTorch (requirements-opt.txt),
+# then the wind-surrogate smoke test. BoTorch 0.18 needs Python >= 3.11.
+do_opt_setup() {
+  local E="$WORK_CPU/optenv"
+  python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' \
+    || { echo "BoTorch 0.18 needs Python >= 3.11 (found $(python3 --version)); install a newer python3 or use conda"; exit 1; }
+  [ -x "$E/bin/python" ] || python3 -m venv "$E"
+  step opt_torch sh -c "'$E/bin/pip' install -q torch --index-url https://download.pytorch.org/whl/cpu || '$E/bin/pip' install -q torch"
+  step opt_reqs  "$E/bin/pip" install -q -r "$REPO/requirements-opt.txt"
+  "$E/bin/python" -W ignore "$REPO/tests/test_wind_surrogate.py"
+  say "optimizer env ready: $E/bin/python"
+}
+
 # the gates' deciding numbers, CPU next to GPU
 do_compare() {
   for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b gate8 wake showcase; do
@@ -415,6 +429,7 @@ case "${1:-status}" in
   compare) do_compare ;;
   rank)    do_rank ;;
   rank_report) do_rank_report ;;
+  opt_setup) do_opt_setup ;;
   all)     do_setup; do_gates; do_city; do_package ;;
   status)  ls -1 "$WORK/done" 2>/dev/null | sed 's/^/done: /'; cat "$SUMMARY" 2>/dev/null || true ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;

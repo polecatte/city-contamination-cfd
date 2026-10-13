@@ -205,3 +205,32 @@ The report gives:
 
 "Meaningful" means p < 0.05 and a spread above 3σ. With two seeds, a borderline F calls for
 more seeds (`RANK_SEEDS="1000 2000 3000"`).
+
+## 8. Optimizer and the wind rose (plan; dependencies in place)
+
+- **Library.** BoTorch 0.18.1 (`requirements-opt.txt`; `./lab_openlb.sh opt_setup` builds a CPU-torch
+  venv). The old `bayesopt.py` is not in the repo and is not rebuilt.
+- **Objective.** Unchanged: the rose-averaged exposure F(x) = mean over 16 directions of J(x, θ),
+  for a uniform rose. One objective; the surrogate's accuracy is a means, not a goal.
+- **Wind direction as a surrogate input.**
+  - Each CFD run is one (design, direction) pair.
+  - The GP models J(x, θ) with k = k_x + k_x′·k_θ, Matérn on the design, periodic on θ.
+  - The posterior of F(x) is that model averaged over the 16 directions (BoTorch
+    `AppendFeatures` + `ExpectationPosteriorTransform`, the construction of Cakmak et al. 2020).
+  - The next (x, θ) is chosen by its value for the decision: knowledge gradient on F (ρKG,
+    Cakmak et al. 2020; Toscano-Palmerin & Frazier). So extra directions go to designs that could
+    still win, not to an accurate map of every design at every angle.
+  - Finalists are run at all 16 directions, so the reported F does not depend on the surrogate.
+- **Synthetic check** (`tests/test_wind_surrogate.py`, smooth truth with a design-dependent cos 4θ
+  street-alignment term as large as the design spread):
+  - With one direction per design, the GP's error in F is 0.45 %. Taking that direction's J at
+    face value gives 3.8 %.
+  - Its 2σ interval covers 95 % of designs, and the rank correlation over 200 unseen designs is 0.99.
+  - A second direction for the 10 contenders cuts their σ from 0.65 % to 0.44 %.
+  - The real J is rougher (the generator has discrete jumps), so the CFD savings are measured,
+    not assumed: angular-spectrum study (3 designs × 16 directions, dx 8) before the search.
+- **Exact free directions.** 90° rotations and mirrors of the voxel city are exact and leave the
+  release ring and footprint unchanged. The 4 axis directions need only a rotation in the
+  generator, and oblique inflow is needed only at 22.5° and 45°.
+- **Four axis directions alone are biased.** N equally spaced directions count the N-fold
+  angular harmonic fully into the mean, and a street grid's channelling is exactly a 4-fold term.
