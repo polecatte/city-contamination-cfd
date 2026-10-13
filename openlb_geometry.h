@@ -84,10 +84,11 @@ struct MaterialMap {
 };
 
 // ── Stamp OpenLB materials from the voxel grid ──────────────
-// wind_deg selects which lateral face is the velocity inlet. For the project's default
-// 0° (+x) wind the inlet is the x=0 plane and the outlet is x=nx-1; 180° swaps them;
-// 90°/270° use the y faces. Only axis-aligned inlets are handled (matching the solver's
-// wind_angle usage); an oblique wind falls back to the +x convention with a note.
+// wind_deg (toward, from +x) sets the lateral faces' roles by the sign of w . n_out, w the wind
+// direction and n_out the face's outward normal: < 0 inflow (velocity inlet), > 0 outflow
+// (pressure outlet), = 0 parallel (free slip). An axis wind gives one inlet, the opposite
+// outlet and two slip faces (0 deg: inlet x = 0, outlet x = nx-1, as before); an oblique wind
+// gives two inlet faces and two outlet faces.
 //
 // Assignment order (guarantees exactly one material per cell):
 //   (1) every cell defaults to MAT_FLUID
@@ -119,14 +120,10 @@ inline MaterialMap build_material_map(const VoxelGrid& g, double wind_deg = 0.0)
         }
     }
 
-    // (3) domain-boundary overlay on fluid cells only.
-    // Normalize wind to the nearest axis; default +x.
-    double wd = std::fmod(wind_deg, 360.0); if (wd < 0) wd += 360.0;
-    enum { PX, PY, NX_, NY_ } inflow;
-    if      (wd >= 45.0  && wd < 135.0) inflow = PY;   // wind toward +y  → inlet at y=0
-    else if (wd >= 135.0 && wd < 225.0) inflow = NX_;  // toward −x        → inlet at x=nx-1
-    else if (wd >= 225.0 && wd < 315.0) inflow = NY_;  // toward −y        → inlet at y=ny-1
-    else                                inflow = PX;   // toward +x        → inlet at x=0
+    // (3) domain-boundary overlay on fluid cells only: each lateral face's role from w . n_out
+    const double wr = wind_deg * M_PI / 180.0, wx = std::cos(wr), wy = std::sin(wr), eps = 1e-6;
+    auto role = [&](double dot) -> int32_t { return dot < -eps ? MAT_INLET : (dot > eps ? MAT_OUTLET : MAT_SLIP); };
+    const int32_t fXm = role(-wx), fXp = role(wx), fYm = role(-wy), fYp = role(wy);   // faces x=0, x=nx-1, y=0, y=ny-1
 
     // One face per cell. The previous sequential overlay let the inlet claim its whole
     // plane first, including the two columns where that plane meets the lateral slip
@@ -147,13 +144,11 @@ inline MaterialMap build_material_map(const VoxelGrid& g, double wind_deg = 0.0)
         const size_t i = m.idx(x, y, z);
         if (m.mat[i] != MAT_FLUID) continue;         // buildings / ground / parks keep theirs
         if (nf >= 2) { m.mat[i] = MAT_FRAME; continue; }       // box edge or corner
-        int32_t v = MAT_SLIP;                        // lateral or top face
-        switch (inflow) {
-            case PX:  if (x == 0)      v = MAT_INLET;  else if (x == nx - 1) v = MAT_OUTLET; break;
-            case NX_: if (x == nx - 1) v = MAT_INLET;  else if (x == 0)      v = MAT_OUTLET; break;
-            case PY:  if (y == 0)      v = MAT_INLET;  else if (y == ny - 1) v = MAT_OUTLET; break;
-            case NY_: if (y == ny - 1) v = MAT_INLET;  else if (y == 0)      v = MAT_OUTLET; break;
-        }
+        int32_t v = MAT_SLIP;                        // top face
+        if      (x == 0)      v = fXm;
+        else if (x == nx - 1) v = fXp;
+        else if (y == 0)      v = fYm;
+        else if (y == ny - 1) v = fYp;
         m.mat[i] = v;
     }
 

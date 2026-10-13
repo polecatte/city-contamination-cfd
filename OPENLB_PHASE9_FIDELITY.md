@@ -217,9 +217,13 @@ more seeds (`RANK_SEEDS="1000 2000 3000"`).
   - The GP models J(x, θ) with k = k_x + k_x′·k_θ, Matérn on the design, periodic on θ.
   - The posterior of F(x) is that model averaged over the 16 directions (BoTorch
     `AppendFeatures` + `ExpectationPosteriorTransform`, the construction of Cakmak et al. 2020).
-  - The next (x, θ) is chosen by its value for the decision: knowledge gradient on F (ρKG,
-    Cakmak et al. 2020; Toscano-Palmerin & Frazier). So extra directions go to designs that could
-    still win, not to an accurate map of every design at every angle.
+  - The next design: log expected improvement on F (plug-in incumbent), including the designs
+    already run as candidates. The next direction: the one that most reduces Var F at that
+    design (exact for a GP). Simpler than joint knowledge gradient (ρKG, Cakmak et al. 2020;
+    Toscano-Palmerin & Frazier), which stays an option if this spends runs poorly.
+  - Observed (synthetic test): contenders are sampled through near neighbours at other
+    directions rather than exact repeats; the 10 runs nearest the best design covered 5–7
+    directions. Full description: OPTIMIZER.md.
   - Finalists are run at all 16 directions, so the reported F does not depend on the surrogate.
 - **Synthetic check** (`tests/test_wind_surrogate.py`, smooth truth with a design-dependent cos 4θ
   street-alignment term as large as the design spread):

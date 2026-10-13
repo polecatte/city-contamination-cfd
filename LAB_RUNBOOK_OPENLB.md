@@ -158,3 +158,13 @@ What to send back: `rank_report.txt`, `hrr/summary.txt` (or `gpu/hrr/summary.txt
 H100's `rank_manifest.txt` plus the `rank_*` run directories' `theta.f32`/`meta_flow.txt` and the
 `rank_geom_*` `receptor_w.f32` back if you want one combined report, or send both reports.
 The guideline domain at dx 4 (32.5 M cells) needs ≈ 20 GB of GPU memory: H100 only.
+
+### 9.1 Optimisation (after the ranking study)
+
+```bash
+~/cfd_gpu/lab_openlb.sh opt_setup                      # CPU torch + BoTorch venv, two self-tests (~4 min)
+MODEL=hrr GPU=1 OPT_BUDGET=150 ~/cfd_gpu/lab_openlb.sh optimize   # resumable; rerun to continue
+~/cfd_gpu/lab_openlb.sh opt_report                     # best designs so far
+MODEL=hrr GPU=1 OPT_TOP=3 ~/cfd_gpu/lab_openlb.sh opt_verify      # top 3 at all 16 directions
+```
+Send back `opt_*/report.json`, `opt_*/verified.json` and `opt_*.log`. Method: OPTIMIZER.md.

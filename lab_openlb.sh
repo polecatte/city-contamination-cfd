@@ -19,6 +19,7 @@
 #   [MODEL=hrr] [GPU=1] ./lab_openlb.sh rank   # ranking study: 5 designs x 2 seeds (see do_rank)
 #   ./lab_openlb.sh rank_report                 # its table: noise, spread, ANOVA, Spearman old vs new
 #   ./lab_openlb.sh opt_setup                   # optimizer venv (CPU torch + BoTorch) + smoke test
+#   [MODEL=hrr] GPU=1 ./lab_openlb.sh optimize | opt_report | opt_verify   # the optimisation (OPTIMIZER.md)
 #   MODEL=hrr [GPU=1] ./lab_openlb.sh setup|gates|...  # the same with HRR collision + corrected
 #             WALE (COLLISION_MODEL=3) at TAU=0.5001: its own app dir (urban_hrr) and outputs
 #             under $WORK/hrr (GPU: $WORK/gpu/hrr); geometries shared with the default model
@@ -259,7 +260,7 @@ do_rank() {
     n="${v%%|*}"; e="${v#*|}"
     step "rank_geom_${cfg}_$n" sh -c "env $genv $e OUT_DIR=rank_geom_${cfg}_$n $gen"
     for s in ${RANK_SEEDS:-1000 2000}; do
-      step "rank_${cfg}_${n}_s$s" sh -c "env $runv STEP4=1 ABL_SEED=$s GEOM_DIR=rank_geom_${cfg}_$n OUT_DIR=rank_${cfg}_${n}_s$s CHECK_EVERY=2000 TS_EVERY=1000 '$BIN' > rank_${cfg}_${n}_s$s.log 2>&1"
+      step "rank_${cfg}_${n}_s$s" sh -c "env $runv STEP4=1 ABL_SEED=$s GEOM_DIR=rank_geom_${cfg}_$n OUT_DIR=rank_${cfg}_${n}_s$s CHECK_EVERY=2000 TS_EVERY=200 '$BIN' > rank_${cfg}_${n}_s$s.log 2>&1"
       local line="$cfg $n $s $WORK/rank_geom_${cfg}_$n $WORK/rank_${cfg}_${n}_s$s"
       grep -qxF "$line" "$WORK/rank_manifest.txt" 2>/dev/null || echo "$line" >> "$WORK/rank_manifest.txt"
     done
@@ -283,7 +284,39 @@ do_opt_setup() {
   step opt_torch sh -c "'$E/bin/pip' install -q torch --index-url https://download.pytorch.org/whl/cpu || '$E/bin/pip' install -q torch"
   step opt_reqs  "$E/bin/pip" install -q -r "$REPO/requirements-opt.txt"
   "$E/bin/python" -W ignore "$REPO/tests/test_wind_surrogate.py"
+  "$E/bin/python" -W ignore "$REPO/tests/test_driver_synth.py" "$WORK_CPU/opt_synth" | grep '^\[synth\]' 
   say "optimizer env ready: $E/bin/python"
+}
+
+# Optimisation (opt/driver.py, OPTIMIZER.md): BoTorch over the 11 design knobs, one run per
+# (design, wind direction), resumable. MODEL decides the physics (hrr = production: tau 0.5001,
+# per-cell D); OPT_DX the resolution (default 4 on a >= 40 GB GPU, else 8); OPT_BUDGET the runs.
+#   [MODEL=hrr] GPU=1 ./lab_openlb.sh optimize      # run (or continue) to OPT_BUDGET runs
+#   ./lab_openlb.sh opt_report                      # best designs, surrogate F +- sd, directions
+#   [MODEL=hrr] GPU=1 ./lab_openlb.sh opt_verify    # top OPT_TOP designs at all 16 directions
+opt_common() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  [ -x "$WORK_CPU/optenv/bin/python" ] || { echo "run '$0 opt_setup' first"; exit 1; }
+  local dx="${OPT_DX:-}" mem
+  if [ -z "$dx" ]; then
+    mem=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
+    dx=8; [ "${GPU:-0}" = 1 ] && [ "${mem:-0}" -ge 40000 ] && dx=4
+  fi
+  case "$dx" in 4) OPT_GEN="$WORK/gen_openlb_geom" ;; 8) OPT_GEN="$WORK/gen_openlb_geom8" ;; *) echo "OPT_DX must be 4 or 8"; exit 2 ;; esac
+  OPT_DIR="$WORK/opt_${MODEL}_dx$dx"
+  OPT_RUNENV=""; [ "$MODEL" = hrr ] && OPT_RUNENV="TAU=${TAU:-0.5001} D_LOCAL=1"
+  say "optimiser: $OPT_DIR (model $MODEL, dx $dx)"
+}
+do_optimize() {
+  opt_common
+  ( cd "$REPO" && "$WORK_CPU/optenv/bin/python" -W ignore -m opt.driver run --workdir "$OPT_DIR" --gen "$OPT_GEN" --solver "$BIN" \
+      --budget "${OPT_BUDGET:-150}" --n-init "${OPT_INIT:-24}" --run-env "$OPT_RUNENV" ) 2>&1 | tee -a "$OPT_DIR.log"
+}
+do_opt_report() { opt_common; ( cd "$REPO" && "$WORK_CPU/optenv/bin/python" -W ignore -m opt.driver report --workdir "$OPT_DIR" ); }
+do_opt_verify() {
+  opt_common
+  ( cd "$REPO" && "$WORK_CPU/optenv/bin/python" -W ignore -m opt.driver verify --workdir "$OPT_DIR" --gen "$OPT_GEN" --solver "$BIN" \
+      --top "${OPT_TOP:-3}" --run-env "$OPT_RUNENV" ) 2>&1 | tee -a "$OPT_DIR.log"
 }
 
 # the gates' deciding numbers, CPU next to GPU
@@ -444,6 +477,9 @@ case "${1:-status}" in
   rank)    do_rank ;;
   rank_report) do_rank_report ;;
   opt_setup) do_opt_setup ;;
+  optimize)  do_optimize ;;
+  opt_report) do_opt_report ;;
+  opt_verify) do_opt_verify ;;
   all)     do_setup; do_gates; do_city; do_package ;;
   status)  ls -1 "$WORK/done" 2>/dev/null | sed 's/^/done: /'; cat "$SUMMARY" 2>/dev/null || true ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;

@@ -63,7 +63,24 @@ int main(){
     // 6 H rather than 5 H: at 5 H the production city still blocks 3.1 % (> 3 %)
     const double BUF_LAT   = envd("BUF_LAT", COMPACT ? 35.0 : 6.0 * H_REF_M);    // 528 m
     const double HEADROOM_H = envd("HEADROOM_H", COMPACT ? 3.0 : 5.0);         // above H_REF_M
+    // Wind (toward, deg from +x) in [0, 90]: 0 = the original +x inflow; an oblique angle puts the
+    // inflow on the x=0 and y=0 faces and the outflow on the other two (openlb_geometry.h). The
+    // other rose directions come from ORIENT, an exact grid symmetry of the city (below), so only
+    // 0 < WIND_DEG <= 45 is ever needed (tools/wind_rose.py maps a direction to the pair).
     const double WIND_DEG   = envd("WIND_DEG",   0.0);
+    const int    ORIENT     = envi("ORIENT", 0);
+    if (WIND_DEG < 0 || WIND_DEG > 90 || ORIENT < 0 || ORIENT > 7) {
+        fprintf(stderr, "[gen_openlb_geom] WIND_DEG must be in [0, 90] and ORIENT in 0..7 (got %g, %d)\n", WIND_DEG, ORIENT);
+        return 2; }
+    if (COMPACT && WIND_DEG != 0) { fprintf(stderr, "[gen_openlb_geom] oblique wind needs the guideline domain\n"); return 2; }
+    // Buffers by face. Upwind faces: 5 H (x) and the 6 H lateral (y, >= 5 H). Downwind faces:
+    // the 15 H wake length projected on each axis, at least the 6 H lateral. At 0 deg this is
+    // exactly the axis layout (5 H / 15 H in x, 6 H each side in y).
+    const double wrad = WIND_DEG * M_PI / 180.0;
+    const double BUF_XM = WIND_DEG < 90 ? BUF_UP : BUF_LAT;
+    const double BUF_YM = BUF_LAT;
+    const double BUF_XP = std::max(BUF_LAT, BUF_DOWN * std::cos(wrad));
+    const double BUF_YP = std::max(BUF_LAT, BUF_DOWN * std::sin(wrad));
 
     Params p{};
     p.city_w = CITY_M; p.city_h = CITY_M;
@@ -78,7 +95,7 @@ int main(){
     p.cbd_peak = 40.0; p.cbd_decay = 8e-6; p.patchiness = 0.0;
     p.cbd_aspect=1; p.cbd_angle=0; p.biz_inner_frac=0; p.biz_aspect=1;
     p.park_centrality = 0.5;
-    p.buf_xn = BUF_UP; p.buf_xp = BUF_DOWN; p.buf_yn = p.buf_yp = BUF_LAT;
+    p.buf_xn = BUF_XM; p.buf_xp = BUF_XP; p.buf_yn = BUF_YM; p.buf_yp = BUF_YP;
     p.rev = LEGACY_BUILDER ? 8 : 9;
     p.h_max = LEGACY_BUILDER ? 0.0 : H_MAX;
     p.Sx = p.buf_xn + p.city_w + p.buf_xp;
@@ -104,6 +121,29 @@ int main(){
     Result r  = rezone(p, r0, mzp);
     printf("[gen_openlb_geom] city: blocks=%d biz=%d maxH=%.0fm pop=%.0f inhab=%.0f\n",
            r.num_blocks, r.counts[1], r.max_height, r.population, r.total_inhabitance);
+    // ORIENT: rotate / mirror the finished layout about the city centre by an element of the
+    // square's symmetry group: k = 0..3 rotate 90 k deg counter-clockwise, k = 4..7 mirror x
+    // first. Exact on the cell grid (square city, whole cells), so the voxels, release set and
+    // receptors of an oriented city are those of the original, moved.
+    if (ORIENT) {
+        const int W = (int)std::lround(CITY_M / CELL), cx0 = (int)std::lround(p.buf_xn / CELL), cy0 = (int)std::lround(p.buf_yn / CELL);
+        auto pt = [&](double u, double v, double& uo, double& vo) {
+            if (ORIENT >= 4) u = W - u;
+            for (int i = 0; i < (ORIENT & 3); ++i) { const double t = u; u = W - v; v = t; }
+            uo = u; vo = v; };
+        auto rect = [&](int& x0, int& x1, int& y0, int& y1) {
+            double ax, ay, bx, by; pt(x0 - cx0, y0 - cy0, ax, ay); pt(x1 - cx0, y1 - cy0, bx, by);
+            const int nx0 = cx0 + (int)std::lround(std::min(ax, bx)), nx1 = cx0 + (int)std::lround(std::max(ax, bx));
+            const int ny0 = cy0 + (int)std::lround(std::min(ay, by)), ny1 = cy0 + (int)std::lround(std::max(ay, by));
+            x0 = nx0; x1 = nx1; y0 = ny0; y1 = ny1; };
+        for (auto& b : r.blocks) {
+            rect(b.x0, b.x1, b.y0, b.y1); rect(b.bx0, b.bx1, b.by0, b.by1);
+            double uo, vo; pt(b.center_x / CELL - cx0, b.center_y / CELL - cy0, uo, vo);
+            b.center_x = (cx0 + uo) * CELL; b.center_y = (cy0 + vo) * CELL;
+        }
+        printf("[gen_openlb_geom] city oriented by symmetry %d (%s %d deg)\n", ORIENT,
+               ORIENT >= 4 ? "mirror x, then rotate" : "rotate", 90 * (ORIENT & 3));
+    }
     if (!LEGACY_BUILDER)
         printf("[gen_openlb_geom] floor area %.0f m2 for a need of %.0f m2 (height scale %.3f, height limit %.0f m)%s\n",
                r.gfa_m2, r.gfa_target_m2, r.height_scale, H_MAX, r.feasible ? "" : "  INFEASIBLE");
@@ -153,9 +193,17 @@ int main(){
               hit = g.type[id] == CELL_SHELL && g.perm[id] < 0.5f; }
           if (hit) ++fa; }
       blockage = (double)fa / ((double)g.ny * (g.nz - 1));
+      if (WIND_DEG > 0) {                // oblique: the y-facing cross-section matters as well
+          long fy = 0;
+          for (int z = 1; z < g.nz; ++z) for (int x = 0; x < g.nx; ++x) {
+              bool hit = false;
+              for (int y = 0; y < g.ny && !hit; ++y) { size_t id = g.idx(x, y, z); hit = g.type[id] == CELL_SHELL && g.perm[id] < 0.5f; }
+              if (hit) ++fy; }
+          blockage = std::max(blockage, (double)fy / ((double)g.nx * (g.nz - 1)));
+      }
       printf("[gen_openlb_geom] domain %s: upstream %.0f m, lateral %.0f m, top %.0f m, downstream %.0f m; "
-             "blockage %.2f%% %s\n", COMPACT ? "COMPACT (not guideline)" : "COST 732", BUF_UP, BUF_LAT,
-             (g.nz - 1) * (double)CELL, BUF_DOWN, 100 * blockage, blockage < 0.03 ? "(< 3 %, ok)" : "(ABOVE the 3 % guideline)"); }
+             "blockage %.2f%% %s\n", COMPACT ? "COMPACT (not guideline)" : "COST 732", p.buf_xn, std::max(p.buf_yn, p.buf_yp),
+             (g.nz - 1) * (double)CELL, p.buf_xp, 100 * blockage, blockage < 0.03 ? "(< 3 %, ok)" : "(ABOVE the 3 % guideline)"); }
 
     const int nx=g.nx, ny=g.ny, nz=g.nz; const size_t N=(size_t)nx*ny*nz;
     const double dx = g.cell_size;
@@ -176,7 +224,7 @@ int main(){
     double ringUp, ringDown, ringLat;
     if (OMEGA_LEGACY) { ringUp = 40.0; ringLat = 35.0; ringDown = envd("OMEGA_DOWN", 70.0); }
     else { ringUp = ringDown = ringLat = ENV_FRAC * CITY_M; }
-    if (ringUp > BUF_UP + 1e-9 || ringLat > BUF_LAT + 1e-9 || ringDown > BUF_DOWN + 1e-9) {
+    if (ringUp > p.buf_xn + 1e-9 || ringLat > std::min(p.buf_yn, p.buf_yp) + 1e-9 || ringDown > p.buf_xp + 1e-9) {
         fprintf(stderr, "[gen_openlb_geom] FATAL release ring (%.0f/%.0f/%.0f m) does not fit the buffers "
                 "(%.0f/%.0f/%.0f m); use OMEGA=legacy or larger buffers\n", ringUp, ringLat, ringDown, BUF_UP, BUF_LAT, BUF_DOWN);
         return 2;
@@ -184,11 +232,11 @@ int main(){
     // legacy keeps the old loop's bounds exactly (it reached the boundary rows); environs stays
     // one cell inside the domain faces
     const int lo = OMEGA_LEGACY ? 0 : 1;
-    const int rx0 = std::max(lo, (int)std::lround((BUF_UP - ringUp) / dx));
-    const int rx1 = OMEGA_LEGACY ? std::min(nx, (int)std::floor((BUF_UP + CITY_M + ringDown) / dx))   // exclusive
-                                 : std::min(nx - 1, (int)std::lround((BUF_UP + CITY_M + ringDown) / dx));
-    const int ry0 = std::max(lo, (int)std::lround((BUF_LAT - ringLat) / dx));
-    const int ry1 = std::min(ny - lo, (int)std::lround((BUF_LAT + CITY_M + ringLat) / dx));
+    const int rx0 = std::max(lo, (int)std::lround((p.buf_xn - ringUp) / dx));
+    const int rx1 = OMEGA_LEGACY ? std::min(nx, (int)std::floor((p.buf_xn + CITY_M + ringDown) / dx))   // exclusive
+                                 : std::min(nx - 1, (int)std::lround((p.buf_xn + CITY_M + ringDown) / dx));
+    const int ry0 = std::max(lo, (int)std::lround((p.buf_yn - ringLat) / dx));
+    const int ry1 = std::min(ny - lo, (int)std::lround((p.buf_yn + CITY_M + ringLat) / dx));
     std::vector<uint8_t> srcmask(N, 0), zone(N, 0);
     long nOmega = 0, nRoof = 0;
     for (int y = ry0; y < ry1; ++y) for (int x = rx0; x < rx1; ++x) {
@@ -313,7 +361,8 @@ int main(){
     { FILE* f=fopen((OUT+"/meta_geom.txt").c_str(),"w"); if(f){
         fprintf(f,"# gen_openlb_geom — OpenLB Stage-A geometry-bridge metadata\n");
         fprintf(f,"grid_nx %d\ngrid_ny %d\ngrid_nz %d\ndx_m %.4f\n",nx,ny,nz,dx);
-        fprintf(f,"wind_deg %.1f\n",WIND_DEG);
+        fprintf(f,"wind_deg %.4f\norient %d\nbuf_xm_m %.1f\nbuf_xp_m %.1f\nbuf_ym_m %.1f\nbuf_yp_m %.1f\n",
+                WIND_DEG, ORIENT, p.buf_xn, p.buf_xp, p.buf_yn, p.buf_yp);
         fprintf(f,"receptor_mode %s\nw_indoor %.6g\nw_park %.6g\nw_street %.6g\nf_inf %.4f\npopulation %.1f\n",
                 REC_LEGACY ? "legacy" : "person_time", wEnv, wPark, wPed, (double)FINF, r.population);
         fprintf(f,"omega_source_cells %ld\nomega_mode %s\nomega_roof_cells %ld\nenviron_frac %.3f\nrelease_zones %d\n",

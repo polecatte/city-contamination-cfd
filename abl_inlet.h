@@ -117,9 +117,19 @@ struct ABLInlet {
         uy = U * std::sin(wind_angle);
         uz = 0.0;
         double fx, fy, fz; fluct(x, y, z, t, fx, fy, fz);
-        // Scale the (unit-variance) fluctuation to surface-layer sigmas.
-        ux += sigma_u_ratio * u_star * fx;
-        uy += sigma_v_ratio * u_star * fy;
+        // Scale the (unit-variance) fluctuation to surface-layer sigmas in the WIND frame
+        // (sigma_u along the mean wind, sigma_v across it), then rotate to x/y. At wind_angle 0
+        // the original expressions are kept verbatim, so axis runs stay bitwise reproducible
+        // (the compiler fuses them into FMAs; a rotated form would round differently).
+        if (wind_angle == 0.0) {
+            ux += sigma_u_ratio * u_star * fx;
+            uy += sigma_v_ratio * u_star * fy;
+        } else {
+            const double fs = sigma_u_ratio * u_star * fx, fn = sigma_v_ratio * u_star * fy;
+            const double ca = std::cos(wind_angle), sa = std::sin(wind_angle);
+            ux += fs * ca - fn * sa;
+            uy += fs * sa + fn * ca;
+        }
         uz += sigma_w_ratio * u_star * fz;
     }
 

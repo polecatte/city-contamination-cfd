@@ -44,6 +44,8 @@
 #endif
 
 #include "geometry_loader.h"   // Stage-A material map + source mask reader/stamper
+#include <fstream>
+#include <sstream>
 #include "abl_inlet_olb.h"     // verified ABL/RFG inlet as AnalyticalF3D (with startup ramp)
 #include "urban_ops.h"         // the per-step work as OpenLB operators (CPU and GPU)
 
@@ -74,6 +76,7 @@ using UrbanD3Q19Descriptor = D3Q19<EFFECTIVE_OMEGA,VELO_GRAD,POROSITY>;
 #endif
 #define DESCRIPTOR UrbanD3Q19Descriptor
 #include "urban_les.h"   // WALE with OpenLB 1.8's inner-product slips corrected
+#include "tail_fit.h"    // exponential tail of the exposure integral (TAIL=1)
 // WALE_OPENLB=1 builds with OpenLB's stock WALE instead (to measure what the correction changes).
 #ifndef WALE_OPENLB
   template <typename COLL> using UrbanWale = urbanles::WaleCorrected<COLL>;
@@ -140,12 +143,15 @@ static void carve_sponge(bridge::GridField<int32_t>& m, double wind_deg, int nSp
     };
     // Two passes: eligibility is judged against the ORIGINAL map, so an earlier mark in the
     // same band cannot disqualify its neighbour.
-    std::vector<size_t> pick;
+    std::vector<size_t> pick; pick.reserve(1024);
     auto mark=[&](int x,int y,int z){ if (eligible(x,y,z)) pick.push_back(m.idx(x,y,z)); };
-    if (wd < 45 || wd >= 315) for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=nx-nSponge;x<nx;++x)  mark(x,y,z); // +x
-    else if (wd < 135)        for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=ny-nSponge;y<ny;++y)  mark(x,y,z); // +y
-    else if (wd < 225)        for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nSponge;++x)      mark(x,y,z); // -x
-    else                      for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=0;y<nSponge;++y)      mark(x,y,z); // -y
+    // a band along every outflow face: the face the wind points out of (openlb_geometry.h's
+    // rule: w . n_out > 0). One face for an axis wind, two for an oblique one.
+    const double wr = wd*M_PI/180.0, wx = std::cos(wr), wy = std::sin(wr), eps = 1e-6;
+    if (wx >  eps) for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=nx-nSponge;x<nx;++x)  mark(x,y,z); // +x
+    if (wy >  eps) for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=ny-nSponge;y<ny;++y)  mark(x,y,z); // +y
+    if (wx < -eps) for(int z=0;z<nz;++z)for(int y=0;y<ny;++y)for(int x=0;x<nSponge;++x)      mark(x,y,z); // -x
+    if (wy < -eps) for(int z=0;z<nz;++z)for(int x=0;x<nx;++x)for(int y=0;y<nSponge;++y)      mark(x,y,z); // -y
     for (size_t k : pick) m.data[k] = MAT_SPONGE;
 }
 
@@ -970,6 +976,10 @@ inline void prepare(ADLat& ad, SuperGeometry<T,3>& sg, T omegaAD, bool localD = 
 struct Ops {
     int nx=0, ny=0, nz=0; double dx=0;
     int xLo = 1, xHi = 0;                      // control volume in x (inclusive)
+    // y extent: the whole width while the y faces are slip (axis wind, zero flux there); with
+    // an oblique wind (inflow/outflow on y faces) [1, ny-3] like x, with fluxes on y planes too
+    bool yOpen = false; int yLo = 0, yHi = 0;
+    bool inCV(int X, int Y) const { return X>=xLo && X<=xHi && Y>=yLo && Y<=yHi; }
     std::vector<double> theta, dep;           // grid-indexed Θ = ∫C dt [lattice C · s], deposit
     std::vector<float>  w;                    // receptor weight (receptor_w.f32), empty if absent
     double wTheta = 0;                        // running <w, Θ>, for J(t) in the time series
@@ -981,16 +991,21 @@ struct Ops {
     };
     std::vector<Blk> blk;
     long nSrc=0, nDep=0;
-    int iPlusX=-1, iMinusX=-1;
+    int iPlusX=-1, iMinusX=-1, iPlusY=-1, iMinusY=-1;
 
     size_t gidx(int x,int y,int z) const { return (size_t)z*ny*nx+(size_t)y*nx+x; }
 
     void init(SuperGeometry<T,3>& sg, const bridge::GridField<int32_t>& mat,
               const std::vector<uint8_t>& src, const std::vector<float>& vd, T dtOverDx) {
         nx=mat.nx; ny=mat.ny; nz=mat.nz; dx=mat.dx; xHi = nx-3;
+        yOpen = false;
+        for (int z=0; z<nz && !yOpen; ++z) for (int x=0; x<nx && !yOpen; ++x)
+            for (int y : {0, ny-1}) { const int m = mat.data[mat.idx(x,y,z)]; if (m==MAT_INLET||m==MAT_OUTLET) yOpen = true; }
+        yLo = yOpen ? 1 : 0; yHi = yOpen ? ny-3 : ny-1;
         theta.assign((size_t)nx*ny*nz,0.0); dep.assign((size_t)nx*ny*nz,0.0);
         for (int i=0;i<AD_DESCRIPTOR::q;++i){ auto c=descriptors::c<AD_DESCRIPTOR>(i);
-            if (c[0]==1&&c[1]==0&&c[2]==0) iPlusX=i; if (c[0]==-1&&c[1]==0&&c[2]==0) iMinusX=i; }
+            if (c[0]==1&&c[1]==0&&c[2]==0) iPlusX=i; if (c[0]==-1&&c[1]==0&&c[2]==0) iMinusX=i;
+            if (c[0]==0&&c[1]==1&&c[2]==0) iPlusY=i; if (c[0]==0&&c[1]==-1&&c[2]==0) iMinusY=i; }
         static const int dn[6][3]={{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
         auto& load = sg.getLoadBalancer(); blk.assign(load.size(), Blk{});
         for (int iC=0;iC<load.size();++iC){
@@ -1002,7 +1017,7 @@ struct Ops {
                 if(X<0||X>=nx||Y<0||Y>=ny||Z<0||Z>=nz)continue;
                 const int m=mat.data[mat.idx(X,Y,Z)];
                 if (m!=MAT_VOID) { B.ax.push_back(x);B.ay.push_back(y);B.az.push_back(z);
-                    B.ag.push_back(gidx(X,Y,Z)); B.acv.push_back(X>=xLo&&X<=xHi); }
+                    B.ag.push_back(gidx(X,Y,Z)); B.acv.push_back(inCV(X,Y)); }
                 const bool fl = (m==MAT_FLUID||m==MAT_POROUS||m==MAT_SPONGE);
                 if (!fl) continue;
                 if (src[mat.idx(X,Y,Z)]) { B.sx.push_back(x);B.sy.push_back(y);B.sz.push_back(z); ++nSrc; }
@@ -1018,13 +1033,15 @@ struct Ops {
     // shifted storage: f = f~ + t_i, so C = Σf~ + 1
     template <class CELL> static T conc(CELL c){ T s=1; for(int i=0;i<AD_DESCRIPTOR::q;++i) s+=c[i]; return s; }
 
-    // exact lattice mass flux across the CV's two x-faces during the last stream
+    // exact lattice mass flux across the CV's x-faces (and y-faces when yOpen) during the
+    // last stream; outDown = through the downwind faces (+x, +y), outUp = the upwind ones
     void faceFlux(ADLat& ad, double& outDown, double& outUp) {
         double dn=0, up=0;
         for (size_t iC=0;iC<blk.size();++iC){ auto& b=ad.getBlock(iC); auto& B=blk[iC];
             for (int x=0;x<B.bnx;++x){ const int X=B.gx0+x;
                 if (X!=xHi && X!=xHi+1 && X!=0 && X!=1) continue;
                 for(int y=0;y<B.bny;++y)for(int z=0;z<B.bnz;++z){
+                    const int Y=B.gy0+y; if (Y<yLo || Y>yHi) continue;
                     auto c=b.get(x,y,z);
                     const T fp=c[iPlusX]+descriptors::t<T,AD_DESCRIPTOR>(iPlusX);
                     const T fm=c[iMinusX]+descriptors::t<T,AD_DESCRIPTOR>(iMinusX);
@@ -1032,6 +1049,18 @@ struct Ops {
                     if (X==xHi)   dn -= fm;
                     if (X==0)     up += fm;                           // -x across 0|1
                     if (X==1)     up -= fp;
+                } }
+            if (yOpen) for (int y=0;y<B.bny;++y){ const int Y=B.gy0+y;
+                if (Y!=yHi && Y!=yHi+1 && Y!=0 && Y!=1) continue;
+                for(int x=0;x<B.bnx;++x)for(int z=0;z<B.bnz;++z){
+                    const int X=B.gx0+x; if (X<xLo || X>xHi) continue;
+                    auto c=b.get(x,y,z);
+                    const T fp=c[iPlusY]+descriptors::t<T,AD_DESCRIPTOR>(iPlusY);
+                    const T fm=c[iMinusY]+descriptors::t<T,AD_DESCRIPTOR>(iMinusY);
+                    if (Y==yHi+1) dn += fp;                           // +y across yHi|yHi+1
+                    if (Y==yHi)   dn -= fm;
+                    if (Y==0)     up += fm;                           // -y across 0|1
+                    if (Y==1)     up -= fp;
                 } } }
         outDown=dn; outUp=up;
     }
@@ -1043,8 +1072,8 @@ struct Ops {
         for (size_t iC=0;iC<blk.size();++iC){ auto& b=ad.getBlock(iC); auto& B=blk[iC];
             for (size_t k=0;k<B.sx.size();++k){ auto c=b.get(B.sx[k],B.sy[k],B.sz[k]);
                 for(int i=0;i<AD_DESCRIPTOR::q;++i) c[i]+=descriptors::t<T,AD_DESCRIPTOR>(i)*q;
-                const int X=B.gx0+B.sx[k];
-                if (X>=xLo && X<=xHi) e+=q; else eo+=q; } }
+                const int X=B.gx0+B.sx[k], Y=B.gy0+B.sy[k];
+                if (inCV(X,Y)) e+=q; else eo+=q; } }
         emitOutsideCV += eo; return e;
     }
     // remove the fraction `rate` of C (scaling the true populations keeps u-structure)
@@ -1058,9 +1087,9 @@ struct Ops {
             for (long k=0;k<n;++k){ auto c=b.get(B.dxv[k],B.dyv[k],B.dzv[k]);
                 const T C=conc(c), r=B.rate[k], removed=r*C;
                 for(int i=0;i<AD_DESCRIPTOR::q;++i){ const T ti=descriptors::t<T,AD_DESCRIPTOR>(i); c[i]=(1-r)*(c[i]+ti)-ti; }
-                const int X=B.gx0+B.dxv[k];
-                dep[gidx(X,B.gy0+B.dyv[k],B.gz0+B.dzv[k])] += removed;
-                if (X>=xLo && X<=xHi) dIn+=removed; else dOut+=removed; } }
+                const int X=B.gx0+B.dxv[k], Y=B.gy0+B.dyv[k];
+                dep[gidx(X,Y,B.gz0+B.dzv[k])] += removed;
+                if (inCV(X,Y)) dIn+=removed; else dOut+=removed; } }
         depOutsideCV += dOut; return dIn;
     }
     // Θ += C·dt on fluid cells; returns CV mass (all non-void cells) and domain-wide airborne.
@@ -1079,6 +1108,18 @@ struct Ops {
                     if (hasW) wc += (double)w[B.ag[k]]*C; } } }
         wTheta += wc*dt;
         airAll=all; return cv;
+    }
+    // tail extrapolation (tail_fit.h): Θ += C·invk on the cells accumulate() integrates;
+    // returns <w, C>·invk, the receptor-weighted part added
+    double addTail(ADLat& ad, SuperGeometry<T,3>& sg, double invk) {
+        double wc=0; const bool hasW = !w.empty();
+        for (size_t iC=0;iC<blk.size();++iC){ auto& b=ad.getBlock(iC); auto& B=blk[iC]; auto& bg=sg.getBlockGeometry(iC);
+            for (size_t k=0;k<B.ag.size();++k){
+                const int m=bg.get({B.ax[k],B.ay[k],B.az[k]});
+                if (m!=MAT_FLUID&&m!=MAT_POROUS&&m!=MAT_SPONGE) continue;
+                const double C=conc(b.get(B.ax[k],B.ay[k],B.az[k]));
+                theta[B.ag[k]]+=C*invk; if (hasW) wc += (double)w[B.ag[k]]*C; } }
+        return wc*invk;
     }
     // settling: subtract w_s from the coupled vertical velocity (after the coupling ran)
     void settle(ADLat& ad, T wsLB) {
@@ -1115,17 +1156,19 @@ struct DeviceAD {
         const int pad = block.getPadding();
         block.template getField<AD_SEL>(); block.template getField<AD_RATE>();
         block.template getField<AD_THETA>(); block.template getField<AD_DEP>(); block.template getField<AD_FLUX>();
+        block.template getField<AD_FLUXY>();
         auto& B = ops.blk[0];
         for (int x=-pad;x<B.bnx+pad;++x) for (int y=-pad;y<B.bny+pad;++y) for (int z=-pad;z<B.bnz+pad;++z) {
             auto c = block.get(x,y,z);
             c.template setField<AD_SEL>(T(0)); c.template setField<AD_RATE>(T(0));
             c.template setField<AD_THETA>(T(0)); c.template setField<AD_DEP>(T(0)); c.template setField<AD_FLUX>(T(0));
+            c.template setField<AD_FLUXY>(T(0));
         }
         std::vector<int> sel((size_t)B.bnx*B.bny*B.bnz, 0);
         auto I = [&](int x,int y,int z){ return ((size_t)x*B.bny+y)*B.bnz+z; };
         for (size_t k=0;k<B.sx.size();++k) {
             sel[I(B.sx[k],B.sy[k],B.sz[k])] |= 1;
-            const int X = B.gx0+B.sx[k]; if (X>=ops.xLo && X<=ops.xHi) ++nSrcCV; else ++nSrcOut;
+            const int X = B.gx0+B.sx[k], Y = B.gy0+B.sy[k]; if (ops.inCV(X,Y)) ++nSrcCV; else ++nSrcOut;
         }
         for (int x=0;x<B.bnx;++x) {                                  // Ops::faceFlux planes
             const int X = B.gx0+x; int code = FLUX_NONE;
@@ -1133,7 +1176,19 @@ struct DeviceAD {
             else if (X == ops.xHi)   code = FLUX_DN_MINUS;
             else if (X == 0)         code = FLUX_UP_PLUS;
             else if (X == 1)         code = FLUX_UP_MINUS;
-            if (code) for (int y=0;y<B.bny;++y) for (int z=0;z<B.bnz;++z) sel[I(x,y,z)] |= (code << 1);
+            if (code) for (int y=0;y<B.bny;++y) for (int z=0;z<B.bnz;++z) {
+                const int Y = B.gy0+y; if (Y<ops.yLo || Y>ops.yHi) continue;
+                sel[I(x,y,z)] |= (code << 1); }
+        }
+        if (ops.yOpen) for (int y=0;y<B.bny;++y) {                   // y planes (oblique wind)
+            const int Y = B.gy0+y; int code = FLUX_NONE;
+            if      (Y == ops.yHi+1) code = FLUX_DN_PLUS;
+            else if (Y == ops.yHi)   code = FLUX_DN_MINUS;
+            else if (Y == 0)         code = FLUX_UP_PLUS;
+            else if (Y == 1)         code = FLUX_UP_MINUS;
+            if (code) for (int x=0;x<B.bnx;++x) for (int z=0;z<B.bnz;++z) {
+                const int X = B.gx0+x; if (X<ops.xLo || X>ops.xHi) continue;
+                sel[I(x,y,z)] |= (code << 4); }
         }
         for (int x=0;x<B.bnx;++x) for (int y=0;y<B.bny;++y) for (int z=0;z<B.bnz;++z)
             if (sel[I(x,y,z)]) block.get(x,y,z).template setField<AD_SEL>((T)sel[I(x,y,z)]);
@@ -1143,6 +1198,7 @@ struct DeviceAD {
         ad.template setProcessingContext<Array<AD_THETA>>(ProcessingContext::Simulation);
         ad.template setProcessingContext<Array<AD_DEP>>(ProcessingContext::Simulation);
         ad.template setProcessingContext<Array<AD_FLUX>>(ProcessingContext::Simulation);
+        ad.template setProcessingContext<Array<AD_FLUXY>>(ProcessingContext::Simulation);
         // registration, per cell from the same lists
         for (int x=0;x<B.bnx;++x) for (int y=0;y<B.bny;++y) for (int z=0;z<B.bnz;++z)
             if (sel[I(x,y,z)] >> 1) block.addPostProcessor(typeid(urbanops::ustage::AdFlux), LatticeR<3>{x,y,z}, meta::id<AdFluxOp>{});
@@ -1186,11 +1242,13 @@ struct DeviceAD {
             const int m = bg.get({B.ax[k],B.ay[k],B.az[k]});
             if (m==MAT_FLUID||m==MAT_POROUS||m==MAT_SPONGE) { all += C;
                 if (hasW) wt += (double)ops.w[B.ag[k]] * c.template getField<urbanops::AD_THETA>(); }
-            const int X = B.gx0+B.ax[k];
+            const int X = B.gx0+B.ax[k], Y = B.gy0+B.ay[k];
             const T dp = c.template getField<urbanops::AD_DEP>();
-            if (dp != 0) { if (X>=ops.xLo && X<=ops.xHi) dc += dp; else dq += dp; }
+            if (dp != 0) { if (ops.inCV(X,Y)) dc += dp; else dq += dp; }
             const T fl = c.template getField<urbanops::AD_FLUX>();
             if (fl != 0) { if (X >= ops.xHi) fd += fl; else fu += fl; }
+            if (ops.yOpen) { const T fy = c.template getField<urbanops::AD_FLUXY>();
+                             if (fy != 0) { if (Y >= ops.yHi) fd += fy; else fu += fy; } }
         }
         airCV=cv; airAll=all; depCV=dc; depOut=dq; outDown=fd; outUp=fu; wTheta=wt;
     }
@@ -1224,7 +1282,18 @@ int main(int argc, char* argv[]) {
     bridge::GridField<int32_t> mat;
     if (!bridge::load_material_map(GEOM+"/material_map.dat", mat)) return 2;
     const int nx=mat.nx, ny=mat.ny, nz=mat.nz; const double dx=mat.dx;
-    const double WIND_DEG = envd("WIND_DEG", 0.0);
+    // Wind angle (deg, toward, from +x): the geometry fixes the inflow/outflow faces, so it is
+    // taken from GEOM/meta_geom.txt; WIND_DEG may only repeat it.
+    double geomWind = 0.0; bool geomHasWind = false;
+    { std::ifstream mf(GEOM + "/meta_geom.txt"); std::string k; double v;
+      for (std::string line; std::getline(mf, line); ) { std::istringstream ls(line);
+          if (ls >> k >> v && k == "wind_deg") { geomWind = v; geomHasWind = true; } } }
+    if (getenv("WIND_DEG") && geomHasWind && std::fabs(envd("WIND_DEG", 0.0) - geomWind) > 1e-6) {
+        std::cerr << "[urban_flow] WIND_DEG=" << envd("WIND_DEG", 0.0) << " but the geometry was built for "
+                  << geomWind << " deg (its inlet/outlet faces); rebuild the geometry or drop WIND_DEG" << std::endl;
+        return 2;
+    }
+    const double WIND_DEG = getenv("WIND_DEG") ? envd("WIND_DEG", 0.0) : geomWind;
     const int nSponge = envi("SPONGE_CELLS", 8);
     carve_sponge(mat, WIND_DEG, nSponge);
     clout << "material_map " << nx<<"x"<<ny<<"x"<<nz<<" dx="<<dx<<"  sponge="<<nSponge<<" cells" << std::endl;
@@ -1500,7 +1569,6 @@ int main(int argc, char* argv[]) {
     // STEP4_UNIFORM_U > 0 (m/s) is the Phase-6 gate mode: no NSE at all, the scalar rides a
     // frozen uniform +x wind, so transport and deposition are tested in isolation.
     OstreamManager cl4(std::cout,"step4");
-    if (WIND_DEG != 0.0) cl4 << "WARNING: the measured budget assumes +x wind; WIND_DEG=" << WIND_DEG << std::endl;
     std::vector<uint8_t> src((size_t)nx*ny*nz, 0);
     if (const char* sc = getenv("SRC_CELLS")) {          // "x,y,z;x,y,z" (linearity guard)
         std::string str(sc); size_t p=0;
@@ -1551,6 +1619,8 @@ int main(int argc, char* argv[]) {
     cl4 << "Omega source cells " << ops.nSrc << ", deposition cells " << ops.nDep
         << ", control volume x in [" << ops.xLo << "," << ops.xHi << "]" << std::endl;
     if (ops.nSrc == 0) { cl4 << "no source cells" << std::endl; return 2; }
+    if (WIND_DEG != 0.0) cl4 << "wind " << WIND_DEG << " deg: control volume x in [" << ops.xLo << "," << ops.xHi
+                             << "], y in [" << ops.yLo << "," << ops.yHi << "]" << (ops.yOpen ? " (flux through x and y faces)" : "") << std::endl;
 
     const T U_UNIFORM = envd("STEP4_UNIFORM_U", 0.0);
     const bool uniform = U_UNIFORM > 0;
@@ -1608,6 +1678,20 @@ int main(int argc, char* argv[]) {
     // the host path (as before Phase 8); every CLEAR_EVERY steps on a GPU, where each check
     // pulls the scalar lattice to the host (~3 % of run time at 100).
     const int CLEAR_EVERY = std::max(1, envi("CLEAR_EVERY", HOST_OPS ? 1 : 100));
+    // TAIL=1 (TAIL_SPEC.md): sample <w,Θ>(t) after the pulse; once the airborne mass is below
+    // TAIL_CLEAR x peak and the late decay is a clean exponential, stop and add the remaining
+    // dose C(x)/k to Θ. CLEAR_FRAC stays the fallback stop; the tail is added there as well
+    // whenever the fit passes.
+    const bool   TAIL       = envi("TAIL", 0) != 0;
+    const double TAIL_CLEAR = envd("TAIL_CLEAR", 0.05);
+    const int    TAIL_EVERY = CLEAR_EVERY * std::max(1, (envi("TAIL_EVERY", 20) + CLEAR_EVERY - 1) / CLEAR_EVERY);
+    tailfit::Tracker tail;
+    tail.from = envd("TAIL_FROM", tail.from);   tail.r2min = envd("TAIL_R2", tail.r2min);
+    tail.maxfrac = envd("TAIL_MAXFRAC", tail.maxfrac);
+    tailfit::Fit tailFit; bool tailStopped = false;
+    if (TAIL) cl4 << "TAIL: sample every " << TAIL_EVERY << " steps, window air <= " << tail.from
+                  << " peak, stop once air < " << TAIL_CLEAR << " peak and the fit passes (R2 >= " << tail.r2min
+                  << ", extrapolated <= " << tail.maxfrac << " of J); fallback stop CLEAR_FRAC " << CLEAR << std::endl;
     // emit is the CV's emission (what the budget closes against); emitOut is Ω beyond the CV.
     double emit=0, emitOut=0, depCV=0, depOut=0, outDown=0, outUp=0, airCV=0, airAll=0, peakAir=0; int endStep=MAXB;
     double wTheta=0;
@@ -1692,7 +1776,13 @@ int main(int argc, char* argv[]) {
         if (!std::isfinite(airCV)) { OstreamManager c(std::cout,"DIVERGED"); c<<"AD non-finite at burst step "<<iB<<std::endl; if(ts)fclose(ts); return 2; }
         // J(t) = <w,Θ(t)>/M_released: Stage C's J accumulated so far (lattice units)
         const double Jt = (emit+emitOut)>0 ? wTheta/(emit+emitOut) : 0.0;
-        const bool stop = CLEAR>0 && !pulseOn && peakAir>0 && airCV < CLEAR*peakAir;
+        bool tailStop = false;
+        if (TAIL && !pulseOn && iB % TAIL_EVERY == 0) {
+            tail.add(iB*dt, wTheta, airCV);
+            if (peakAir > 0 && airCV < TAIL_CLEAR*peakAir) { tailFit = tail.fit(peakAir); tailStop = tailFit.ok; }
+        }
+        const bool stop = (CLEAR>0 && !pulseOn && peakAir>0 && airCV < CLEAR*peakAir) || tailStop;
+        if (tailStop) tailStopped = true;
         if ((report || stop) && ts) { fprintf(ts,"%d,%.4f,%.9e,%.9e,%.9e,%.9e,%.9e,%.3e,%.9e,%.9e\n",iB,iB*dt,airCV,depCV,emit,outDown,outUp,resid,airAll,Jt); fflush(ts); }
         if (FRAMES && (report || stop)) writeFrame();
         if (FRAMES && !wroteMid && !pulseOn && peakAir > 0 && airCV < 0.5 * peakAir) writeMid3d();
@@ -1704,6 +1794,22 @@ int main(int argc, char* argv[]) {
     if (ts) fclose(ts);
     if (!uniform) dStats("at the end");
     if (!HOST_OPS) dad.fetch(adLattice, ops);
+    double tailW = 0;                                          // <w,Θ> added by the tail
+    if (TAIL) {
+        if (!tailStopped) tailFit = tail.fit(peakAir);         // stopped by CLEAR_FRAC or the cap
+        const bool apply = tailFit.k > 0 && tailFit.n >= tail.nmin && tailFit.r2 >= tail.r2min && tailFit.span >= tail.spanmin;
+        if (apply) {
+            adLattice.setProcessingContext(ProcessingContext::Evaluation);   // C(x, t_stop) on the host
+            tailW = ops.addTail(adLattice, superGeometry, 1.0 / tailFit.k);
+        }
+        const double Mrel = emit + emitOut;
+        cl4 << "TAIL " << (apply ? "applied" : "NOT applied") << (tailStopped ? " (early stop)" : " (stopped by CLEAR_FRAC/cap)")
+            << ": k=" << tailFit.k << "/s (e-folding " << (tailFit.k > 0 ? 1/tailFit.k : 0) << " s), R2=" << tailFit.r2
+            << ", n=" << tailFit.n << ", decay seen e^" << tailFit.span << ", airborne " << (peakAir > 0 ? airCV/peakAir : 0)
+            << " of peak; J " << wTheta/std::max(1e-300, Mrel) << " + tail " << tailW/std::max(1e-300, Mrel)
+            << " (fit predicted " << tailFit.tail/std::max(1e-300, Mrel) << ", " << 100*tailFit.frac << " %)" << std::endl;
+        if (!apply) tailFit.ok = false;
+    }
 
     // export Θ = ∫C dt and the deposition map for Stage C (J = ⟨w,Θ⟩/|Ω|)
     std::vector<float> th(ops.theta.begin(), ops.theta.end()), de(ops.dep.begin(), ops.dep.end());
@@ -1716,6 +1822,10 @@ int main(int argc, char* argv[]) {
         fprintf(mf,"grid %d %d %d\ndx_m %.4f\nomega_cells %ld\n",nx,ny,nz,dx,ops.nSrc);
         fprintf(mf,"burst_steps %d\ndt_s %.6g\nD_eff_m2s %.6g\ntau_AD %.6g\n",endStep,(double)dt,(double)D_EFF,(double)(1/omegaAD));
         fprintf(mf,"D_local %d\nSc_t %.4g\ntau_AD_min %.6g\n",(int)D_LOCAL,(double)SC_T,(double)TAU_AD_MIN);
+        if (TAIL) fprintf(mf,"tail_applied %d\ntail_early_stop %d\ntail_k_per_s %.6g\ntail_r2 %.6f\ntail_n %d\ntail_span %.4f\n"
+                             "tail_air_frac_at_stop %.6g\ntail_J_part %.6e\ntail_fit_frac %.6f\n",
+                          (int)(tailW > 0), (int)tailStopped, tailFit.k, tailFit.r2, tailFit.n, tailFit.span,
+                          peakAir > 0 ? airCV/peakAir : 0.0, (emit+emitOut) > 0 ? tailW/(emit+emitOut) : 0.0, tailFit.frac);
         fprintf(mf,"# control volume x in [%d,%d]; budget: emitted = deposited + airborne + drained\n",ops.xLo,ops.xHi);
         fprintf(mf,"mass_emitted %.9e\nmass_deposited %.9e\nmass_airborne %.9e\nmass_drained %.9e\n",emit,depCV,airCV,drained);
         fprintf(mf,"mass_emitted_beyond_cv %.9e\nmass_emitted_total %.9e\n",emitOut,emit+emitOut);

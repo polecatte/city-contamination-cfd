@@ -122,7 +122,12 @@ struct InletOp {
       fz += m[5][n]*c + m[8][n]*s;
     }
     fx *= g[0]; fy *= g[1]; fz *= g[2];
-    ux += a[6] * fx; uy += a[7] * fy; uz += a[8] * fz;
+    // sigma_u along the wind, sigma_v across it (abl_inlet.h ABLInlet::velocity; the axis
+    // case keeps the original expressions for bitwise reproducibility)
+    if (a[5] == V(0) && a[4] == V(1)) { ux += a[6] * fx; uy += a[7] * fy; }
+    else { const V fs = a[6] * fx, fn = a[7] * fy;
+           ux += fs * a[4] - fn * a[5]; uy += fs * a[5] + fn * a[4]; }
+    uz += a[8] * fz;
     V u[3] = { ramp * (ux / a[11]), ramp * (uy / a[11]), ramp * (uz / a[11]) };
     cell.defineU(u);
   }
@@ -277,7 +282,8 @@ struct AD_SEL   : public descriptors::FIELD_BASE<1> { };  // bit0: Omega source;
 struct AD_RATE  : public descriptors::FIELD_BASE<1> { };  // deposition fraction per step (S2)
 struct AD_THETA : public descriptors::FIELD_BASE<1> { };  // Theta = sum C dt  [lattice C * s]
 struct AD_DEP   : public descriptors::FIELD_BASE<1> { };  // deposited mass
-struct AD_FLUX  : public descriptors::FIELD_BASE<1> { };  // this cell's share of the CV face flux
+struct AD_FLUX  : public descriptors::FIELD_BASE<1> { };  // this cell's share of the CV x-face flux
+struct AD_FLUXY : public descriptors::FIELD_BASE<1> { };  // ... and of the y-face flux (oblique wind)
 
 struct P_Q     : public descriptors::FIELD_BASE<1> { };
 struct P_DT    : public descriptors::FIELD_BASE<1> { };
@@ -291,7 +297,8 @@ struct AdTheta   { };
 struct AdSettle  { };
 }
 
-// flux codes (Ops::faceFlux): which post-stream slot this cell contributes, with sign
+// flux codes (Ops::faceFlux): which post-stream slot this cell contributes, with sign. AD_SEL
+// holds the x-plane code in bits 1-3 and the y-plane code in bits 4-6 (same values, y slots).
 enum : int { FLUX_NONE = 0, FLUX_DN_PLUS = 1, FLUX_DN_MINUS = 2, FLUX_UP_PLUS = 3, FLUX_UP_MINUS = 4 };
 
 template <typename CELL>
@@ -307,14 +314,19 @@ struct AdFluxOp {
   void apply(CELL& cell) any_platform {
     using V = typename CELL::value_t;
     using DESCRIPTOR = typename CELL::descriptor_t;
-    const int code = maskOf<void>(cell.template getField<AD_SEL>()) >> 1;
-    const int ip = slotOf<DESCRIPTOR>(1,0,0), im = slotOf<DESCRIPTOR>(-1,0,0);
-    V add = 0;
-    if      (code == FLUX_DN_PLUS)  add =  (cell[ip] + descriptors::t<V,DESCRIPTOR>(ip));
-    else if (code == FLUX_DN_MINUS) add = -(cell[im] + descriptors::t<V,DESCRIPTOR>(im));
-    else if (code == FLUX_UP_PLUS)  add =  (cell[im] + descriptors::t<V,DESCRIPTOR>(im));
-    else if (code == FLUX_UP_MINUS) add = -(cell[ip] + descriptors::t<V,DESCRIPTOR>(ip));
-    cell.template setField<AD_FLUX>(cell.template getField<AD_FLUX>() + add);
+    const int mask = maskOf<void>(cell.template getField<AD_SEL>());
+    auto contrib = [&](int code, int ip, int im) -> V {
+      if      (code == FLUX_DN_PLUS)  return  (cell[ip] + descriptors::t<V,DESCRIPTOR>(ip));
+      else if (code == FLUX_DN_MINUS) return -(cell[im] + descriptors::t<V,DESCRIPTOR>(im));
+      else if (code == FLUX_UP_PLUS)  return  (cell[im] + descriptors::t<V,DESCRIPTOR>(im));
+      else if (code == FLUX_UP_MINUS) return -(cell[ip] + descriptors::t<V,DESCRIPTOR>(ip));
+      return V(0);
+    };
+    const int cx = (mask >> 1) & 7, cy = (mask >> 4) & 7;
+    if (cx) cell.template setField<AD_FLUX>(cell.template getField<AD_FLUX>()
+                                            + contrib(cx, slotOf<DESCRIPTOR>(1,0,0), slotOf<DESCRIPTOR>(-1,0,0)));
+    if (cy) cell.template setField<AD_FLUXY>(cell.template getField<AD_FLUXY>()
+                                             + contrib(cy, slotOf<DESCRIPTOR>(0,1,0), slotOf<DESCRIPTOR>(0,-1,0)));
   }
 };
 
