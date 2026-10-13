@@ -144,11 +144,17 @@ case "$MODE" in
       ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null \
              | head -1 | tr -d ' .' || true)
     fi
-    if [ -n "$ARCH" ]; then
+    # nvidia-smi prints its errors on stdout ("Failed to initialize NVML: Driver/library version
+    # mismatch"), so only a 2-3 digit compute capability is accepted; anything else stops here
+    # instead of reaching nvcc as an architecture name.
+    if [[ "$ARCH" =~ ^[0-9]{2,3}$ ]]; then
       setvar "$CFG" CUDA_ARCH "$ARCH"
-      echo "CUDA_ARCH := $ARCH (from nvidia-smi compute_cap)"
+      echo "CUDA_ARCH := $ARCH (${CUDA_ARCH:+env override}${CUDA_ARCH:-from nvidia-smi compute_cap})"
     else
-      echo "WARNING: could not read compute_cap; leaving template's CUDA_ARCH as-is" >&2
+      echo "ERROR: no usable GPU compute capability (got: '${ARCH:-nothing}')." >&2
+      echo "       If nvidia-smi fails, fix the driver first (see lab_openlb.sh); to compile anyway," >&2
+      echo "       set CUDA_ARCH explicitly, e.g. CUDA_ARCH=86 (RTX A4000) or CUDA_ARCH=90 (H100)." >&2
+      exit 1
     fi
 
     # urban_flow computes in double (typedef double T) and the CPU reference is double, so

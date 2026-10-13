@@ -120,8 +120,22 @@ gate() {
 # std::source_location (src/core/fields.h). Order: $NVCC, nvcc on PATH if new enough, a
 # conda-forge CUDA 12.6 in $WORK_CPU/cuda126 (installed here with micromamba if missing).
 cuda_toolchain() {
-  command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,memory.used --format=csv,noheader \
-    | sed 's/^/     GPU: /' || say "WARNING: nvidia-smi not found — the GPU build will compile but cannot run here"
+  local smi
+  if ! command -v nvidia-smi >/dev/null; then
+    say "WARNING: nvidia-smi not found — the GPU build will compile (with CUDA_ARCH set) but cannot run here"
+  elif ! smi=$(nvidia-smi --query-gpu=name,compute_cap,driver_version,memory.total,memory.used --format=csv,noheader 2>&1) \
+       || [[ "$smi" == *Failed* || "$smi" == *mismatch* ]]; then
+    say "nvidia-smi fails: $(printf '%s' "$smi" | head -2 | tr '\n' ' ')"
+    if [[ "$smi" == *mismatch* ]]; then
+      say "  'Driver/library version mismatch' = the NVIDIA driver was updated but the old kernel module is"
+      say "  still loaded. Reboot the machine (or unload/reload the nvidia kernel modules). No CUDA program,"
+      say "  this one included, can run until then."
+    fi
+    [ -n "${CUDA_ARCH:-}" ] || { say "stopping (set CUDA_ARCH=86 / 90 to compile anyway)"; exit 1; }
+    say "CUDA_ARCH=$CUDA_ARCH given: compiling anyway"
+  else
+    printf '%s\n' "$smi" | sed 's/^/     GPU: /'
+  fi
   local v
   if [ -n "${NVCC:-}" ]; then NVCC_USED="$NVCC"
   elif command -v nvcc >/dev/null && v=$(nvcc --version | sed -n 's/.*release \([0-9]*\)\.\([0-9]*\).*/\1 \2/p') \
