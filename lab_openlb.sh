@@ -339,17 +339,17 @@ do_send() {
       echo "done: $(ls -1 "$d/done" 2>/dev/null | tr '\n' ' ')"
       [ -f "$d/summary.txt" ] && sed 's/^/summary: /' "$d/summary.txt"
       for f in "$d"/logs/build_*.log; do
-        [ -f "$f" ] && grep -q -E 'error|Error|fatal|undefined reference' "$f" && \
-          { echo "-- $(basename "$f") (errors)"; grep -m 8 -E 'error|Error|fatal|undefined reference' "$f"; }
+        [ -f "$f" ] && grep -q -E 'error:|fatal|Error [0-9]+|undefined reference' "$f" && \
+          { echo "-- $(basename "$f") (errors)"; grep -m 8 -E 'error:|fatal|Error [0-9]+|undefined reference' "$f"; }
       done
       for f in "$d"/logs/*.log; do
         [ -f "$f" ] || continue
         case "$(basename "$f")" in build_*|olb_core_*|olb_external*|olb_config*|cuda_install*) continue ;; esac
-        lines=$(grep -E '^\[(6a|6b|7a|7b|7c|8|J|wake|parity|rank|tail|orient|synth|wind|opt|verify)\]|GATE|PASS|FAIL|Xr/H|drift|closure|DIVERG|nan|rror' "$f" | tail -8)
+        lines=$(grep -E '^\[(6a|6b|7a|7b|7c|8|J|wake|parity|rank|tail|orient|synth|wind|opt|verify)\]|GATE|PASS|FAIL|Xr/H|drift|closure|DIVERG|error:|fatal' "$f" | tail -8)
         [ -n "$lines" ] && { echo "-- $(basename "$f" .log)"; echo "$lines"; }
       done
       # a step that failed: its log's last lines (the step's own FAIL report)
-      grep -l -E 'FAIL|DIVERG|rror' "$d"/logs/*.log 2>/dev/null | while read -r f; do
+      grep -l -E 'FAIL|DIVERG|error:|fatal|Error [0-9]+' "$d"/logs/*.log 2>/dev/null | while read -r f; do
         case "$(basename "$f")" in build_*) continue ;; esac
         echo "-- tail of $(basename "$f")"; tail -n 12 "$f"; done
       grep -h -E 'MLUPs :' "$d"/out_*.log "$d"/city_*.log "$d"/rank_*.log 2>/dev/null | sed 's/^/throughput /' | head -12
@@ -358,6 +358,7 @@ do_send() {
     for f in "$WORK_CPU"/opt_*/report.json "$WORK_CPU"/*/opt_*/report.json "$WORK_CPU"/opt_*/verified.json "$WORK_CPU"/*/opt_*/verified.json; do
       [ -f "$f" ] && { echo; echo "======== $f"; head -c 4000 "$f"; echo; }
     done
+    echo; echo "== end; GPU status now: $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>&1 | head -1)"
   } > "$out" 2>&1
   exit 0 )
   ( cd "$WORK_CPU" && shopt -s nullglob && \
@@ -400,9 +401,15 @@ do_setup() {
   fi
   if [ "${GPU:-0}" = 1 ]; then
     cuda_toolchain
+    # Always re-run (cheap, idempotent: config.mk is rebuilt from the template). A marker left
+    # by an older or failed attempt must not keep a stale config.mk, e.g. one carrying
+    # nvidia-smi's error text as CUDA_ARCH; and the GPU tree is shared by MODEL=wale and hrr.
+    rm -f "$WORK/done/olb_config"
     step olb_config env OLB_ROOT="$OLB_ROOT" NVCC="$NVCC_USED" CUDA_LIBDIR="${CUDA_LIBDIR:-}" \
          CUDA_HOST_CXX="${CUDA_HOST_CXX:-}" CUDA_ARCH="${CUDA_ARCH:-}" "$REPO/olbconfig.sh" gpu
     grep -E '^(CXX|CUDA_ARCH|FLOATING_POINT_TYPE) ' "$OLB_ROOT/config.mk" | sed 's/^/     /'
+    grep -qE '^CUDA_ARCH[[:space:]]*:?=[[:space:]]*[0-9]{2,3}[[:space:]]*$' "$OLB_ROOT/config.mk" \
+      || { say "config.mk has no numeric CUDA_ARCH (see above): fix the driver or set CUDA_ARCH=86/90"; exit 1; }
   else
     step olb_config env OLB_ROOT="$OLB_ROOT" "$REPO/olbconfig.sh" cpu-mt
   fi
@@ -412,6 +419,9 @@ do_setup() {
   # ("undefined reference to omp_..."). The marker is keyed on config.mk, so switching mode
   # rebuilds the core once; the app objects are always rebuilt (cheap next to any run).
   local cfg; cfg="$(md5sum "$OLB_ROOT/config.mk" | cut -c1-12)"
+  # The marker means "core built for this config.mk"; trust it only while the library is still
+  # there: a failed rebuild for another config (it runs clean-core first) deletes it from the tree.
+  [ -f "$OLB_ROOT/build/lib/libolbcore.a" ] || rm -f "$WORK/done/olb_core_$cfg"
   step "olb_core_$cfg" sh -c "make -C '$OLB_ROOT' clean-core && make -C '$OLB_ROOT' -j$THREADS core"
   mkdir -p "$APP"
   for f in urban_flow.cpp geometry_loader.h abl_inlet_olb.h abl_inlet.h urban_ops.h urban_les.h tail_fit.h; do ln -sf "$REPO/$f" "$APP/$f"; done
