@@ -267,7 +267,10 @@ do_rank() {
     n="${v%%|*}"; e="${v#*|}"
     step "rank_geom_${cfg}_$n" sh -c "env $genv $e OUT_DIR=rank_geom_${cfg}_$n $gen"
     for s in ${RANK_SEEDS:-1000 2000}; do
+      need_space "$WORK" 1 "a ranking run"
       step "rank_${cfg}_${n}_s$s" sh -c "env $runv STEP4=1 ABL_SEED=$s GEOM_DIR=rank_geom_${cfg}_$n OUT_DIR=rank_${cfg}_${n}_s$s CHECK_EVERY=2000 TS_EVERY=200 '$BIN' > rank_${cfg}_${n}_s$s.log 2>&1"
+      # the report needs Theta + meta only; the flow snapshots are ~0.1-0.4 GB per run
+      rm -f "$WORK/rank_${cfg}_${n}_s$s/umean_full.f32" "$WORK/rank_${cfg}_${n}_s$s/uavg.f32"
       local line="$cfg $n $s $WORK/rank_geom_${cfg}_$n $WORK/rank_${cfg}_${n}_s$s"
       grep -qxF "$line" "$WORK/rank_manifest.txt" 2>/dev/null || echo "$line" >> "$WORK/rank_manifest.txt"
     done
@@ -439,8 +442,9 @@ need_space() {
 
 do_setup() {
   command -v g++ >/dev/null || { echo "need g++ (C++20)"; exit 1; }
-  need_space "$TMPDIR" 4 "compiling (temporaries in $TMPDIR)"
-  need_space "$WORK" 5 "the builds and run outputs"
+  # measured: an nvcc build of urban_flow peaks at ~0.3 GB of temporaries (+0.07 GB output)
+  need_space "$TMPDIR" 1 "compiling (temporaries in $TMPDIR)"
+  need_space "$WORK" 2 "the builds and the gate outputs"
   rm -rf "${TMPDIR:?}"/tmpxft_* "${TMPDIR:?}"/cc* 2>/dev/null || true    # leftovers of interrupted builds
   if [ ! -d "$OLB_ROOT/src" ]; then
     say "fetching OpenLB 1.8.1"
@@ -512,6 +516,7 @@ do_setup() {
 
 do_gates() {
   [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  need_space "$WORK" 1 "the gate runs (~0.6 GB of fields)"
   local P="$REPO/tests"
   # Gate 5 on the production map: OpenLB's own voxel counts vs the Stage-A histogram
   gate gate5 sh -c "GEOM_DIR=geom_prod OUT_DIR=out_gate5 MAX_STEPS=1 '$BIN' > out_gate5.log 2>&1;
