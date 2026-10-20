@@ -10,7 +10,8 @@
 #
 #   GPU=1 ./lab_openlb.sh setup|gates|city|all|status   # the same, on the GPU build
 #   GPU=1 ./lab_openlb.sh parity    # GPU vs CPU build on short cases (tests/device_parity.sh)
-#   ./lab_openlb.sh compare         # CPU and GPU gate numbers side by side
+#   ./lab_openlb.sh compare         # CPU / GPU / HRR gate numbers side by side
+#   ./lab_openlb.sh send            # everything to send back: one small text file + a logs tarball
 #   [GPU=1] ./lab_openlb.sh frames     # production city (seed 1000) again with snapshots -> GIFs + stills
 #   [GPU=1] ./lab_openlb.sh showcase   # small city end to end: flow, burst, J, figures, scorecard
 #   [GPU=1] ./lab_openlb.sh cube_sens  # 6b sensitivity at dx=4: floor model, inflow turbulence, C_w
@@ -319,16 +320,69 @@ do_opt_verify() {
       --top "${OPT_TOP:-3}" --run-env "$OPT_RUNENV" ) 2>&1 | tee -a "$OPT_DIR.log"
 }
 
+# send: everything worth sending back, in one small text file to paste into the chat (and a
+# small tarball of the logs, no fields, to upload if the text is not enough). Covers the CPU, GPU,
+# HRR and GPU-HRR work dirs, whatever has run: setup/build errors, gate and parity verdicts,
+# throughput, ranking and optimiser reports, and the last lines of every failed step.
+do_send() {
+  local ts out tarf d lab f; ts="$(date +%Y%m%d-%H%M%S)"
+  out="$WORK_CPU/send_$ts.txt"; tarf="$WORK_CPU/send_$ts.tar.gz"
+  # collecting must not stop at a missing piece: no -e / pipefail inside (grep finding nothing is fine)
+  ( set +e +o pipefail
+  {
+    echo "== lab results $ts on $(hostname); repo commit $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
+    command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 | head -2 | sed 's/^/GPU: /'
+    for d in "$WORK_CPU" "$WORK_CPU/gpu" "$WORK_CPU/hrr" "$WORK_CPU/gpu/hrr"; do
+      [ -d "$d/logs" ] || continue
+      lab="${d#$WORK_CPU}"; lab="${lab#/}"; lab="${lab:-cpu}"
+      echo; echo "======== $lab ($d)"
+      echo "done: $(ls -1 "$d/done" 2>/dev/null | tr '\n' ' ')"
+      [ -f "$d/summary.txt" ] && sed 's/^/summary: /' "$d/summary.txt"
+      for f in "$d"/logs/build_*.log; do
+        [ -f "$f" ] && grep -q -E 'error|Error|fatal|undefined reference' "$f" && \
+          { echo "-- $(basename "$f") (errors)"; grep -m 8 -E 'error|Error|fatal|undefined reference' "$f"; }
+      done
+      for f in "$d"/logs/*.log; do
+        [ -f "$f" ] || continue
+        case "$(basename "$f")" in build_*|olb_core_*|olb_external*|olb_config*|cuda_install*) continue ;; esac
+        lines=$(grep -E '^\[(6a|6b|7a|7b|7c|8|J|wake|parity|rank|tail|orient|synth|wind|opt|verify)\]|GATE|PASS|FAIL|Xr/H|drift|closure|DIVERG|nan|rror' "$f" | tail -8)
+        [ -n "$lines" ] && { echo "-- $(basename "$f" .log)"; echo "$lines"; }
+      done
+      # a step that failed: its log's last lines (the step's own FAIL report)
+      grep -l -E 'FAIL|DIVERG|rror' "$d"/logs/*.log 2>/dev/null | while read -r f; do
+        case "$(basename "$f")" in build_*) continue ;; esac
+        echo "-- tail of $(basename "$f")"; tail -n 12 "$f"; done
+      grep -h -E 'MLUPs :' "$d"/out_*.log "$d"/city_*.log "$d"/rank_*.log 2>/dev/null | sed 's/^/throughput /' | head -12
+    done
+    [ -f "$WORK_CPU/rank_report.txt" ] && { echo; echo "======== rank_report.txt"; cat "$WORK_CPU/rank_report.txt"; }
+    for f in "$WORK_CPU"/opt_*/report.json "$WORK_CPU"/*/opt_*/report.json "$WORK_CPU"/opt_*/verified.json "$WORK_CPU"/*/opt_*/verified.json; do
+      [ -f "$f" ] && { echo; echo "======== $f"; head -c 4000 "$f"; echo; }
+    done
+  } > "$out" 2>&1
+  exit 0 )
+  ( cd "$WORK_CPU" && shopt -s nullglob && \
+    files=( "$(basename "$out")" logs gpu/logs hrr/logs gpu/hrr/logs */summary.txt summary.txt rank_report.txt \
+            */rank_manifest.txt rank_manifest.txt */*/rank_*/meta_flow.txt */rank_*/meta_flow.txt rank_*/meta_flow.txt \
+            */*/rank_*/exposure_timeseries.csv */rank_*/exposure_timeseries.csv rank_*/exposure_timeseries.csv \
+            opt_*/report.json opt_*/verified.json opt_*/history.jsonl */opt_*/report.json */opt_*/verified.json */opt_*/history.jsonl ) && \
+    present=() && for f in "${files[@]}"; do if [ -e "$f" ]; then present+=("$f"); fi; done && \
+    tar czf "$tarf" --exclude='*.f32' --exclude='*.gif' --exclude='*.bin' "${present[@]}" )
+  say "text to paste: $out ($(wc -c < "$out") bytes)"
+  say "logs to upload if asked: $tarf ($(du -h "$tarf" | cut -f1))"
+  say "show it with:  cat $out"
+}
+
 # the gates' deciding numbers, CPU next to GPU
 do_compare() {
-  for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b gate8 wake showcase; do
-    for side in cpu gpu; do
-      local L="$WORK_CPU/logs/$g.log"; [ $side = gpu ] && L="$WORK_CPU/gpu/logs/$g.log"
+  for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b gate8 wake showcase parity; do
+    for side in cpu gpu hrr gpu/hrr; do
+      local L="$WORK_CPU/$side/logs/$g.log"; [ $side = cpu ] && L="$WORK_CPU/logs/$g.log"
       [ -f "$L" ] || continue
       grep -E '^\[(6a|6b|7a|7c|7b|8|J|wake)\]|drift|Xr/H|closure|PASS|FAIL' "$L" | tail -6 | sed "s/^/$g $side: /"
     done
   done
-  grep -h -E 'MLUPs :' "$WORK_CPU"/out_*.log "$WORK_CPU"/gpu/out_*.log 2>/dev/null | head -20 || true
+  grep -H -E 'MLUPs :' "$WORK_CPU"/out_*.log "$WORK_CPU"/gpu/out_*.log "$WORK_CPU"/hrr/out_*.log "$WORK_CPU"/gpu/hrr/out_*.log 2>/dev/null \
+    | sed "s|$WORK_CPU/||" | head -24 || true
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -474,6 +528,7 @@ case "${1:-status}" in
   cube_sens) do_cube_sens ;;
   cube_dx1) do_cube_dx1 ;;
   compare) do_compare ;;
+  send)    do_send ;;
   rank)    do_rank ;;
   rank_report) do_rank_report ;;
   opt_setup) do_opt_setup ;;
