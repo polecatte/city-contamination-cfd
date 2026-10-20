@@ -54,6 +54,11 @@ OLB_URL_ZENODO="https://zenodo.org/records/15440776/files/release-1.8.1.tar.gz?d
 export OMP_NUM_THREADS="$THREADS"
 
 WORK_CPU="$WORK"
+# Compiler temporaries: nvcc and g++ write several GB of intermediates to $TMPDIR (default /tmp).
+# On a shared machine /tmp can be small or full ("No space left on device" mid-build), so
+# everything here uses a directory under the work dir, unless LAB_TMPDIR names another.
+export TMPDIR="${LAB_TMPDIR:-$WORK_CPU/tmp}"
+mkdir -p "$TMPDIR"
 CPU_BIN="$WORK_CPU/release-1.8.1/examples/urban/urban_flow/urban_flow"
 if [ "${GPU:-0}" = 1 ]; then
   WORK="$WORK_CPU/gpu"
@@ -332,6 +337,7 @@ do_send() {
   {
     echo "== lab results $ts on $(hostname); repo commit $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
     command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 | head -2 | sed 's/^/GPU: /'
+    df -Ph /tmp "$TMPDIR" "$WORK_CPU" 2>/dev/null | awk 'NR>1{print "disk: " $6 " " $4 " free of " $2}' | sort -u
     for d in "$WORK_CPU" "$WORK_CPU/gpu" "$WORK_CPU/hrr" "$WORK_CPU/gpu/hrr"; do
       [ -d "$d/logs" ] || continue
       lab="${d#$WORK_CPU}"; lab="${lab#/}"; lab="${lab:-cpu}"
@@ -387,8 +393,18 @@ do_compare() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# need_space DIR GB WHAT: stop early, with the reason, if DIR's filesystem has less than GB free
+need_space() {
+  local free; free=$(df -Pk "$1" 2>/dev/null | awk 'NR==2{print int($4/1048576)}')
+  [ "${free:-0}" -ge "$2" ] || { say "only ${free:-?} GB free on the filesystem of $1; $3 needs >= $2 GB."
+                                 say "free some space there (or point LAB_TMPDIR at a disk with room) and rerun"; exit 1; }
+}
+
 do_setup() {
   command -v g++ >/dev/null || { echo "need g++ (C++20)"; exit 1; }
+  need_space "$TMPDIR" 4 "compiling (temporaries in $TMPDIR)"
+  need_space "$WORK" 5 "the builds and run outputs"
+  rm -rf "${TMPDIR:?}"/tmpxft_* "${TMPDIR:?}"/cc* 2>/dev/null || true    # leftovers of interrupted builds
   if [ ! -d "$OLB_ROOT/src" ]; then
     say "fetching OpenLB 1.8.1"
     if [ -f "$WORK_CPU/olb.tar.gz" ] && [ "$WORK" != "$WORK_CPU" ]; then
@@ -419,6 +435,9 @@ do_setup() {
   # ("undefined reference to omp_..."). The marker is keyed on config.mk, so switching mode
   # rebuilds the core once; the app objects are always rebuilt (cheap next to any run).
   local cfg; cfg="$(md5sum "$OLB_ROOT/config.mk" | cut -c1-12)"
+  # logs of core builds for other (older) configs are history only; drop them so `send` does
+  # not report an old failure as current
+  for f in "$WORK"/logs/olb_core_*.log; do [ "$f" = "$WORK/logs/olb_core_$cfg.log" ] || rm -f "$f"; done
   # The marker means "core built for this config.mk"; trust it only while the library is still
   # there: a failed rebuild for another config (it runs clean-core first) deletes it from the tree.
   [ -f "$OLB_ROOT/build/lib/libolbcore.a" ] || rm -f "$WORK/done/olb_core_$cfg"
