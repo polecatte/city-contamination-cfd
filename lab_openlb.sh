@@ -12,6 +12,7 @@
 #   GPU=1 ./lab_openlb.sh parity    # GPU vs CPU build on short cases (tests/device_parity.sh)
 #   ./lab_openlb.sh compare         # CPU / GPU / HRR gate numbers side by side
 #   ./lab_openlb.sh send            # everything to send back: one small text file + a logs tarball
+#   [CONFIRM=1] ./lab_openlb.sh clean   # disk full? shows what fills it; removes only regenerable files
 #   [GPU=1] ./lab_openlb.sh frames     # production city (seed 1000) again with snapshots -> GIFs + stills
 #   [GPU=1] ./lab_openlb.sh showcase   # small city end to end: flow, burst, J, figures, scorecard
 #   [GPU=1] ./lab_openlb.sh cube_sens  # 6b sensitivity at dx=4: floor model, inflow turbulence, C_w
@@ -379,6 +380,42 @@ do_send() {
   say "show it with:  cat $out"
 }
 
+# clean: what fills the disk, and removal of what can be regenerated. Dry run unless CONFIRM=1.
+#   always offered : micromamba's download cache (CUDA is already installed), compiler temporaries,
+#                    pip's cache, and the flow snapshots of finished runs (umean_full.f32,
+#                    uavg.f32: their figures and gate numbers are already made; Theta is kept)
+#   only on request: CLEAN_PACKAGES=1 the olb_lab_*.tar.gz backups and older send_*.tar.gz,
+#                    CLEAN_FRAMES=1 the raw animation frames (the GIFs/PNGs in figs/ are kept)
+do_clean() {
+  ( set +e +o pipefail; shopt -s nullglob
+  say "disk: $(df -Ph "$WORK_CPU" | awk 'NR==2{print $4 " free of " $2 " on " $6}')"
+  say "largest items in $HOME:"
+  du -sh "$HOME"/* "$HOME"/.[!.]* 2>/dev/null | sort -h | tail -12 | sed 's/^/     /'
+  say "largest items in $WORK_CPU:"
+  du -sh "$WORK_CPU"/* "$WORK_CPU"/gpu/* "$WORK_CPU"/hrr/* "$WORK_CPU"/gpu/hrr/* 2>/dev/null | sort -h | tail -12 | sed 's/^/     /'
+  local list=( "$WORK_CPU"/mamba/pkgs "$TMPDIR"/* "$HOME"/.cache/pip )
+  while IFS= read -r f; do list+=("$f"); done < <(find "$WORK_CPU" -type f \( -name umean_full.f32 -o -name uavg.f32 \) \
+                                                  -not -path '*/release-1.8.1/*' 2>/dev/null)
+  if [ "${CLEAN_PACKAGES:-0}" = 1 ]; then
+    list+=( "$WORK_CPU"/olb_lab_*.tar.gz )
+    local sends=( "$WORK_CPU"/send_*.tar.gz ); [ ${#sends[@]} -gt 1 ] && list+=( "${sends[@]:0:${#sends[@]}-1}" )
+  fi
+  [ "${CLEAN_FRAMES:-0}" = 1 ] && list+=( "$WORK_CPU"/city_frames/frames "$WORK_CPU"/gpu/city_frames/frames )
+  local present=(); for f in "${list[@]}"; do [ -e "$f" ] && present+=("$f"); done
+  if [ ${#present[@]} -eq 0 ]; then say "nothing regenerable to remove"; exit 0; fi
+  say "regenerable: ${#present[@]} items, $(du -shc "${present[@]}" 2>/dev/null | tail -1 | cut -f1) in total"
+  du -sh "${present[@]}" 2>/dev/null | sort -h | tail -8 | sed 's/^/     /'
+  local pk=( "$WORK_CPU"/olb_lab_*.tar.gz )
+  [ "${CLEAN_PACKAGES:-0}" != 1 ] && [ ${#pk[@]} -gt 0 ] && \
+    say "not included: ${#pk[@]} backup package(s) olb_lab_*.tar.gz, $(du -shc "${pk[@]}" | tail -1 | cut -f1) (CLEAN_PACKAGES=1 adds them)"
+  if [ "${CONFIRM:-0}" = 1 ]; then
+    rm -rf "${present[@]}"; say "removed. disk: $(df -Ph "$WORK_CPU" | awk 'NR==2{print $4 " free"}')"
+  else
+    say "dry run: nothing removed. CONFIRM=1 $0 clean removes the items above"
+  fi
+  exit 0 )
+}
+
 # the gates' deciding numbers, CPU next to GPU
 do_compare() {
   for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b gate8 wake showcase parity; do
@@ -558,6 +595,7 @@ case "${1:-status}" in
   cube_dx1) do_cube_dx1 ;;
   compare) do_compare ;;
   send)    do_send ;;
+  clean)   do_clean ;;
   rank)    do_rank ;;
   rank_report) do_rank_report ;;
   opt_setup) do_opt_setup ;;
