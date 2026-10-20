@@ -284,6 +284,10 @@ int main(){
     const bool FLAT_W = envi("FLAT_W",0)!=0;
     const int zped = std::min(nz-1, std::max(1,(int)std::llround(z_ped/dx)));
     std::vector<float> w(N,0.f); std::vector<int> stamp(N,-1);
+    // RECEPTOR_PARTS=1: also write the weight of each pathway separately (receptor_w_indoor /
+    // _park / _street.f32), so J can be split by where people are (tests/pathways.py)
+    const bool PARTS = envi("RECEPTOR_PARTS", 0) != 0;
+    std::vector<float> wIn(PARTS ? N : 0, 0.f), wPk(PARTS ? N : 0, 0.f), wSt(PARTS ? N : 0, 0.f);
     double wEnv=0, wPark=0; long nEnvTot=0, nParkTot=0; int bxmin=nx,bxmax=-1,bymin=ny,bymax=-1;
     for(int bi=0;bi<(int)r.blocks.size();++bi){
         const Block& b=r.blocks[bi];
@@ -296,7 +300,7 @@ int main(){
                 if(g.type[id]==CELL_FLUID || (g.type[id]==CELL_SHELL && g.perm[id]>0.5f)) cells.push_back(id); }
             if(cells.empty()) continue;
             const double per=b.eff_inh/(double)cells.size();
-            for(size_t id:cells){ w[id]+=(float)per; wPark+=per; ++nParkTot; }
+            for(size_t id:cells){ w[id]+=(float)per; wPark+=per; ++nParkTot; if(PARTS) wPk[id]+=(float)per; }
             continue;
         }
         int hc=b.height_cells; if(hc<1) continue;
@@ -313,7 +317,7 @@ int main(){
         if(env.empty()) continue;
         const double fin = REC_LEGACY ? (double)F_IN : 1.0;   // legacy counted indoor time twice
         double per=fin*FINF*(FLAT_W?1.0:b.eff_inh)/(double)env.size();
-        for(size_t nid:env){ w[nid]+=(float)per; wEnv+=per; ++nEnvTot; }
+        for(size_t nid:env){ w[nid]+=(float)per; wEnv+=per; ++nEnvTot; if(PARTS) wIn[nid]+=(float)per; }
     }
     double wPed=0; long nPed=0;
     if(REC_LEGACY){
@@ -321,15 +325,19 @@ int main(){
         int px0=std::max(1,bxmin-mg),px1=std::min(nx-2,bxmax+mg),py0=std::max(1,bymin-mg),py1=std::min(ny-2,bymax+mg);
         int z=std::min(zped,nz-2);
         for(int y=py0;y<=py1;++y)for(int x=px0;x<=px1;++x){ size_t id=IDX(x,y,z);
-            if(g.type[id]==CELL_FLUID){ w[id]+=F_OUT; wPed+=F_OUT; ++nPed; } } }
+            if(g.type[id]==CELL_FLUID){ w[id]+=F_OUT; wPed+=F_OUT; ++nPed; if(PARTS) wSt[id]+=F_OUT; } } }
     } else {
         // street occupants (occupancy.h): P x (in-vehicle + sidewalk share of outdoors)
         const double streetPop = r.population * street_fraction(nhaps_average(), OUTDOOR_PARK_SHARE);
         StreetField sf = build_street_occupancy(p, r, g, streetPop);
         for(int y=0;y<ny;++y)for(int x=0;x<nx;++x){ const float v=sf.weight[(size_t)y*nx+x];
-            if(v>0.f){ w[IDX(x,y,sf.z)]+=v; wPed+=v; ++nPed; } }
+            if(v>0.f){ w[IDX(x,y,sf.z)]+=v; wPed+=v; ++nPed; if(PARTS) wSt[IDX(x,y,sf.z)]+=v; } }
     }
     const double wsum=wEnv+wPark+wPed;
+    if (PARTS) for (auto pr : {std::make_pair("indoor", &wIn), std::make_pair("park", &wPk), std::make_pair("street", &wSt)}) {
+        FILE* f=fopen((OUT+"/receptor_w_"+pr.first+".f32").c_str(),"wb");
+        if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f);
+               fwrite(pr.second->data(),sizeof(float),N,f); fclose(f);} }
     { FILE* f=fopen((OUT+"/receptor_w.f32").c_str(),"wb");
       if(f){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1}; fwrite(h,sizeof(int),5,f);
              fwrite(w.data(),sizeof(float),N,f); fclose(f);} }

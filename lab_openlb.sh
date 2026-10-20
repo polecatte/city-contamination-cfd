@@ -20,6 +20,10 @@
 #
 #   [MODEL=hrr] [GPU=1] ./lab_openlb.sh rank   # ranking study: 5 designs x 2 seeds (see do_rank)
 #   ./lab_openlb.sh rank_report                 # its table: noise, spread, ANOVA, Spearman old vs new
+#   RANK_CFG=quick [MODEL=..] GPU=1 ./lab_openlb.sh rank      # quick ranking: dx 8, guideline domain, tail stop, 1 seed
+#   RANK_CFG=quick [MODEL=..] GPU=1 ./lab_openlb.sh winddirs  # one design at WIND_PHIS (default 0 22.5 45 deg)
+#   ./lab_openlb.sh pathways                    # dose split indoor / park / street, from the finished city runs
+#   GATES="gate6a gate6b_dx4" ./lab_openlb.sh gates          # only the gates named
 #   ./lab_openlb.sh opt_setup                   # optimizer venv (CPU torch + BoTorch) + smoke test
 #   [MODEL=hrr] GPU=1 ./lab_openlb.sh optimize | opt_report | opt_verify   # the optimisation (OPTIMIZER.md)
 #   MODEL=hrr [GPU=1] ./lab_openlb.sh setup|gates|...  # the same with HRR collision + corrected
@@ -114,6 +118,8 @@ build() {
 # gate NAME CMD... : like step, but a non-zero exit is a recorded gate FAIL, not an abort
 gate() {
   local name="$1"; shift
+  # GATES="gate6a gate6b_dx4" runs only the gates named
+  if [ -n "${GATES:-}" ] && [[ " $GATES " != *" $name "* ]]; then return 0; fi
   if done_ "$name"; then say "skip $name (done)"; return 0; fi
   say "gate $name"
   local rc=0
@@ -251,8 +257,12 @@ RANK_DESIGNS=(
 )
 do_rank() {
   [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
-  local dx="${RANK_DX:-}" cfg genv runv gen n e s mem
-  if [ "$MODEL" = hrr ]; then
+  local dx="${RANK_DX:-}" cfg genv runv gen n e s mem seeds="${RANK_SEEDS:-1000 2000}"
+  if [ "${RANK_CFG:-}" = quick ]; then
+    # quick: the production setup at dx 8 (COST 732 domain, release over city + environs,
+    # per-cell D, tail stop), physics from MODEL, one seed unless RANK_SEEDS says otherwise
+    dx="${dx:-8}"; cfg="quick_${MODEL}_dx$dx"; genv=""; runv="D_LOCAL=1 TAIL=1"; seeds="${RANK_SEEDS:-1000}"
+  elif [ "$MODEL" = hrr ]; then
     if [ -z "$dx" ]; then
       mem=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 0)
       dx=8; [ "${GPU:-0}" = 1 ] && [ "${mem:-0}" -ge 40000 ] && dx=4
@@ -266,7 +276,7 @@ do_rank() {
   for v in "${RANK_DESIGNS[@]}"; do
     n="${v%%|*}"; e="${v#*|}"
     step "rank_geom_${cfg}_$n" sh -c "env $genv $e OUT_DIR=rank_geom_${cfg}_$n $gen"
-    for s in ${RANK_SEEDS:-1000 2000}; do
+    for s in $seeds; do
       need_space "$WORK" 1 "a ranking run"
       step "rank_${cfg}_${n}_s$s" sh -c "env $runv STEP4=1 ABL_SEED=$s GEOM_DIR=rank_geom_${cfg}_$n OUT_DIR=rank_${cfg}_${n}_s$s CHECK_EVERY=2000 TS_EVERY=200 '$BIN' > rank_${cfg}_${n}_s$s.log 2>&1"
       # the report needs Theta + meta only; the flow snapshots are ~0.1-0.4 GB per run
@@ -277,6 +287,51 @@ do_rank() {
   done
   do_rank_report
 }
+# Wind directions for one design (default base) at the quick-ranking settings: WIND_PHIS lists
+# directions in degrees (toward, counter-clockwise from the city's +x; tools/wind_rose.py maps each
+# to ORIENT + inflow angle). 0 reuses the quick ranking's run of the same design if it exists.
+do_winddirs() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  local dx="${RANK_DX:-8}" design="${WIND_DESIGN:-base}" s="${WIND_SEED:-1000}" e="" v k th n gen cfg rcfg line
+  case "$dx" in 4) gen=./gen_openlb_geom ;; 8) gen=./gen_openlb_geom8 ;; *) echo "RANK_DX must be 4 or 8"; exit 2 ;; esac
+  cfg="wind_${MODEL}_dx$dx"; rcfg="quick_${MODEL}_dx$dx"
+  for v in "${RANK_DESIGNS[@]}"; do [ "${v%%|*}" = "$design" ] && e="${v#*|}"; done
+  say "wind directions for design $design: ${WIND_PHIS:-0 22.5 45} deg ($MODEL, dx $dx)"
+  for phi in ${WIND_PHIS:-0 22.5 45}; do
+    read -r k th < <(python3 "$REPO/tools/wind_rose.py" --case "$phi")
+    n="phi$phi"
+    if [ "$k" = 0 ] && [ "$th" = 0 ] && [ -f "$WORK/rank_${rcfg}_${design}_s$s/theta.f32" ]; then
+      line="$cfg $n $s $WORK/rank_geom_${rcfg}_$design $WORK/rank_${rcfg}_${design}_s$s"
+      say "phi 0: reusing the quick ranking's run of $design"
+    else
+      step "wind_geom_${cfg}_$n" sh -c "env $e ORIENT=$k WIND_DEG=$th OUT_DIR=wind_geom_${cfg}_$n $gen"
+      need_space "$WORK" 1 "a wind-direction run"
+      step "wind_${cfg}_$n" sh -c "env D_LOCAL=1 TAIL=1 STEP4=1 ABL_SEED=$s GEOM_DIR=wind_geom_${cfg}_$n OUT_DIR=wind_${cfg}_${n} CHECK_EVERY=2000 TS_EVERY=200 '$BIN' > wind_${cfg}_${n}.log 2>&1"
+      rm -f "$WORK/wind_${cfg}_${n}/umean_full.f32" "$WORK/wind_${cfg}_${n}/uavg.f32"
+      line="$cfg $n $s $WORK/wind_geom_${cfg}_$n $WORK/wind_${cfg}_${n}"
+    fi
+    grep -qxF "$line" "$WORK/wind_manifest.txt" 2>/dev/null || echo "$line" >> "$WORK/wind_manifest.txt"
+  done
+  python3 "$REPO/tests/rank_report.py" "$WORK/wind_manifest.txt" | tee "$WORK_CPU/wind_report.txt"
+}
+
+# Who breathes the dose: re-score the finished production-city runs (geom_prod) by pathway with
+# the corrected receptor weights (tests/pathways.py). No CFD: the geometry is re-generated with
+# the legacy builder (byte-identical, checked) plus the per-pathway weights.
+do_pathways() {
+  local g="$WORK_CPU/geom_prod" rx="$WORK_CPU/geom_prod_rx" gen="$TMPDIR/gen_rx" runs=() d
+  [ -f "$g/material_map.dat" ] || { echo "no $g (run '$0 setup' first)"; exit 1; }
+  g++ -O2 -std=c++17 -I"$REPO" -DCELL_SIZE_M=4.0 "$REPO/gen_openlb_geom.cpp" -o "$gen" || exit 1
+  ( cd "$WORK_CPU" && BUILDER=legacy DOMAIN=compact RECEPTOR_PARTS=1 OUT_DIR="$rx" "$gen" > "$WORK_CPU/logs/pathways_geom.log" 2>&1 )
+  cmp -s "$rx/material_map.dat" "$g/material_map.dat" \
+    || { say "the re-generated geometry differs from $g: not re-scoring (see logs/pathways_geom.log)"; exit 1; }
+  rm -f "$rx"/material_map.dat "$rx"/dep_vel.f32 "$rx"/geom_type.u8 "$rx"/source_mask.u8 "$rx"/release_zone.u8
+  for d in city_s1000 city_s2000 gpu/city_s1000 gpu/city_s2000 gpu/city_frames; do
+    [ -f "$WORK_CPU/$d/theta.f32" ] && runs+=("$WORK_CPU/$d"); done
+  [ ${#runs[@]} -gt 0 ] || { echo "no finished city runs with theta.f32"; exit 1; }
+  python3 "$REPO/tests/pathways.py" "$rx" "${runs[@]}" --legacy "$g" | tee "$WORK_CPU/pathways.txt"
+}
+
 do_rank_report() {
   local m; m=$(find "$WORK_CPU" -maxdepth 3 -name rank_manifest.txt | sort)
   [ -n "$m" ] || { echo "no rank_manifest.txt under $WORK_CPU yet"; exit 1; }
@@ -364,7 +419,9 @@ do_send() {
         echo "-- tail of $(basename "$f")"; tail -n 12 "$f"; done
       grep -h -E 'MLUPs :' "$d"/out_*.log "$d"/city_*.log "$d"/rank_*.log 2>/dev/null | sed 's/^/throughput /' | head -12
     done
-    [ -f "$WORK_CPU/rank_report.txt" ] && { echo; echo "======== rank_report.txt"; cat "$WORK_CPU/rank_report.txt"; }
+    for f in rank_report.txt wind_report.txt pathways.txt; do
+      [ -f "$WORK_CPU/$f" ] && { echo; echo "======== $f"; cat "$WORK_CPU/$f"; }
+    done
     for f in "$WORK_CPU"/opt_*/report.json "$WORK_CPU"/*/opt_*/report.json "$WORK_CPU"/opt_*/verified.json "$WORK_CPU"/*/opt_*/verified.json; do
       [ -f "$f" ] && { echo; echo "======== $f"; head -c 4000 "$f"; echo; }
     done
@@ -603,6 +660,8 @@ case "${1:-status}" in
   clean)   do_clean ;;
   rank)    do_rank ;;
   rank_report) do_rank_report ;;
+  winddirs) do_winddirs ;;
+  pathways) do_pathways ;;
   opt_setup) do_opt_setup ;;
   optimize)  do_optimize ;;
   opt_report) do_opt_report ;;

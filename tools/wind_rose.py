@@ -11,7 +11,8 @@ The wind as seen by the city is the domain wind mapped back through that transfo
 phi has exactly one case with WIND_DEG in [0, 45) (or two at the 45 deg diagonals), so a
 16-direction rose needs inflow angles 0, 22.5 and 45 deg only.
 
-    python3 tools/wind_rose.py 16      # the cases for a uniform 16-direction rose
+    python3 tools/wind_rose.py 16          # the cases for a uniform 16-direction rose
+    python3 tools/wind_rose.py --case 67.5 # one direction: prints "ORIENT WIND_DEG"
 """
 import math, sys
 
@@ -80,6 +81,9 @@ def _selftest():
 
 if __name__ == "__main__":
     _selftest()
+    if len(sys.argv) > 2 and sys.argv[1] == "--case":     # one direction -> "ORIENT WIND_DEG"
+        k, th = case_for_direction(float(sys.argv[2]))
+        print(k, f"{th:g}"); sys.exit(0)
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 16
     print(f"# uniform {n}-direction rose: phi (toward, deg CCW from the city's +x) -> ORIENT, WIND_DEG")
     for phi, k, th, wt in uniform_rose(n):

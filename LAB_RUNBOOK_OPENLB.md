@@ -168,3 +168,27 @@ MODEL=hrr GPU=1 OPT_BUDGET=150 ~/cfd_gpu/lab_openlb.sh optimize   # resumable; r
 MODEL=hrr GPU=1 OPT_TOP=3 ~/cfd_gpu/lab_openlb.sh opt_verify      # top 3 at all 16 directions
 ```
 Send back `opt_*/report.json`, `opt_*/verified.json` and `opt_*.log`. Method: OPTIMIZER.md.
+
+### 9.2 Poster run (results by the next morning)
+
+```bash
+cd ~/cfd_gpu && git pull
+GPU=1 ~/cfd_gpu/lab_openlb.sh setup          # regular GPU app (~10 min)
+MODEL=hrr ~/cfd_gpu/lab_openlb.sh setup      # CPU HRR app with the latest code (~5 min)
+
+# GPU queue, ~13-15 h unattended: 5 designs (1 seed) -> 3 wind directions -> second seeds
+tmux new -s gpu 'RANK_CFG=quick GPU=1 ~/cfd_gpu/lab_openlb.sh rank; \
+  RANK_CFG=quick GPU=1 ~/cfd_gpu/lab_openlb.sh winddirs; \
+  RANK_CFG=quick RANK_SEEDS="1000 2000" GPU=1 ~/cfd_gpu/lab_openlb.sh rank; read -p done'
+
+# CPU queue (second terminal): pathway split (minutes), HRR cube at dx 4 (~1 h), dx 2 overnight
+tmux new -s cpu '~/cfd_gpu/lab_openlb.sh pathways; \
+  MODEL=hrr GATES="gate6a gate6b_dx4" ~/cfd_gpu/lab_openlb.sh gates; \
+  MODEL=hrr GATES="gate6b_dx2" ~/cfd_gpu/lab_openlb.sh gates; read -p done'
+
+# next morning
+~/cfd_gpu/lab_openlb.sh send
+```
+The ranking runs use the current BGK model (MODEL default) because HRR is not validated yet;
+the CPU queue's cube runs say whether HRR fixes the wake. Detach from tmux with Ctrl-b d,
+reattach with `tmux attach -t gpu`. Progress: `ls ~/olb_lab/gpu/done | grep -c rank_quick`.
