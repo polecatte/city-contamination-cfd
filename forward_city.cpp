@@ -165,7 +165,7 @@ int main(){
     { FILE* f=fopen((OUT+"/plan_height.f32").c_str(),"wb"); if(f){int h[5]={nx,ny,1,(int)std::lround(dx*1000.0),1};fwrite(h,sizeof(int),5,f);fwrite(planh.data(),sizeof(float),planh.size(),f);fclose(f);} }
 
     // meta (human + machine readable): everything needed to reload the binaries
-    auto write_meta=[&](double Jmean,double Jstd,int nEns,long nOmega,double dep,double air,double outfl,double emit,bool done){
+    auto write_meta=[&](double Jmean,double Jstd,double JinMean,double JoutMean,int nEns,long nOmega,double dep,double air,double outfl,double emit,bool done){
         FILE* f=fopen((OUT+"/meta.txt").c_str(),"w"); if(!f) return;
         fprintf(f,"# forward_city dataset — self-describing run metadata\n");
         fprintf(f,"grid_nx %d\ngrid_ny %d\ngrid_nz %d\ndx_m %.4f\n",nx,ny,nz,dx);
@@ -177,11 +177,12 @@ int main(){
         fprintf(f,"blocks %d\nmaxH_m %.1f\npopulation %.0f\ninhabitance %.0f\n",r.num_blocks,r.max_height,r.population,r.total_inhabitance);
         fprintf(f,"omega_source_cells %ld\n",nOmega);
         fprintf(f,"# binary layout: each .f32/.u8 starts with 5 int32 [nx,ny,nz,dx*1000,ncomp]\n");
-        fprintf(f,"# fields: geom_type.u8(0=fluid,1=ground,2=shell,3=indoor) receptor_w.f32 source_mask.u8\n");
+        fprintf(f,"# fields: geom_type.u8(0=fluid,1=ground,2=shell,3=indoor) receptor_w.f32(=w_in+w_out) source_mask.u8\n");
+        fprintf(f,"#         receptor_w_in.f32 receptor_w_out.f32 (EXPOSURE_METRIC.md eqs 2-3)\n");
         fprintf(f,"#         umean_full.f32(ncomp=4: ux,uy,uz,nut planar) theta_last.f32 theta_mean.f32\n");
         fprintf(f,"#         plan_code.u8(nz=1) plan_height.f32(nz=1) tiac_zped.bin vel_zped.bin\n");
         if(done){
-          fprintf(f,"status COMPLETE\nJ_mean %.6e\nJ_std %.6e\nN_ens %d\n",Jmean,Jstd,nEns);
+          fprintf(f,"status COMPLETE\nJ_mean %.6e\nJ_std %.6e\nJ_in_mean %.6e\nJ_out_mean %.6e\nN_ens %d\n",Jmean,Jstd,JinMean,JoutMean,nEns);
           fprintf(f,"mass_emitted %.6e\nmass_deposited %.6e\nmass_airborne %.6e\nmass_outflow %.6e\n",emit,dep,air,outfl);
         } else fprintf(f,"status GEOMETRY_ONLY\n");
         fclose(f);
@@ -199,47 +200,55 @@ int main(){
     wru("source_mask.u8", srcmask.data(), N);
     printf("[forward_city] source Ω = %ld ground cells (streets + parks), released simultaneously\n", nOmega);
 
-    // ── receptor w: F_inf infiltration, weighted by per-building eff_inh ──────────
+    // ── receptor weights (EXPOSURE_METRIC.md eqs 2–4), building-anchored ─────────
+    //   w_in (x) = Σ_b 1{x∈env(b)}    · N_b · f_in · F_inf / |env(b)|
+    //   w_out(x) = Σ_b 1{x∈street(b)} · N_b · f_out         / |street(b)|
+    // env(b) = outdoor fluid cells face-adjacent to building b; street(b) = the
+    // env(b) cells at pedestrian height z_ped. Both terms carry people (N_b), so
+    // Σw is resolution-independent and E_in : E_out follows the time budget.
     const double z_ped = envd("Z_PED", 2.0);
     float FINF=(float)envd("FINF",0.62), F_IN=(float)envd("F_IN",0.87), F_OUT=(float)envd("F_OUT",0.075);
     if(FINF>1.f) FINF=1.f;
     const bool FLAT_W = envi("FLAT_W",0)!=0;
     const int zped = std::min(nz-1, std::max(1,(int)std::llround(z_ped/dx)));  // clamp: valid slice index
-    std::vector<float> w(N,0.f); std::vector<int> stamp(N,-1);
-    double wEnv=0; long nEnvTot=0; int bxmin=nx,bxmax=-1,bymin=ny,bymax=-1;
+    std::vector<float> w_in(N,0.f), w_out(N,0.f); std::vector<int> stamp(N,-1);
+    double wEnv=0, wPed=0; long nEnvTot=0, nPed=0; int nNoStreet=0;
     for(int bi=0;bi<(int)r.blocks.size();++bi){
         const Block& b=r.blocks[bi];
         if(b.usage==PARK) continue; int hc=b.height_cells; if(hc<1) continue;
         int x0=std::max(0,b.x0),x1=std::min(nx,b.x1),y0=std::max(0,b.y0),y1=std::min(ny,b.y1);
         if(x1<=x0||y1<=y0) continue; int hz=std::min(hc,nz-1);
-        bxmin=std::min(bxmin,x0);bxmax=std::max(bxmax,x1-1);bymin=std::min(bymin,y0);bymax=std::max(bymax,y1-1);
         if(b.eff_inh<=0.0) continue;
-        std::vector<size_t> env; const int dxn[6]={1,-1,0,0,0,0},dyn[6]={0,0,1,-1,0,0},dzn[6]={0,0,0,0,1,-1};
+        std::vector<size_t> env, street; const int dxn[6]={1,-1,0,0,0,0},dyn[6]={0,0,1,-1,0,0},dzn[6]={0,0,0,0,1,-1};
         for(int z=1;z<=hz;++z)for(int y=y0;y<y1;++y)for(int x=x0;x<x1;++x){
             size_t sid=IDX(x,y,z); if(g.type[sid]!=CELL_SHELL) continue;
             for(int d=0;d<6;++d){ int xx=x+dxn[d],yy=y+dyn[d],zz=z+dzn[d];
                 if(xx<0||xx>=nx||yy<0||yy>=ny||zz<1||zz>=nz) continue;
                 size_t nid=IDX(xx,yy,zz); if(g.type[nid]!=CELL_FLUID) continue;
-                if(stamp[nid]==bi) continue; stamp[nid]=bi; env.push_back(nid); } }
+                if(stamp[nid]==bi) continue; stamp[nid]=bi; env.push_back(nid);
+                if(zz==zped) street.push_back(nid); } }
         if(env.empty()) continue;
-        double per=(double)F_IN*FINF*(FLAT_W?1.0:b.eff_inh)/(double)env.size();
-        for(size_t nid:env){ w[nid]+=(float)per; wEnv+=per; ++nEnvTot; }
+        const double Nb = FLAT_W?1.0:b.eff_inh;
+        double per_in=(double)F_IN*FINF*Nb/(double)env.size();
+        for(size_t nid:env){ w_in[nid]+=(float)per_in; wEnv+=per_in; ++nEnvTot; }
+        if(street.empty()){ ++nNoStreet; continue; }
+        double per_out=(double)F_OUT*Nb/(double)street.size();
+        for(size_t nid:street){ w_out[nid]+=(float)per_out; wPed+=per_out; ++nPed; }
     }
-    double wPed=0; long nPed=0;
-    if(bxmax>=bxmin){ int mg=std::max(2,(int)std::llround(10.0/dx));
-        int px0=std::max(1,bxmin-mg),px1=std::min(nx-2,bxmax+mg),py0=std::max(1,bymin-mg),py1=std::min(ny-2,bymax+mg);
-        int z=std::min(zped,nz-2);
-        for(int y=py0;y<=py1;++y)for(int x=px0;x<=px1;++x){ size_t id=IDX(x,y,z);
-            if(g.type[id]==CELL_FLUID){ w[id]+=F_OUT; wPed+=F_OUT; ++nPed; } } }
+    std::vector<float> w(N);
+    for(size_t i=0;i<N;++i) w[i]=w_in[i]+w_out[i];
     double wsum=wEnv+wPed;
-    printf("[forward_city] receptor w (%s F_inf=%.2f f_in=%.2f f_out=%.3f): indoor %ld cells (w=%.4g) + outdoor %ld cells (w=%.4g)\n",
+    printf("[forward_city] receptor w (%s F_inf=%.2f f_in=%.2f f_out=%.3f): indoor %ld cells (w=%.4g) + outdoor %ld street cells (w=%.4g)\n",
            FLAT_W?"UNIFORM":"eff_inh-weighted",FINF,F_IN,F_OUT,nEnvTot,wEnv,nPed,wPed);
+    if(nNoStreet>0) printf("[forward_city]   WARN: %d building(s) have no street cells at z_ped=%.1f m — their outdoor term is dropped\n",nNoStreet,z_ped);
     if(wsum<=0){ status("FAIL_EMPTY_RECEPTOR"); fprintf(stderr,"[forward_city] FATAL: empty receptor field\n"); return 2; }
     wrf("receptor_w.f32", w.data(), N, 1);
+    wrf("receptor_w_in.f32", w_in.data(), N, 1);
+    wrf("receptor_w_out.f32", w_out.data(), N, 1);
 
     // Geometry-only mode: everything the domain image needs is stored; stop here.
     if(envi("DUMP_GEOM_ONLY",0)){
-        write_meta(0,0,0,nOmega,0,0,0,0,false);
+        write_meta(0,0,0,0,0,nOmega,0,0,0,0,false);
         status("GEOMETRY_ONLY");
         printf("[forward_city] DUMP_GEOM_ONLY: geometry + plan rasters stored in %s — exiting before LBM.\n",OUT.c_str());
         return 0;
@@ -312,7 +321,7 @@ int main(){
     std::function<void(int,int,int,bool,bool)> snap_fn;
 
     std::vector<uint8_t> tp=g.type;
-    std::vector<double> J(N_ENS,0.0);
+    std::vector<double> J(N_ENS,0.0), Jin(N_ENS,0.0), Jout(N_ENS,0.0);
     std::vector<float> Theta_sum(N,0.f), tiac, umx,umy,umz,unut;
     double last_dep=0,last_air=0,last_out=0,last_emit=0;
     for(int k=0;k<N_ENS;++k){
@@ -367,9 +376,10 @@ int main(){
         lbm::Result res=s.run();
 
         // ── DIVERGENCE GUARD: fail loudly + immediately on any non-finite state ──
-        double Jk=0.0; bool bad = !std::isfinite(res.max_velocity) || !std::isfinite(res.max_concentration);
+        double Jik=0.0, Jok=0.0; bool bad = !std::isfinite(res.max_velocity) || !std::isfinite(res.max_concentration);
         if(!bad){ s.copy_tiac_to_host(tiac);
-            for(size_t i=0;i<N;++i){ float t=tiac[i]; if(!std::isfinite(t)){ bad=true; break; } Jk+=(double)w[i]*t; } }
+            for(size_t i=0;i<N;++i){ float t=tiac[i]; if(!std::isfinite(t)){ bad=true; break; }
+                Jik+=(double)w_in[i]*t; Jok+=(double)w_out[i]*t; } }
         if(bad){
             status("DIVERGED");
             fprintf(stderr,
@@ -383,11 +393,11 @@ int main(){
             return 2;
         }
         for(size_t i=0;i<N;++i) Theta_sum[i]+=tiac[i];
-        Jk/=(double)nOmega; J[k]=Jk;
+        Jin[k]=Jik/(double)nOmega; Jout[k]=Jok/(double)nOmega; J[k]=Jin[k]+Jout[k];
         last_dep=res.total_deposited; last_air=res.total_airborne; last_emit=res.total_emitted;
         last_out=res.total_emitted-res.total_deposited-res.total_airborne;
-        printf("[forward_city]   member J=%.6e (deposited %.1f%%, airborne %.1f%%)\n",
-               Jk,100.0*res.total_deposited/std::max(1e-30,res.total_emitted),
+        printf("[forward_city]   member J=%.6e = J_in %.6e + J_out %.6e (deposited %.1f%%, airborne %.1f%%)\n",
+               J[k],Jin[k],Jout[k],100.0*res.total_deposited/std::max(1e-30,res.total_emitted),
                100.0*res.total_airborne/std::max(1e-30,res.total_emitted));
 
         if(k==N_ENS-1){   // store the last realisation's fields for the viz suite
@@ -409,12 +419,16 @@ int main(){
     if(tsf){ fclose(tsf); tsf=nullptr; }
     double mean=0; for(double v:J) mean+=v; mean/=N_ENS;
     double var=0;  for(double v:J) var+=(v-mean)*(v-mean); double sd=(N_ENS>1)?std::sqrt(var/(N_ENS-1)):0.0;
+    double mean_in=0, mean_out=0; for(int k=0;k<N_ENS;++k){ mean_in+=Jin[k]; mean_out+=Jout[k]; }
+    mean_in/=N_ENS; mean_out/=N_ENS;
     if(STORE_FULL){ std::vector<float> tm(N); for(size_t i=0;i<N;++i) tm[i]=Theta_sum[i]/(float)N_ENS; wrf("theta_mean.f32",tm.data(),N,1); }
-    write_meta(mean,sd,N_ENS,nOmega,last_dep,last_air,last_out,last_emit,true);
+    write_meta(mean,sd,mean_in,mean_out,N_ENS,nOmega,last_dep,last_air,last_out,last_emit,true);
     status("COMPLETE");
 
     printf("\n[forward_city] ===== city population dose (N=%d realisation%s over Ω=%ld) =====\n",N_ENS,N_ENS>1?"s":"",nOmega);
     printf("  mean J = %.6e   (population dose per unit released mass, per source cell; lattice units)\n",mean);
+    printf("    J_in  (indoor)  = %.6e  (%.1f%%)\n",mean_in,100.0*mean_in/std::max(1e-30,mean));
+    printf("    J_out (outdoor) = %.6e  (%.1f%%)\n",mean_out,100.0*mean_out/std::max(1e-30,mean));
     if(N_ENS>1) printf("  std  J = %.6e  (%.1f%% of mean)\n",sd,100.0*sd/std::max(1e-30,mean));
     printf("  LOWER is better; compare J ACROSS designs, not in absolute terms.\n");
     printf("  all datasets stored in %s/  (meta.txt describes every binary)\n",OUT.c_str());
