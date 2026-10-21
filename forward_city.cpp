@@ -133,14 +133,21 @@ int main(){
     auto IDX=[&](int x,int y,int z){ return (size_t)z*ny*nx + (size_t)y*nx + x; };
 
     // ── self-describing binary writers (5-int header: nx,ny,nz,dx*1000,ncomp) ────
-    auto hdr5=[&](FILE* f,int nc){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),nc}; fwrite(h,sizeof(int),5,f); };
+    auto hdr5=[&](FILE* f,int nc){ int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),nc}; return fwrite(h,sizeof(int),5,f)==5; };
+    // A short write (disk full) must not leave a truncated dataset that looks valid:
+    // delete it, mark STATUS, and stop loudly.
+    auto closeChecked=[&](FILE* f,const std::string& fn,bool ok){
+        ok = (fclose(f)==0) && ok;
+        if(!ok){ std::remove((OUT+"/"+fn).c_str()); status("FAIL_WRITE");
+            fprintf(stderr,"[forward_city] *** FATAL: short write of %s/%s (disk full?) — partial file removed ***\n",OUT.c_str(),fn.c_str());
+            exit(5); } };
     auto wrf=[&](const std::string& fn,const float* d,size_t n,int nc){
         FILE* f=fopen((OUT+"/"+fn).c_str(),"wb"); if(!f){fprintf(stderr,"[forward_city] WARN cannot write %s\n",fn.c_str());return;}
-        hdr5(f,nc); fwrite(d,sizeof(float),n,f); fclose(f);
+        bool ok=hdr5(f,nc); ok = fwrite(d,sizeof(float),n,f)==n && ok; closeChecked(f,fn,ok);
         printf("[forward_city]   stored %s (%zu floats, ncomp=%d)\n",fn.c_str(),n,nc); };
     auto wru=[&](const std::string& fn,const uint8_t* d,size_t n){
         FILE* f=fopen((OUT+"/"+fn).c_str(),"wb"); if(!f){fprintf(stderr,"[forward_city] WARN cannot write %s\n",fn.c_str());return;}
-        hdr5(f,1); fwrite(d,1,n,f); fclose(f);
+        bool ok=hdr5(f,1); ok = fwrite(d,1,n,f)==n && ok; closeChecked(f,fn,ok);
         printf("[forward_city]   stored %s (%zu bytes)\n",fn.c_str(),n); };
 
     // geometry dataset (compact: cell type only) — needed to mask solids in viz

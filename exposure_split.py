@@ -22,7 +22,8 @@ def load(path):
     dt = np.uint8 if path.endswith(".u8") else np.float32
     a = np.fromfile(path, dtype=dt, offset=20)
     if a.size != nx * ny * nz * nc:
-        sys.exit(f"{path}: payload {a.size} != {nx}x{ny}x{nz}x{nc}")
+        sys.exit(f"{path}: payload {a.size} != {nx}x{ny}x{nz}x{nc}: file truncated "
+                 f"(disk full while writing?). Free space and regenerate it.")
     return a, (nx, ny, nz)
 
 def meta(run):
