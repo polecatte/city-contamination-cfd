@@ -54,6 +54,16 @@ def main():
           f"(rel diff {abs(j_run - j_meta) / max(abs(j_meta), 1e-300):.1e})")
     print(f"       run's weight sum = {w.sum(dtype=np.float64):.4g}")
 
+    # the regenerated weights must belong to the same city, cell for cell
+    if wdir != run:
+        ga, gb = (os.path.join(d, "geom_type.u8") for d in (run, wdir))
+        if not (os.path.exists(ga) and os.path.exists(gb)):
+            sys.exit("geom_type.u8 missing in the run or weights dir: cannot confirm the geometry matches")
+        if not np.array_equal(load(ga)[0], load(gb)[0]):
+            sys.exit("geometry differs between the run and the weights dir: regenerate the weights "
+                     "with the code that made the run (same CELL and builder knobs)")
+        print("geometry: identical to the run (geom_type.u8 byte-for-byte)")
+
     # building-anchored split
     w_in, gi = load(os.path.join(wdir, "receptor_w_in.f32"))
     w_out, go = load(os.path.join(wdir, "receptor_w_out.f32"))
