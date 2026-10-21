@@ -182,23 +182,35 @@ def main():
     # ── 4. timing (street pathway, from the z_ped frames of the last member) ──
     ts_path, frames = os.path.join(run, "exposure_timeseries.csv"), sorted(glob.glob(os.path.join(run, "frames", "conc_*.f32")))
     if os.path.exists(ts_path) and frames:
-        t_of = {int(r["frame"]): float(r["t_s"]) for r in csv.DictReader(open(ts_path))}
-        t, rate = [], []
+        # Θ accumulates C once per solver step (CINT += C), so integrate over steps.
+        rows_ts = {int(r["frame"]): r for r in csv.DictReader(open(ts_path))}
+        t, st, rate = [], [], []
         for fp in frames:
             fi = int(os.path.basename(fp)[5:9])
-            if fi not in t_of: continue
+            if fi not in rows_ts: continue
             fnx, fny = (int(v) for v in np.fromfile(fp, dtype=np.int32, count=2))
             c = np.fromfile(fp, dtype=np.float32, offset=8).reshape(fny, fnx)
-            t.append(t_of[fi]); rate.append(float(np.sum(w_out2d * c)) / n_omega)
-        t, rate = np.array(t), np.array(rate)
-        cum = np.concatenate([[0], np.cumsum(0.5 * (rate[1:] + rate[:-1]) * np.diff(t))])
-        when = lambda q: float(np.interp(q * cum[-1], cum, t))
+            t.append(float(rows_ts[fi]["t_s"])); st.append(float(rows_ts[fi]["phaseB_step"]))
+            rate.append(float(np.sum(w_out2d * c)) / n_omega)
+        t, st, rate = np.array(t), np.array(st), np.array(rate)
+        cum = np.concatenate([[0], np.cumsum(0.5 * (rate[1:] + rate[:-1]) * np.diff(st))])
         print(f"\n4. street-exposure timing (last member, {len(t)} frames, every {np.median(np.diff(t)):.1f} s)")
-        print(f"   peak rate at {t[np.argmax(rate)]:.0f} s; 50% of outdoor dose by {when(0.5):.0f} s, "
-              f"90% by {when(0.9):.0f} s, 99% by {when(0.99):.0f} s (end of run {t[-1]:.0f} s)")
+        print(f"   peak sampled rate at {t[np.argmax(rate)]:.0f} s (end of run {t[-1]:.0f} s)")
+        when = lambda c, q: float(np.interp(q, c, t))
         if has_last:
             Jo_last = sum(r["people"] * r["last_out"] for r in rows)
-            print(f"   frame-sampled outdoor dose / exact (theta_last): {cum[-1] / Jo_last:.3f}  (1 = sampling fine enough)")
+            frac = cum[-1] / Jo_last
+            print(f"   frames capture {100 * frac:.0f}% of the exact outdoor dose (theta_last); the rest falls "
+                  f"between snapshots, mostly in the first {t[1] - t[0]:.0f} s, which contain the release pulse")
+            early = np.concatenate([[0], (1 - frac) + cum[1:] / Jo_last]) if frac < 1 else cum / Jo_last
+            late = cum / cum[-1]
+            for q in (0.5, 0.9, 0.99):
+                print(f"   {int(100 * q):2d}% of outdoor dose by {when(early, q):5.0f} s if the missing dose is in the first "
+                      f"interval;  {when(late, q):5.0f} s uncorrected (latest)")
+        else:
+            late = cum / cum[-1]
+            print("   (no theta_last.f32: cannot check sampling)  " +
+                  ", ".join(f"{int(100 * q)}% by {when(late, q):.0f} s" for q in (0.5, 0.9, 0.99)))
     else:
         print("\n4. timing: no frames/ or exposure_timeseries.csv in this run (SNAP_EVERY=0?)")
 
