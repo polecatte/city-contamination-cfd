@@ -12,10 +12,13 @@ Exit status 0 = gate PASS, 1 = FAIL, 2 = input problem. Writes a PNG next to uav
 Gate 6a (OPENLB_PORT_STATUS_AND_VERIFICATION.md Phase 5a). Drift is measured the way the
 old solver's T_abl measured it (tests/airflow_validation.cpp): max over z of
 |U_station(z) - U_inlet(z)| / U_ref, U_ref = inlet U at z = 40 m, U laterally averaged
-over the interior. The gate is the city-face station (BUF_UP = 40 m downstream of the
-inlet); the 1/4, 1/2, 3/4 L stations are reported as the G1 evidence, since the city
-itself spans them. Also reported: the inlet's time mean against the target log law,
-which separates inlet error from solver drift.
+over the interior. The gate is the city-face station of the production domain: BUF_UP =
+5 H_REF = 500 m downstream of the inlet (gen_openlb_geom's guideline domain, H_MAX 100 m;
+CITY_FACE_M overrides it, e.g. 440 for the legacy builder's 88 m). The compact domain's city
+face (40 m) is still reported, with a warning when it fails, because runs made on the compact
+domain (DOMAIN=compact) meet the inflow there. The 1/4, 1/2, 3/4 L stations are reported as
+the G1 evidence. Also reported: the inlet's time mean against the target log law, which
+separates inlet error from solver drift.
 
 Gate 6b (Phase 5b). Xr = distance from the leeward face (half-way between the last
 wall cell and the first fluid cell) to where the near-ground (first fluid cell)
@@ -55,7 +58,12 @@ def gate_abl(mat, u, dx, out):
     iref = int(round(40.0 / dx))
     Uin = prof(0)
     Uref = Uin[iref]
-    stations = {'city face (40 m)': int(round(40.0 / dx)),
+    face_m = float(os.environ.get('CITY_FACE_M', 500.0))
+    iface = int(round(face_m / dx))
+    if iface >= nx - 2:
+        raise SystemExit(f"[6a] city face {face_m:g} m is beyond this fetch ({nx * dx:g} m long); set CITY_FACE_M")
+    face = f'city face ({face_m:g} m)'
+    stations = {'compact face (40 m)': int(round(40.0 / dx)), face: iface,
                 '1/4 L': nx // 4, '1/2 L': nx // 2, '3/4 L': (3 * nx) // 4}
     print(f"[6a] grid {nx}x{ny}x{nz} dx={dx} m; U_ref = U_inlet(z=40 m) = {Uref:.3f} m/s")
     tgt = log_law(z)
@@ -78,12 +86,16 @@ def gate_abl(mat, u, dx, out):
             su = np.sqrt(u[3][:, ys, xs].mean(axis=1)); U = prof(xs)
             print(f"[6a] I_u at {name}: " + "  ".join(f"z={z*dx:.0f} m {100*su[z]/U[z]:.1f}%"
                   for z in [1, 3, 5, 10, 20] if z < nz))
-    gate = res['city face (40 m)']
-    worst = max(res.values())
+    gate = res[face]
+    compact = res['compact face (40 m)']
+    downstream = max(v for k, v in res.items() if k not in ('compact face (40 m)',) and stations[k] >= iface)
     ok = gate < 0.10
-    print(f"[6a] GATE 6a (inlet -> city face < 10%): {100*gate:.1f}%  {'PASS' if ok else 'FAIL'}")
-    print(f"[6a] over the city fetch (to 3/4 L) the worst drift is {100*worst:.1f}%"
-          f"  -> G1 evidence: {'floor holds the profile' if worst < 0.10 else 'floor does NOT hold the profile'}")
+    print(f"[6a] GATE 6a (inlet -> production city face at {face_m:g} m < 10%): {100*gate:.1f}%  {'PASS' if ok else 'FAIL'}")
+    if compact >= 0.10:
+        print(f"[6a] WARNING: compact-domain city face (40 m) drifts {100*compact:.1f}%: runs made with DOMAIN=compact "
+              f"meet a distorted inflow; use the guideline domain for production")
+    print(f"[6a] from the city face to 3/4 L the worst drift is {100*downstream:.1f}%"
+          f"  -> G1 evidence: {'floor holds the profile' if downstream < 0.10 else 'floor does NOT hold the profile'}")
     try:
         import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
         fig, ax = plt.subplots(figsize=(5, 6))
