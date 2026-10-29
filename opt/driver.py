@@ -19,7 +19,11 @@ Method (OPENLB_PHASE9_FIDELITY.md section 8, OPTIMIZER.md):
              a contender can win a further direction instead of a new design being forced.
   direction  for the chosen design, the direction whose run would most reduce the posterior
              variance of its rose mean: argmax_j Cov(F, J_j)^2 / (Var J_j + noise), exact for a GP.
-  noise      a fresh inlet seed per run; the GP's noise term absorbs the seed scatter.
+  noise      a fresh inlet seed per run; the GP's noise term absorbs the seed scatter. Its
+             floor is the measured seed scatter (SEED_NOISE_REL, lab gate 8: 0.6-0.7 % per run),
+             so a few nearly equal early runs cannot shrink the noise to zero.
+  run checks evaluate.run_checks rejects truncated or non-closing runs; they stay in the history
+             with the reason but never reach the GP, and three in a row stop the search.
   feasibility designs the generator cannot fit under the height limit are never run (pre-check).
 
 History (WORKDIR/history.jsonl) and the evaluator's per-run cache make every command resumable.
@@ -33,6 +37,9 @@ import param_space_density as P                  # noqa: E402
 
 N_DIR = 16
 DIRS_DEG = [360.0 * i / N_DIR for i in range(N_DIR)]
+# per-run seed scatter of iF, relative (lab gate 8, two seeds on the city: |J1-J2|/mean 0.9-1.0 %)
+SEED_NOISE_REL = float(os.environ.get("SEED_NOISE_REL", "0.006"))
+MAX_BAD_IN_ROW = 3
 warnings.filterwarnings("ignore")
 
 
@@ -91,6 +98,8 @@ def fit_model(space, rows):
     from botorch.fit import fit_gpytorch_mll
     from gpytorch.mlls import ExactMarginalLogLikelihood
     from gpytorch.kernels import MaternKernel, PeriodicKernel, ScaleKernel
+    from gpytorch.likelihoods import GaussianLikelihood
+    from gpytorch.constraints import GreaterThan
     d = space.d
     Z = np.array([space.to_model(r["x"]) for r in rows])
     th = np.array([[r["phi"] / 360.0] for r in rows])
@@ -107,7 +116,13 @@ def fit_model(space, rows):
     kth.raw_period_length.requires_grad_(False)
     covar = ScaleKernel(kd()) + ScaleKernel(kd() * kth)
     dirs = torch.tensor([[a / 360.0] for a in DIRS_DEG], dtype=torch.double)
-    m = SingleTaskGP(X, Y, covar_module=covar, outcome_transform=Standardize(m=1),
+    # noise floor in Standardize's units: (SEED_NOISE_REL x mean iF)^2 / Var(iF)
+    y = Y.squeeze(-1)
+    var_y = float(y.var()) if len(y) > 1 else 0.0
+    floor = (SEED_NOISE_REL * float(y.mean())) ** 2 / var_y if var_y > 0 else 1e-4
+    floor = min(max(floor, 1e-6), 0.5)
+    lik = GaussianLikelihood(noise_constraint=GreaterThan(floor))
+    m = SingleTaskGP(X, Y, covar_module=covar, likelihood=lik, outcome_transform=Standardize(m=1),
                      input_transform=AppendFeatures(feature_set=dirs))
     fit_gpytorch_mll(ExactMarginalLogLikelihood(m.likelihood, m))
     return m
@@ -177,6 +192,7 @@ def run(args, evaluator, space=None, log=print):
     rng = np.random.default_rng(args.seed)
     init_dirs = list(rng.permutation(N_DIR)) * (args.n_init // N_DIR + 1)
     seed_next = args.seed_base + len(H.rows)
+    bad_in_row = 0
     while len([r for r in H.rows if r.get("phase") != "verify"]) < args.budget:
         n = len([r for r in H.rows if r.get("phase") != "verify"])
         t0 = time.time()
@@ -193,8 +209,15 @@ def run(args, evaluator, space=None, log=print):
         H.add(res)
         ok = H.ok()
         nd = len({design_id(r["x"]) for r in ok})
-        log(f"[opt] {len(ok):4d} runs, {nd:3d} designs | {kind:5s} phi {phi:6.1f} -> iF {res.get('iF_ppm', float('nan')):.4f} ppm"
-            f"{'' if res.get('feasible', True) else ' (infeasible)'}")
+        iF = res.get("iF_ppm")
+        log(f"[opt] {len(ok):4d} runs, {nd:3d} designs | {kind:5s} phi {phi:6.1f} -> iF "
+            f"{iF if iF is not None else float('nan'):.4f} ppm{'' if res.get('feasible', True) else ' (infeasible)'}"
+            f"{' REJECTED: ' + '; '.join(res['reject']) if res.get('reject') else ''}")
+        bad_in_row = bad_in_row + 1 if res.get("valid") is False else 0
+        if bad_in_row >= MAX_BAD_IN_ROW:
+            raise RuntimeError(f"{bad_in_row} runs in a row failed evaluate.run_checks (last: {'; '.join(res['reject'])}); "
+                               f"stopping before the budget is spent on a systematic fault. Fix it and rerun: the "
+                               f"history is kept and the search resumes.")
     return H
 
 
@@ -229,8 +252,14 @@ def verify(args, evaluator, space=None, log=print):
     for t in top:
         vals = []
         for phi in DIRS_DEG:
-            r = evaluator(t["x"], phi, seed); seed += 1
-            r["phase"] = "verify"; H.add(r); vals.append(r["iF_ppm"])
+            for attempt in range(MAX_BAD_IN_ROW):                # a rejected run is redone with a new seed
+                r = evaluator(t["x"], phi, seed); seed += 1
+                r["phase"] = "verify"; H.add(r)
+                if r.get("iF_ppm") is not None: break
+                log(f"[verify] phi {phi:.1f} rejected ({'; '.join(r.get('reject', []))}), new seed")
+            else:
+                raise RuntimeError(f"verify: {MAX_BAD_IN_ROW} runs at phi {phi:.1f} failed the run checks")
+            vals.append(r["iF_ppm"])
         Fv = float(np.mean(vals))
         log(f"[verify] design F = {Fv:.4f} ppm over 16 directions (surrogate {t['F_mean']:.4f} +- {t['F_sd']:.4f}); "
             f"directions min {min(vals):.4f} max {max(vals):.4f}")

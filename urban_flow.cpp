@@ -1694,6 +1694,7 @@ int main(int argc, char* argv[]) {
                   << ", extrapolated <= " << tail.maxfrac << " of J); fallback stop CLEAR_FRAC " << CLEAR << std::endl;
     // emit is the CV's emission (what the budget closes against); emitOut is Ω beyond the CV.
     double emit=0, emitOut=0, depCV=0, depOut=0, outDown=0, outUp=0, airCV=0, airAll=0, peakAir=0; int endStep=MAXB;
+    const char* stopReason = "cap";                        // meta_flow: clearance | tail | cap
     double wTheta=0;
     { double a0=0; const double m0 = ops.accumulate(adLattice, superGeometry, 0, a0);
       cl4 << "pre-release CV mass " << m0 << " (must be 0)" << std::endl; }
@@ -1789,7 +1790,7 @@ int main(int argc, char* argv[]) {
         if (report || stop) cl4 << "iB=" << iB << " t=" << iB*dt << "s air=" << airCV << " dep=" << depCV
             << " out=" << outDown << "+" << outUp << " emit=" << emit << " resid=" << resid
             << " airborne_frac=" << ((emit+emitOut)>0 ? airAll/(emit+emitOut) : 0.0) << " J=" << Jt << std::endl;
-        if (stop) { endStep=iB+1; break; }
+        if (stop) { endStep=iB+1; stopReason = tailStop ? "tail" : "clearance"; break; }
     }
     if (ts) fclose(ts);
     if (!uniform) dStats("at the end");
@@ -1821,6 +1822,7 @@ int main(int argc, char* argv[]) {
     { FILE* mf=fopen((OUT+"/meta_flow.txt").c_str(),"w"); if(mf){
         fprintf(mf,"grid %d %d %d\ndx_m %.4f\nomega_cells %ld\n",nx,ny,nz,dx,ops.nSrc);
         fprintf(mf,"burst_steps %d\ndt_s %.6g\nD_eff_m2s %.6g\ntau_AD %.6g\n",endStep,(double)dt,(double)D_EFF,(double)(1/omegaAD));
+        fprintf(mf,"burst_cap %d\nstop_reason %s\n",MAXB,stopReason);
         fprintf(mf,"D_local %d\nSc_t %.4g\ntau_AD_min %.6g\n",(int)D_LOCAL,(double)SC_T,(double)TAU_AD_MIN);
         if (TAIL) fprintf(mf,"tail_applied %d\ntail_early_stop %d\ntail_k_per_s %.6g\ntail_r2 %.6f\ntail_n %d\ntail_span %.4f\n"
                              "tail_air_frac_at_stop %.6g\ntail_J_part %.6e\ntail_fit_frac %.6f\n",

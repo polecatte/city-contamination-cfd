@@ -46,11 +46,47 @@ def intake_fraction(geom, out):
         p = line.split()
         if len(p) == 2 and not p[0].startswith("#"):
             try: m[p[0]] = float(p[1])
-            except ValueError: pass
+            except ValueError: m[p[0]] = p[1]                  # text values, e.g. stop_reason
     emit = m.get("mass_emitted_total", m["mass_emitted"])
     J = float(np.dot(w.astype(np.float64), th.astype(np.float64)) / emit)
     dx = m.get("dx_m", hw[3] / 1000.0)
     return J, B_BREATH * J / dx ** 3 * 1e6, m
+
+
+def run_checks(J, m, max_closure=1e-2, clear_frac=0.01, max_tail_frac=0.15):
+    """Reasons a finished run must not reach the optimizer (empty list = valid).
+
+    A run whose exit code is 0 can still carry a wrong J: one that hit MAX_BURST_STEPS before
+    clearing has truncated Theta, and urban_flow applies the tail fit at the cap without its
+    TAIL_MAXFRAC limit. Checks: J finite and positive; mass budget closes (gate 7a's 1 %); the
+    burst cleared (stop_reason clearance or tail), or hit the cap with a tail fit that is a
+    minor share of J; any applied tail within max_tail_frac."""
+    import math
+    why = []
+    if not (isinstance(J, float) and math.isfinite(J) and J > 0):
+        why.append(f"J = {J} is not finite and positive")
+    closure = m.get("budget_closure")
+    if not isinstance(closure, float):
+        why.append("meta_flow.txt has no budget_closure")
+    elif closure > max_closure:
+        why.append(f"mass budget closes only to {closure:.2e} (> {max_closure:g})")
+    tail_applied = m.get("tail_applied", 0.0) == 1.0
+    tail_frac = m.get("tail_fit_frac", 0.0) if tail_applied else 0.0
+    if tail_applied and isinstance(tail_frac, float) and tail_frac > max_tail_frac:
+        why.append(f"extrapolated tail is {100 * tail_frac:.1f} % of J (> {100 * max_tail_frac:.0f} %)")
+    reason = m.get("stop_reason")
+    if reason is None:                                         # solver older than stop_reason
+        air = m.get("tail_air_frac_at_stop")
+        if not tail_applied and isinstance(air, float) and air > clear_frac:
+            why.append(f"burst did not clear: {100 * air:.1f} % of peak airborne at stop, no tail fit")
+    elif reason == "cap" and not tail_applied:
+        air, cap = m.get("tail_air_frac_at_stop"), m.get("burst_cap")
+        air_txt = f", {100 * air:.1f} % of peak still airborne" if isinstance(air, float) else ""
+        cap_txt = f" ({cap:.0f} steps)" if isinstance(cap, float) else ""
+        why.append(f"hit MAX_BURST_STEPS{cap_txt} before clearing{air_txt}, no tail fit")
+    elif reason not in ("clearance", "tail", "cap"):
+        why.append(f"unknown stop_reason {reason!r}")
+    return why
 
 
 class CFDEvaluator:
@@ -112,8 +148,12 @@ class CFDEvaluator:
             if r.returncode != 0:
                 raise RuntimeError(f"solver failed ({r.returncode}), see {d}/run.log")
             J, iF, m = intake_fraction(geom, out)
+            why = run_checks(J, m)
             res.update({"J": J, "iF_ppm": iF, "burst_steps": m.get("burst_steps"),
-                        "budget_closure": m.get("budget_closure"), "tail_J_part": m.get("tail_J_part", 0.0)})
+                        "budget_closure": m.get("budget_closure"), "tail_J_part": m.get("tail_J_part", 0.0),
+                        "stop_reason": m.get("stop_reason"), "valid": not why, "reject": why})
+            if why:                                     # keep the numbers for diagnosis, out of the GP
+                res.update({"J_raw": J, "iF_raw_ppm": iF, "J": None, "iF_ppm": None})
             for fn in os.listdir(out):                      # drop what the optimizer never reads
                 if fn.endswith(".f32") and fn not in self.keep:
                     os.remove(os.path.join(out, fn))
