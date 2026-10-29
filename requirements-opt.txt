@@ -1,0 +1,14 @@
+# Optimizer (Bayesian optimization driver) dependencies. Python >= 3.11 (BoTorch 0.18 needs it).
+#
+# Install torch FIRST from PyTorch's CPU index: the GP surrogate is small, so the CPU build is
+# enough, and it avoids the ~3 GB of CUDA wheels the default PyPI torch pulls in:
+#   python3 -m venv optenv && . optenv/bin/activate
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements-opt.txt
+# (./lab_openlb.sh opt_setup does exactly this into $WORK/optenv. Without the CPU index, the
+# torch line below installs the default PyPI build, which also works.)
+torch>=2.4
+botorch==0.18.1        # BO: GP models, knowledge gradient, Expectation/CVaR over environmental variables
+gpytorch>=1.15.2       # kernels (Matern, periodic/cosine) used by BoTorch models
+numpy
+scipy

@@ -151,6 +151,19 @@ struct Params {
     // Set all to 0 for legacy centered behavior (Sx/Sy specified directly).
     double buf_xn, buf_xp;      // -x (left) and +x (right) buffers
     double buf_yn, buf_yp;      // -y (bottom) and +y (top) buffers
+
+    // ── Builder revision 9 (gen_openlb_geom's default; BUILDER=legacy there keeps 8) ──
+    //  - the street grid covers the whole city footprint and is CLIPPED at its edge, so
+    //    changing block or street size moves the edge blocks a little instead of dropping
+    //    a whole row/column and re-centring the rest;
+    //  - height scatter is a smooth function of the block's position (pos_noise), not of
+    //    its index, so adding a block does not re-draw every other block's height;
+    //  - no RES_LOW reclassification (an apartment block at <= 4 floors no longer shrinks
+    //    abruptly to 25 % coverage), as in the two-tier form generator;
+    //  - heights are scaled so total floor area houses the population (rezone, below),
+    //    capped at h_max (a height limit) and the slenderness limit.
+    int    rev   = 8;
+    double h_max = 0;           // m; 0 = slenderness limit only
 };
 
 // ── Buffer helpers ──────────────────────────────────────────
@@ -255,6 +268,9 @@ struct Result {
     int nx_cells, ny_cells, num_blocks_x, num_blocks_y, offset_x, offset_y;
     double road_area_m2, park_area_m2, total_open_m2, open_space_ratio, park_frac;
     std::vector<bool> v_road_major, h_road_major;
+    // rev 9 (rezone): floor area vs what the population needs, and the height scale used
+    double gfa_m2 = 0, gfa_target_m2 = 0, height_scale = 1;
+    bool   feasible = true;   // false: the height limits cannot fit the population's floor area
 };
 
 // Skyline height field: a base height plus a radially-symmetric Gaussian "bump"
@@ -313,6 +329,23 @@ inline double value_noise01(double x, double y, double scale){
 }
 constexpr double PATCH_SCALE_M = 160.0;   // patch feature size ≈ 3–4 blocks
 
+// v9 height-scatter noise: value noise at the block's position relative to the city
+// centre (continuous in position, ~one block pitch between independent values), rescaled
+// to block_noise's spread (std 1/sqrt 12) so `roughness` keeps its meaning (≈ std of ln h).
+constexpr double ROUGH_NOISE_M = 45.0;
+inline double pos_noise(double x_rel, double y_rel) {
+    static const double gain = [] {
+        double s = 0, s2 = 0; const int n = 400;
+        for (int i = 0; i < n; ++i) for (int j = 0; j < n; ++j) {
+            const double v = value_noise01(1e4 + 7.31 * i, 1e4 + 6.97 * j, ROUGH_NOISE_M);
+            s += v; s2 += v * v; }
+        const double m = s / (n * n), sd = std::sqrt(std::max(1e-12, s2 / (n * n) - m * m));
+        return (1.0 / std::sqrt(12.0)) / sd;
+    }();
+    const double v = (value_noise01(1e4 + x_rel, 1e4 + y_rel, ROUGH_NOISE_M) - 0.5) * gain;
+    return std::max(-1.0, std::min(1.0, v));
+}
+
 // ── Generate ─────────────────────────────────────────────────
 inline Result generate(const Params& p){
     int Scx=(int)(p.Sx/CELL), Scy=(int)(p.Sy/CELL);
@@ -344,6 +377,11 @@ inline Result generate(const Params& p){
     {int y=road_h(0);
      while(y+bd+road_h(nby+1)<=limy){y+=bd+road_h(nby+1);nby++;}
      nby=std::max(1,nby);}
+    const bool clip = p.rev >= 9 && has_buf && p.city_w > 0 && p.city_h > 0;
+    if (clip) {                       // v9: enough blocks to overhang the city on both sides
+        nbx = (cwx + ROAD_X) / (bw + ROAD_X) + 3;
+        nby = (cwy + ROAD_Y) / (bd + ROAD_Y) + 3;
+    }
     // Total grid extents
     int ux=0;for(int ix=0;ix<=nbx;++ix)ux+=road_v(ix); ux+=nbx*bw;
     int uy=0;for(int iy=0;iy<=nby;++iy)uy+=road_h(iy); uy+=nby*bd;
@@ -386,9 +424,16 @@ inline Result generate(const Params& p){
     double cov=1.0;
     double cs=std::sqrt(cov);
     std::vector<Block> blocks;
+    // v9: lots are clipped to the city footprint [cx0, cx0+cwx) x [cy0, cy0+cwy)
+    const int cx0c = (int)std::round(p.buf_xn / CELL), cy0c = (int)std::round(p.buf_yn / CELL);
     for(int iy=0;iy<nby;++iy) for(int ix=0;ix<nbx;++ix){
         int bx0=col_x[ix], by0=row_y[iy];
         int bx1=bx0+bw, by1=by0+bd;
+        if (clip) {
+            bx0 = std::max(bx0, cx0c); bx1 = std::min(bx1, cx0c + cwx);
+            by0 = std::max(by0, cy0c); by1 = std::min(by1, cy0c + cwy);
+            if (bx1 - bx0 < 2*SETBACK + 2 || by1 - by0 < 2*SETBACK + 2) continue;   // < 2 cells to build on
+        }
         if(bx0<mg||by0<mg||bx1>Scx-mg||by1>Scy-mg) continue;
         int x0f=bx0+SETBACK,y0f=by0+SETBACK,x1f=bx1-SETBACK,y1f=by1-SETBACK;
         if(x1f<=x0f||y1f<=y0f) continue;
@@ -429,8 +474,8 @@ inline Result generate(const Params& p){
         double ch=p.city_h>0?p.city_h:p.Sy;
         double cx_dom = has_buf ? (p.buf_xn + cw*0.5) : (p.Sx*0.5);
         double cy_dom = has_buf ? (p.buf_yn + ch*0.5) : (p.Sy*0.5);
-        if(std::abs(b.center_x-cx_dom)>cw*0.5 || std::abs(b.center_y-cy_dom)>ch*0.5)
-            continue; // skip this block — outside city boundary
+        if(!clip && (std::abs(b.center_x-cx_dom)>cw*0.5 || std::abs(b.center_y-cy_dom)>ch*0.5))
+            continue; // skip this block — outside city boundary (v9 clips instead)
         blocks.push_back(b);
     }
     int N=(int)blocks.size();

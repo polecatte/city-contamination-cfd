@@ -38,7 +38,7 @@ flagged rather than made, since I don't edit your sources silently.
 
 **Stage-A↔B file handshake — verified.** `geometry_loader.h`'s reader round-trips the
 `material_map.dat` + `source_mask.u8` the bridge produced: histogram reads back
-1 fluid 2 445 872 · 2 wall 61 528 · 3 inlet 14 696 · 4 outlet 14 696 · 5 slip 59 675 ·
+1 fluid 2 445 872 · 2 wall 61 528 · 3 inlet 14 355 · 4 outlet 14 355 · 5 slip 59 325 ·
 6 porous 4 725 · 7 ground 29 559 · Ω 22 812 — exactly Stage A's counts.
 
 ## What's scaffolded (compiles in your 1.8 tree, flagged `CONFIRM 1.8`)

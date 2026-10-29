@@ -1,5 +1,11 @@
 # OpenLB port — status audit & lab-machine verification plan
 
+> **Update 2026-09-27:** Phases 5–7 have been run. Results, the four silent defects the
+> first runs exposed, the G1 decision (a custom rough-wall floor plus a top shear stress),
+> and the operating-point trade-off Gate 6b forces are in
+> [`OPENLB_PHASE5_6_GATES.md`](OPENLB_PHASE5_6_GATES.md). The Phase-1 config below is still
+> right for the port; use `./olbconfig.sh cpu-mt` (OpenMP) for Phase 5 onwards.
+
 Audit date: 2026-08-20. Scope: `OPENLB_MIGRATION_PLAN.md` §7 steps 1–4 as implemented in
 `openlb_geometry.h`, `gen_openlb_geom.cpp`, `geometry_loader.h`, `abl_inlet_olb.h`,
 `urban_flow.cpp`.
@@ -38,9 +44,9 @@ worse than a crash.
 
 ```
 gen_openlb_geom (dx=4 m)  → 177×167×89 = 2 630 751 cells
-  MAT 1 fluid 2 445 872 · 2 wall 61 528 · 3 inlet 14 696 · 4 outlet 14 696
-  5 slip 59 675 · 6 porous 4 725 · 7 ground 29 559        Ω = 22 812
-  all 5 reconciliation identities PASS · exit 0
+  MAT 1 fluid 2 445 872 · 2 wall 61 528 · 3 inlet 14 355 · 4 outlet 14 355
+  5 slip 59 325 · 6 porous 4 725 · 7 ground 29 559        Ω = 22 812
+  all 5 reconciliation identities PASS (identity 4 now fluid+in+out+slip+donothing) · exit 0
 geometry_loader selftest  → round-trips every count · SELFTEST OK
 abl_inlet_verify          → log-law 0.10% [PASS] · div 5.2% · σ 6.8% low · deterministic
 ```
@@ -258,8 +264,8 @@ g++ -O2 -std=c++17 -DGEOMLOADER_SELFTEST -x c++ geometry_loader.h -o geomloader_
 **Gate 3 (exact numbers to match — I reproduced these today on a clean tree):**
 
 ```
-2 630 751 cells · fluid 2 445 872 · wall 61 528 · inlet 14 696 · outlet 14 696
-slip 59 675 · porous 4 725 · ground 29 559 · Ω 22 812 · all identities PASS · exit 0
+2 630 751 cells · fluid 2 445 872 · wall 61 528 · inlet 14 355 · outlet 14 355
+slip 59 325 · porous 4 725 · ground 29 559 · Ω 22 812 · all identities PASS · exit 0
 ```
 
 Any deviation means a compiler/environment difference, not a code change — chase it now
@@ -362,6 +368,10 @@ frames this concern for the old engine; it must be re-established for the new on
 Then `visualize_forward.py` + `render_domain.py` on the output directory.
 
 ### Phase 8 — GPU (only after Phase 7 is green on CPU)
+
+> **Status 2026-09-29:** implemented — see `OPENLB_PHASE8_GPU.md` (operators in `urban_ops.h`,
+> bitwise CPU parity, CUDA 12.6 build, lab parity script). The config below is superseded by
+> `./olbconfig.sh gpu`: CUDA 12.0 cannot compile OpenLB 1.8, and the link line needs the arch.
 
 ```make
 CXX := nvcc

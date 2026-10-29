@@ -57,6 +57,13 @@ enum OlbMaterial : int32_t {
     MAT_OUTLET    = 4,
     MAT_SLIP      = 5,
     MAT_POROUS    = 6,
+    MAT_FRAME     = 9,   // domain box edges/corners — see "One face per cell" in
+                         // OPENLB_MIGRATION_PLAN.md 6.4. Solid no-slip, but its own number
+                         // so the verified WALL count stays exactly the building shells.
+                         // Must NOT be 0: OpenLB reads material 0 as "outside" when it
+                         // derives a boundary cell's discrete normal, and an extra outside
+                         // neighbour turns the adjacent face cell into an edge/corner that
+                         // the interpolated boundaries have no specialisation for.
     MAT_GROUND    = 7,   // ground plane — ROUGH wall (wall function w/ z0), kept SEPARATE
                          // from buildings so the ABL wall-function corrective targets only
                          // the floor (buildings stay smooth no-slip per COST 732).
@@ -77,10 +84,11 @@ struct MaterialMap {
 };
 
 // ── Stamp OpenLB materials from the voxel grid ──────────────
-// wind_deg selects which lateral face is the velocity inlet. For the project's default
-// 0° (+x) wind the inlet is the x=0 plane and the outlet is x=nx-1; 180° swaps them;
-// 90°/270° use the y faces. Only axis-aligned inlets are handled (matching the solver's
-// wind_angle usage); an oblique wind falls back to the +x convention with a note.
+// wind_deg (toward, from +x) sets the lateral faces' roles by the sign of w . n_out, w the wind
+// direction and n_out the face's outward normal: < 0 inflow (velocity inlet), > 0 outflow
+// (pressure outlet), = 0 parallel (free slip). An axis wind gives one inlet, the opposite
+// outlet and two slip faces (0 deg: inlet x = 0, outlet x = nx-1, as before); an oblique wind
+// gives two inlet faces and two outlet faces.
 //
 // Assignment order (guarantees exactly one material per cell):
 //   (1) every cell defaults to MAT_FLUID
@@ -88,6 +96,10 @@ struct MaterialMap {
 //   (3) domain-face overlay, applied to FLUID cells only so a building or the ground
 //       that happens to sit on a face is never reclassified as an inlet/outlet/slip:
 //       inlet face → INLET, opposite face → OUTLET, remaining lateral + top → SLIP.
+//       EXACTLY ONE FACE PER CELL: a cell lying on two or more domain faces (the 12 box
+//       edges and 8 corners) gets MAT_FRAME rather than being claimed by whichever overlay
+//       ran first. See "One face per cell" in OPENLB_MIGRATION_PLAN.md 6.4 for why, and in
+//       particular why MAT_FRAME must not be material 0.
 inline MaterialMap build_material_map(const VoxelGrid& g, double wind_deg = 0.0) {
     MaterialMap m;
     m.nx = g.nx; m.ny = g.ny; m.nz = g.nz; m.cell_size = g.cell_size;
@@ -108,43 +120,37 @@ inline MaterialMap build_material_map(const VoxelGrid& g, double wind_deg = 0.0)
         }
     }
 
-    // (3) domain-boundary overlay on fluid cells only.
-    // Normalize wind to the nearest axis; default +x.
-    double wd = std::fmod(wind_deg, 360.0); if (wd < 0) wd += 360.0;
-    enum { PX, PY, NX_, NY_ } inflow;
-    if      (wd >= 45.0  && wd < 135.0) inflow = PY;   // wind toward +y  → inlet at y=0
-    else if (wd >= 135.0 && wd < 225.0) inflow = NX_;  // toward −x        → inlet at x=nx-1
-    else if (wd >= 225.0 && wd < 315.0) inflow = NY_;  // toward −y        → inlet at y=ny-1
-    else                                inflow = PX;   // toward +x        → inlet at x=0
+    // (3) domain-boundary overlay on fluid cells only: each lateral face's role from w . n_out
+    const double wr = wind_deg * M_PI / 180.0, wx = std::cos(wr), wy = std::sin(wr), eps = 1e-6;
+    auto role = [&](double dot) -> int32_t { return dot < -eps ? MAT_INLET : (dot > eps ? MAT_OUTLET : MAT_SLIP); };
+    const int32_t fXm = role(-wx), fXp = role(wx), fYm = role(-wy), fYp = role(wy);   // faces x=0, x=nx-1, y=0, y=ny-1
 
-    auto set_face = [&](int x, int y, int z, int32_t v) {
-        size_t i = m.idx(x, y, z);
-        if (m.mat[i] == MAT_FLUID) m.mat[i] = v;   // fluid only
+    // One face per cell. The previous sequential overlay let the inlet claim its whole
+    // plane first, including the two columns where that plane meets the lateral slip
+    // faces; those cells then had no bulk-fluid neighbour, so OpenLB could not derive a
+    // discrete inward normal for them and threw "Could not set Boundary". A cell on two
+    // or more domain faces has no unique normal by construction, and because it touches
+    // no fluid it cannot influence the solution, so it becomes MAT_DONOTHING (no dynamics).
+    auto n_faces = [&](int x, int y, int z) {
+        int c = 0;
+        if (x == 0 || x == nx - 1) ++c;
+        if (y == 0 || y == ny - 1) ++c;
+        if (z == 0 || z == nz - 1) ++c;
+        return c;
     };
-    // inlet / outlet on the two wind-aligned faces
-    for (int z = 0; z < nz; ++z) for (int y = 0; y < ny; ++y) {
-        int xin = (inflow == PX) ? 0 : (inflow == NX_ ? nx - 1 : -1);
-        int xout= (inflow == PX) ? nx - 1 : (inflow == NX_ ? 0 : -1);
-        if (xin >= 0)  set_face(xin,  y, z, MAT_INLET);
-        if (xout >= 0) set_face(xout, y, z, MAT_OUTLET);
+    for (int z = 0; z < nz; ++z) for (int y = 0; y < ny; ++y) for (int x = 0; x < nx; ++x) {
+        const int nf = n_faces(x, y, z);
+        if (nf == 0) continue;                       // domain interior
+        const size_t i = m.idx(x, y, z);
+        if (m.mat[i] != MAT_FLUID) continue;         // buildings / ground / parks keep theirs
+        if (nf >= 2) { m.mat[i] = MAT_FRAME; continue; }       // box edge or corner
+        int32_t v = MAT_SLIP;                        // top face
+        if      (x == 0)      v = fXm;
+        else if (x == nx - 1) v = fXp;
+        else if (y == 0)      v = fYm;
+        else if (y == ny - 1) v = fYp;
+        m.mat[i] = v;
     }
-    for (int z = 0; z < nz; ++z) for (int x = 0; x < nx; ++x) {
-        int yin = (inflow == PY) ? 0 : (inflow == NY_ ? ny - 1 : -1);
-        int yout= (inflow == PY) ? ny - 1 : (inflow == NY_ ? 0 : -1);
-        if (yin >= 0)  set_face(x, yin,  z, MAT_INLET);
-        if (yout >= 0) set_face(x, yout, z, MAT_OUTLET);
-    }
-    // remaining lateral faces + top → free-slip (fluid only; inlet/outlet already claimed)
-    for (int z = 0; z < nz; ++z) for (int x = 0; x < nx; ++x) {
-        set_face(x, 0,      z, MAT_SLIP);
-        set_face(x, ny - 1, z, MAT_SLIP);
-    }
-    for (int z = 0; z < nz; ++z) for (int y = 0; y < ny; ++y) {
-        set_face(0,      y, z, MAT_SLIP);
-        set_face(nx - 1, y, z, MAT_SLIP);
-    }
-    for (int y = 0; y < ny; ++y) for (int x = 0; x < nx; ++x)
-        set_face(x, y, nz - 1, MAT_SLIP);   // top
 
     return m;
 }
@@ -178,9 +184,12 @@ inline bool material_reconcile(const VoxelGrid& g, const MaterialMap& m, bool ve
         }
     }
     // material-side counts
-    long m_cnt[8] = {0,0,0,0,0,0,0,0};
-    for (size_t i = 0; i < N; ++i) if (m.mat[i] >= 0 && m.mat[i] <= 7) ++m_cnt[m.mat[i]];
-    long m_fluidfaces = m_cnt[MAT_FLUID] + m_cnt[MAT_INLET] + m_cnt[MAT_OUTLET] + m_cnt[MAT_SLIP];
+    long m_cnt[10] = {0,0,0,0,0,0,0,0,0,0};
+    for (size_t i = 0; i < N; ++i) if (m.mat[i] >= 0 && m.mat[i] <= 9) ++m_cnt[m.mat[i]];
+    // MAT_FRAME is the box edges/corners carved out of fluid by the one-face-per-cell rule,
+    // so it belongs on the fluid side of this identity.
+    long m_fluidfaces = m_cnt[MAT_FLUID] + m_cnt[MAT_INLET] + m_cnt[MAT_OUTLET]
+                      + m_cnt[MAT_SLIP]  + m_cnt[MAT_FRAME];
 
     // reconciliation identities
     bool ok = true;
@@ -190,17 +199,19 @@ inline bool material_reconcile(const VoxelGrid& g, const MaterialMap& m, bool ve
     };
     if (verbose) {
         printf("\n[openlb_geom] material histogram (%zu cells)\n", N);
-        const char* nm[8] = {"DONOTHING","FLUID","WALL","INLET","OUTLET","SLIP","POROUS","GROUND"};
-        for (int k = 0; k < 8; ++k)
+        const char* nm[10] = {"DONOTHING","FLUID","WALL","INLET","OUTLET","SLIP","POROUS",
+                              "GROUND","(sponge)","FRAME"};
+        for (int k = 0; k < 10; ++k)
             printf("  MAT %d %-10s %10ld (%5.2f%%)\n", k, nm[k], m_cnt[k], 100.0*m_cnt[k]/N);
         printf("\n[openlb_geom] reconciliation against voxel grid\n");
     }
     check("GROUND = ground cells",          m_cnt[MAT_GROUND], v_ground);
     check("WALL = solid building shells",   m_cnt[MAT_WALL],   v_shell_solid);
     check("POROUS = park shells + indoor",  m_cnt[MAT_POROUS], v_shell_porous + v_indoor);
-    check("fluid+inlet+outlet+slip = FLUID", m_fluidfaces,     v_fluid);
+    check("fluid+in+out+slip+frame = FLUID", m_fluidfaces,     v_fluid);
     check("total cells conserved",          (long)N,
-          m_cnt[0]+m_cnt[MAT_FLUID]+m_cnt[MAT_WALL]+m_cnt[MAT_INLET]+m_cnt[MAT_OUTLET]+m_cnt[MAT_SLIP]+m_cnt[MAT_POROUS]+m_cnt[MAT_GROUND]);
+          m_cnt[0]+m_cnt[MAT_FLUID]+m_cnt[MAT_WALL]+m_cnt[MAT_INLET]+m_cnt[MAT_OUTLET]
+          +m_cnt[MAT_SLIP]+m_cnt[MAT_POROUS]+m_cnt[MAT_GROUND]+m_cnt[MAT_FRAME]);
     if (verbose) printf("[openlb_geom] gate: %s\n", ok ? "PASS — material counts match the old voxelizer"
                                                         : "FAIL — mapping does not reconcile");
     return ok;

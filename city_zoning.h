@@ -129,6 +129,11 @@ struct MixedZoningParams {
     double   res_gradient     = 1.5;  // residential falloff exp(−b·r/R); 0 = uniform sprawl
     double   jh_mix           = 0.5;  // 0 = segregated (housing avoids job cores), 1 = mixed-use
     double   peak_height      = 70.0; // building height (m) at the densest employment peak
+    // Builder rev 9: the population fixes the floor area, so only the SHAPE of the height field
+    // is a design choice: h ∝ (1 − height_conc) + height_conc · ĝ, ĝ = g rescaled to [0,1] over the
+    // blocks, g = 0.78·E + 0.32·R
+    // (the same mix as rev 8). 0 = uniform canopy, 1 = heights follow the density fields.
+    double   height_conc      = 0.6;
 };
 
 // ── Potential field primitives ────────────────────────────────────────────
@@ -383,6 +388,15 @@ inline Result rezone(const Params& p, Result r, const MixedZoningParams& mzp) {
     std::vector<double> emp_field, res_field;
     if (mzp.dens_enable) {
         density_fields(blocks, cx, cy, cw, ch, mzp, emp_field, res_field);
+        if (p.rev >= 9) {
+            const double kap = max(0.0, min(1.0, mzp.height_conc));
+            double gmin = 1e300, gmax = -1e300;
+            for (int i = 0; i < N; ++i) { const double g = 0.78*emp_field[i] + 0.32*res_field[i];
+                                          gmin = min(gmin, g); gmax = max(gmax, g); }
+            const double gr = max(1e-12, gmax - gmin);            // min-max: kap = 1 spans the full contrast
+            for (int i = 0; i < N; ++i)   // 30 m nominal; rescaled to the population's floor area later
+                blocks[i].raw_height = 30.0 * ((1.0 - kap) + kap * (0.78*emp_field[i] + 0.32*res_field[i] - gmin) / gr);
+        } else
         for (int i = 0; i < N; ++i) {
             double h = BASE_HEIGHT_M + mzp.peak_height*(0.78*emp_field[i] + 0.32*res_field[i]);
             blocks[i].raw_height = h;   // heights now derive from the density fields
@@ -407,121 +421,156 @@ inline Result rezone(const Params& p, Result r, const MixedZoningParams& mzp) {
     std::vector<int> order = scatter_order(px, py, phi_biz_v, all_idx,
                                            mzp.biz_scatter, d_scale);
 
-    // ── Step C: Reset all to RES_HIGH, place parks, then assign business ─
     // Park count from direct park_fraction knob (same as generate()).
     double park_frac = max(0.0, min(MAX_PARK_FRAC, p.park_fraction));
     int n_park = (int)(N*park_frac + 0.5);
 
-    for (auto& b : blocks) b.usage = RES_HIGH;
-
-    // ── Step D: Business assignment — single pass at α=1 ─────────────────
-    // Iteratively converts the nearest-Φ RES_HIGH block to BUSINESS until the
-    // employment constraint (workers = pop·LABOR_RATE, area per worker = BIZ_AREA_PW)
-    // is satisfied at ≥95%. Uses raw_height directly (morphology heights, α=1).
-    auto assign_biz = [&]() -> int {
-        for (auto& b : blocks)
-            if (b.usage == BUSINESS) b.usage = RES_HIGH;
-        int nb = 0;
-        for (int iter = 0; iter < 200; ++iter) {
-            double pop_est = 0, biz_fa = 0;
-            for (auto& b : blocks) {
-                double h = max(CELL, min(b.raw_height, (double)b.max_height_cells*CELL));
-                if (b.usage == PARK)     { continue; }
-                if (b.usage == BUSINESS) { biz_fa += b.footprint_m2*(h/BIZ_FLOOR_H); continue; }
-                double fh = RES_FLOOR_H, nf = h/fh;
-                Usage eu = b.usage; double efp = b.footprint_m2;
-                if (eu==RES_HIGH && (int)std::round(nf) <= RES_LOW_MAX_FLOORS)
-                    { eu=RES_LOW; efp *= RES_LOW_COVERAGE/cov; }
-                pop_est += residents_per_m2(eu)*efp*nf;
-            }
-            double biz_needed = pop_est * LABOR_RATE * BIZ_AREA_PW;
-            if (biz_fa >= biz_needed*0.95) break;
-            bool ok = false;
-            for (int k = 0; k < N; ++k) {
-                int idx = order[k];
-                if (blocks[idx].usage != RES_HIGH) continue;
-                blocks[idx].usage = BUSINESS; nb++; ok = true; break;
-            }
-            if (!ok) break;
+    // Steps C-G depend on the heights. rev 8 runs them once on the density-field heights.
+    // rev 9 runs them as a function of a common height scale s and picks s so the total
+    // floor area houses the fixed population (residents at RES_AREA_PP + workers at
+    // BIZ_AREA_PW), each building capped by min(slenderness, h_max): heights are then as tall
+    // as the population demands, and the design knobs set only their distribution.
+    const bool v9 = p.rev >= 9;
+    const std::vector<Block> blocks0 = blocks;
+    auto build_at = [&](double s) {
+        blocks = blocks0;
+        if (v9) for (auto& b : blocks) {
+            b.raw_height *= s;
+            if (p.h_max > 0) b.max_height_cells = min(b.max_height_cells, max(1, (int)std::floor(p.h_max / CELL + 1e-9)));
         }
-        return nb;
+        // ── Step C: Reset all to RES_HIGH, place parks, then assign business ─
+
+        for (auto& b : blocks) b.usage = RES_HIGH;
+
+        // ── Step D: Business assignment — single pass at α=1 ─────────────────
+        // Iteratively converts the nearest-Φ RES_HIGH block to BUSINESS until the
+        // employment constraint (workers = pop·LABOR_RATE, area per worker = BIZ_AREA_PW)
+        // is satisfied at ≥95%. Uses raw_height directly (morphology heights, α=1).
+        auto assign_biz = [&]() -> int {
+            for (auto& b : blocks)
+                if (b.usage == BUSINESS) b.usage = RES_HIGH;
+            int nb = 0;
+            for (int iter = 0; iter < 200; ++iter) {
+                double pop_est = 0, biz_fa = 0;
+                for (auto& b : blocks) {
+                    double h = max(CELL, min(b.raw_height, (double)b.max_height_cells*CELL));
+                    if (b.usage == PARK)     { continue; }
+                    if (b.usage == BUSINESS) { biz_fa += b.footprint_m2*(h/BIZ_FLOOR_H); continue; }
+                    double fh = RES_FLOOR_H, nf = h/fh;
+                    Usage eu = b.usage; double efp = b.footprint_m2;
+                    if (!v9 && eu==RES_HIGH && (int)std::round(nf) <= RES_LOW_MAX_FLOORS)
+                        { eu=RES_LOW; efp *= RES_LOW_COVERAGE/cov; }
+                    pop_est += residents_per_m2(eu)*efp*nf;
+                }
+                double biz_needed = pop_est * LABOR_RATE * BIZ_AREA_PW;
+                if (biz_fa >= biz_needed*0.95) break;
+                bool ok = false;
+                for (int k = 0; k < N; ++k) {
+                    int idx = order[k];
+                    if (blocks[idx].usage != RES_HIGH) continue;
+                    blocks[idx].usage = BUSINESS; nb++; ok = true; break;
+                }
+                if (!ok) break;
+            }
+            return nb;
+        };
+        assign_biz();
+
+        // ── Step E: Park placement — same designed field + scatter as business ─
+        // Parks are ranked on Φ_park (radial/centrality + gradient + twin-peak +
+        // corridor) and filled with the shared scatter_order():
+        //   park_scatter=0 → one contiguous green mass at the Φ_park minimum;
+        //   park_scatter=1 → maximin-dispersed pocket parks.
+        // A tiny deterministic jitter breaks ties on flat fields so an unstructured
+        // (Φ_park≈const) dispersal stays non-degenerate.
+        {
+            std::vector<double> phi_park_v(N);
+            for (int i = 0; i < N; ++i)
+                phi_park_v[i] = (mzp.dens_enable
+                                 ? (emp_field[i] + res_field[i])   // parks in low-intensity valleys
+                                 : mzp.rd_enable
+                                 ? rd_block[i]     // parks prefer the RD valleys (low v)
+                                 : phi_park(blocks[i].center_x, blocks[i].center_y,
+                                            cx, cy, cw, ch, mzp))
+                              + 1e-3*hash01(blocks[i].grid_ix, blocks[i].grid_iy);
+
+            std::vector<int> pool;
+            for (int i = 0; i < N; ++i)
+                if (blocks[i].usage == RES_HIGH || blocks[i].usage == RES_LOW)
+                    pool.push_back(i);
+            int M = (int)pool.size();
+            int np = min(n_park, M);
+
+            std::vector<int> park_order = scatter_order(px, py, phi_park_v, pool,
+                                                        mzp.park_scatter, d_scale);
+            for (int k = 0; k < np && k < (int)park_order.size(); ++k)
+                blocks[park_order[k]].usage = PARK;
+        }
+
+        // Fix park footprints (fill full block, no setback — same as generate() Step 5)
+        for (auto& b : blocks) if (b.usage == PARK) {
+            b.x0=b.bx0; b.y0=b.by0; b.x1=b.bx1; b.y1=b.by1;
+            b.footprint_m2 = (double)(b.x1-b.x0)*(b.y1-b.y0)*CELL*CELL;
+        }
+
+        // ── Step F: Re-run business assignment after parks are placed ─────────
+        // Parks now excluded from the pool, so business fills remaining blocks in Φ order.
+        assign_biz();
+
+        // ── Step G: Snap heights → floors, RES_LOW reclassification ─────────
+        // (mirrors generate() Step 8 exactly)
+        double rn = max(0.0, min(0.8, p.roughness));
+        for (int ki = 0; ki < N; ++ki) {
+            auto& b = blocks[ki];
+            if (b.usage == PARK) {
+                b.height_cells = max(1,(int)std::round(PARK_CANOPY_H/CELL));
+                b.n_floors=0; b.eff_pop=0; b.empl_cap=0; b.eff_inh=0;
+            } else {
+                const double xi = v9 ? pos_noise(b.center_x - cx, b.center_y - cy) : block_noise(ki);
+                double raw_h = b.raw_height * exp(ROUGH_GAIN*rn*xi);
+                raw_h = max(CELL, min(raw_h, (double)b.max_height_cells*CELL));
+                double fh = (b.usage==BUSINESS) ? BIZ_FLOOR_H : RES_FLOOR_H;
+                b.n_floors = max(1,(int)std::round(raw_h/fh));
+                if (v9) b.n_floors = min(b.n_floors, max(1, (int)std::floor(b.max_height_cells*CELL/fh + 1e-9)));
+                if (!v9 && b.usage==RES_HIGH && b.n_floors<=RES_LOW_MAX_FLOORS) {
+                    b.usage = RES_LOW;
+                    double scale = sqrt(RES_LOW_COVERAGE/cov);
+                    int cw_b=b.x1-b.x0, cd_b=b.y1-b.y0;
+                    int nw=max(2,(int)(cw_b*scale)), nd=max(2,(int)(cd_b*scale));
+                    int ccx=(b.x0+b.x1)/2, ccy=(b.y0+b.y1)/2;
+                    b.x0=ccx-nw/2; b.x1=b.x0+nw;
+                    b.y0=ccy-nd/2; b.y1=b.y0+nd;
+                    b.footprint_m2=(double)(b.x1-b.x0)*(b.y1-b.y0)*CELL*CELL;
+                    int md_lo=min(b.x1-b.x0,b.y1-b.y0);
+                    b.max_height_cells=(int)(SLENDERNESS*md_lo);
+                }
+                double phys_h = b.n_floors*fh;
+                b.height_cells = max(1,(int)std::round(phys_h/CELL));
+                b.height_cells = min(b.height_cells, b.max_height_cells);
+                double fa = b.footprint_m2*b.n_floors;
+                b.eff_pop   = residents_per_m2(b.usage)*fa;
+                b.empl_cap  = workers_per_m2(b.usage)*fa;
+                b.eff_inh   = 0;
+            }
+        }
     };
-    assign_biz();
-
-    // ── Step E: Park placement — same designed field + scatter as business ─
-    // Parks are ranked on Φ_park (radial/centrality + gradient + twin-peak +
-    // corridor) and filled with the shared scatter_order():
-    //   park_scatter=0 → one contiguous green mass at the Φ_park minimum;
-    //   park_scatter=1 → maximin-dispersed pocket parks.
-    // A tiny deterministic jitter breaks ties on flat fields so an unstructured
-    // (Φ_park≈const) dispersal stays non-degenerate.
-    {
-        std::vector<double> phi_park_v(N);
-        for (int i = 0; i < N; ++i)
-            phi_park_v[i] = (mzp.dens_enable
-                             ? (emp_field[i] + res_field[i])   // parks in low-intensity valleys
-                             : mzp.rd_enable
-                             ? rd_block[i]     // parks prefer the RD valleys (low v)
-                             : phi_park(blocks[i].center_x, blocks[i].center_y,
-                                        cx, cy, cw, ch, mzp))
-                          + 1e-3*hash01(blocks[i].grid_ix, blocks[i].grid_iy);
-
-        std::vector<int> pool;
-        for (int i = 0; i < N; ++i)
-            if (blocks[i].usage == RES_HIGH || blocks[i].usage == RES_LOW)
-                pool.push_back(i);
-        int M = (int)pool.size();
-        int np = min(n_park, M);
-
-        std::vector<int> park_order = scatter_order(px, py, phi_park_v, pool,
-                                                    mzp.park_scatter, d_scale);
-        for (int k = 0; k < np && k < (int)park_order.size(); ++k)
-            blocks[park_order[k]].usage = PARK;
-    }
-
-    // Fix park footprints (fill full block, no setback — same as generate() Step 5)
-    for (auto& b : blocks) if (b.usage == PARK) {
-        b.x0=b.bx0; b.y0=b.by0; b.x1=b.bx1; b.y1=b.by1;
-        b.footprint_m2 = (double)(b.x1-b.x0)*(b.y1-b.y0)*CELL*CELL;
-    }
-
-    // ── Step F: Re-run business assignment after parks are placed ─────────
-    // Parks now excluded from the pool, so business fills remaining blocks in Φ order.
-    assign_biz();
-
-    // ── Step G: Snap heights → floors, RES_LOW reclassification ─────────
-    // (mirrors generate() Step 8 exactly)
-    double rn = max(0.0, min(0.8, p.roughness));
-    for (int ki = 0; ki < N; ++ki) {
-        auto& b = blocks[ki];
-        if (b.usage == PARK) {
-            b.height_cells = max(1,(int)std::round(PARK_CANOPY_H/CELL));
-            b.n_floors=0; b.eff_pop=0; b.empl_cap=0; b.eff_inh=0;
-        } else {
-            double raw_h = b.raw_height * exp(ROUGH_GAIN*rn*block_noise(ki));
-            raw_h = max(CELL, min(raw_h, (double)b.max_height_cells*CELL));
-            double fh = (b.usage==BUSINESS) ? BIZ_FLOOR_H : RES_FLOOR_H;
-            b.n_floors = max(1,(int)std::round(raw_h/fh));
-            if (b.usage==RES_HIGH && b.n_floors<=RES_LOW_MAX_FLOORS) {
-                b.usage = RES_LOW;
-                double scale = sqrt(RES_LOW_COVERAGE/cov);
-                int cw_b=b.x1-b.x0, cd_b=b.y1-b.y0;
-                int nw=max(2,(int)(cw_b*scale)), nd=max(2,(int)(cd_b*scale));
-                int ccx=(b.x0+b.x1)/2, ccy=(b.y0+b.y1)/2;
-                b.x0=ccx-nw/2; b.x1=b.x0+nw;
-                b.y0=ccy-nd/2; b.y1=b.y0+nd;
-                b.footprint_m2=(double)(b.x1-b.x0)*(b.y1-b.y0)*CELL*CELL;
-                int md_lo=min(b.x1-b.x0,b.y1-b.y0);
-                b.max_height_cells=(int)(SLENDERNESS*md_lo);
-            }
-            double phys_h = b.n_floors*fh;
-            b.height_cells = max(1,(int)std::round(phys_h/CELL));
-            b.height_cells = min(b.height_cells, b.max_height_cells);
-            double fa = b.footprint_m2*b.n_floors;
-            b.eff_pop   = residents_per_m2(b.usage)*fa;
-            b.empl_cap  = workers_per_m2(b.usage)*fa;
-            b.eff_inh   = 0;
+    auto floor_area = [&] { double g = 0; for (auto& b : blocks) if (b.usage != PARK) g += b.footprint_m2 * b.n_floors; return g; };
+    if (!v9) build_at(1.0);
+    else {
+        const double P = max(0.0, p.population_total);
+        const double target = P * RES_AREA_PP + P * LABOR_RATE * BIZ_AREA_PW;
+        double lo = 0.02, hi = 50.0, sBest = hi, gBest = 0;
+        build_at(hi); const double gMax = floor_area();
+        if (gMax < target) { r.feasible = false; sBest = hi; }
+        else for (int it = 0; it < 60; ++it) {                    // bisection in log s
+            const double s = std::sqrt(lo * hi);
+            build_at(s); const double g = floor_area();
+            if (g >= target) { hi = s; sBest = s; gBest = g; } else lo = s;
+            if (hi / lo < 1.0005 || (g >= target && g < 1.003 * target)) break;
         }
+        build_at(sBest);
+        r.height_scale = sBest; r.gfa_m2 = floor_area(); r.gfa_target_m2 = target;
+        (void)gBest;
     }
 
     // ── Step H: Employment balance + dasymetric population ───────────────

@@ -70,6 +70,9 @@ def parse_city():
 M = read_meta(os.path.join(OUT, "meta.txt"))
 NX, NY, NZ, DX, TYPE = read_u8_grid(os.path.join(OUT, "geom_type.u8"))
 U_INLET = float(M.get("U_inlet_ms", [4.0])[0]); V2MS = U_INLET / U_LB      # lattice velocity -> m/s
+# urban_flow (OpenLB) writes umean_full.f32 already in m/s and says so in meta.txt;
+# forward_city's lattice-unit fields keep the conversion above.
+if M.get("velocity_units", ["lattice"])[0] == "ms": V2MS = 1.0
 zped = max(1, min(NZ-1, int(round(2.0/DX))))
 EXT = [0, NX*DX, 0, NY*DX]
 
@@ -129,7 +132,11 @@ def three_time_maps(prefix, title, cmap_name, out):
 
 def exposure_graph():
     if TS is None: print("[viz] no exposure_timeseries.csv — skipping exposure graph"); return
-    t = np.atleast_1d(TS["t_s"]); cum = np.atleast_1d(TS["cumulative_dose"]); rate = np.atleast_1d(TS["exposure_rate"])
+    t = np.atleast_1d(TS["t_s"])
+    if "cumulative_dose" in TS.dtype.names:                     # forward_city schema
+        cum = np.atleast_1d(TS["cumulative_dose"]); rate = np.atleast_1d(TS["exposure_rate"])
+    else:                                                       # urban_flow: J(t) = <w,Θ(t)>/M
+        cum = np.atleast_1d(TS["J"]); rate = np.gradient(cum, t) if len(t) > 1 else np.zeros_like(cum)
     fig, ax1 = plt.subplots(figsize=(9, 5.2))
     ax1.plot(t, cum, "-", color="#1f3a93", lw=2.2, label="cumulative dose ⟨w,∫C dt⟩")
     ax1.set_xlabel("time since release [s]"); ax1.set_ylabel("cumulative population dose", color="#1f3a93")
