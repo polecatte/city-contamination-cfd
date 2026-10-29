@@ -2,7 +2,9 @@
 # lab_openlb.sh — run the OpenLB port's gates and production city on the lab box.
 #
 #   ./lab_openlb.sh setup     # fetch + build OpenLB 1.8.1 (OpenMP), build the app and tools
-#   ./lab_openlb.sh gates     # 5, 6a, 6b (dx=4 and dx=2), 7a/7b/7c  — ~3-4 h on 32 cores
+#   ./lab_openlb.sh gates     # 5, 6a, 6b (dx=4 and dx=2), 7a/7b/7c, plume  — ~3-4 h on 32 cores
+#   [GPU=1] ./lab_openlb.sh plume   # only the scalar plume test (exact point-source solution)
+#   MUST_DIR=~/must [GPU=1] ./lab_openlb.sh must   # MUST container array vs measured data (do_must)
 #   ./lab_openlb.sh city      # production city, two inlet seeds, to 99 % clearance
 #   ./lab_openlb.sh package   # summary.txt + tarball of logs and small outputs
 #   ./lab_openlb.sh all       # the four above, in order
@@ -140,7 +142,7 @@ gate() {
   local rc=0
   ( cd "$WORK" && "$@" ) > "$WORK/logs/$name.log" 2>&1 || rc=$?
   if [ $rc -eq 0 ]; then note "PASS $name"; else note "FAIL $name (exit $rc)"; fi
-  grep -E '^\[(6a|6b|7a|7c|8|J)\]|GATE|PASS|FAIL' "$WORK/logs/$name.log" | tail -8 | sed 's/^/     /' || true
+  grep -E '^\[(6a|6b|7a|7c|8|J|plume)\]|GATE|PASS|FAIL' "$WORK/logs/$name.log" | tail -8 | sed 's/^/     /' || true
   mark "$name"
 }
 
@@ -246,6 +248,37 @@ do_precision() {
     done
   done
   python3 "$REPO/tests/precision_report.py" "$M" | tee "$WORK_CPU/precision_report_$MODEL.txt"
+}
+
+# MUST (Mock Urban Setting Test) container array against measured data: needs MUST_DIR with
+#   containers.txt   one container per line: xc yc length width height angle_deg (m; OBST_FILE)
+#   must.env         shell assignments for the case, e.g. OBST_ROT (= minus the direction the wind
+#                    blows toward in the data's frame), DX (0.5 m: H/dx 5; 0.25 m for H/dx 10 needs
+#                    a large GPU), U_INLET, ABL_ZREF, ABL_Z0, ABL_LTURB, SRC_X SRC_Y SRC_Z (m),
+#                    MUST_UREF_POINT x,y,z + MUST_UREF_OBS (velocity normalisation), MUST_CREF_U
+#                    (+ MUST_H) for C* = c U H^2 / Q
+#   obs_flow.csv     x,y,z,u[,v,w]   obs_conc.csv   x,y,z,c (C*)       (tests/must_score.py)
+# Runs the geometry, MUST_SEEDS inlet seeds (time mean over MUST_AVG_FT flow-throughs, then the
+# puff), and scores velocity (hit rate) and concentration (FB, NMSE, FAC2, NAD).
+do_must() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  local D="${MUST_DIR:-}" s args=()
+  [ -n "$D" ] && [ -f "$D/containers.txt" ] || { echo "set MUST_DIR to a folder with containers.txt, must.env, obs_flow.csv / obs_conc.csv (see do_must)"; exit 1; }
+  D="$(cd "$D" && pwd)"
+  # shellcheck disable=SC1091
+  [ -f "$D/must.env" ] && { set -a; . "$D/must.env"; set +a; }
+  step geom_must sh -c "CASE=obstacles OBST_FILE='$D/containers.txt' OUT_DIR=geom_must ./gen_gate6_geom"
+  for s in ${MUST_SEEDS:-1000 2000}; do
+    need_space "$WORK" 2 "a MUST run"
+    step "must_s$s" sh -c "STEP4=1 ABL_SEED=$s GEOM_DIR=geom_must OUT_DIR=must_s$s SPINUP_FT=${MUST_SPIN_FT:-4} AVG_FT=${MUST_AVG_FT:-2} D_LOCAL=1 TAIL=1 CHECK_EVERY=2000 TS_EVERY=1000 '$BIN' > must_s$s.log 2>&1"
+    rm -f "$WORK/must_s$s/umean_full.f32"
+  done
+  [ -f "$D/obs_flow.csv" ] && args+=(--flow "$D/obs_flow.csv")
+  [ -n "${MUST_UREF_POINT:-}" ] && args+=("--uref-point=$MUST_UREF_POINT" --uref-obs "${MUST_UREF_OBS:?MUST_UREF_OBS}")
+  [ -f "$D/obs_conc.csv" ] && args+=(--conc "$D/obs_conc.csv" --uref "${MUST_CREF_U:?MUST_CREF_U (U_ref of C*)}")
+  [ -n "${MUST_H:-}" ] && args+=(--H "$MUST_H")
+  local runs=(); for s in ${MUST_SEEDS:-1000 2000}; do runs+=("must_s$s"); done
+  gate must python3 "$REPO/tests/must_score.py" geom_must "${runs[@]}" "${args[@]}"
 }
 
 # A small city through the whole pipeline (geometry -> live flow -> burst to 99 % clearance ->
@@ -474,7 +507,7 @@ do_send() {
       for f in "$d"/logs/*.log; do
         [ -f "$f" ] || continue
         case "$(basename "$f")" in build_*|olb_core_*|olb_external*|olb_config*|cuda_install*) continue ;; esac
-        lines=$(grep -E '^\[(6a|6b|7a|7b|7c|8|J|wake|parity|rank|tail|orient|synth|wind|opt|verify)\]|GATE|PASS|FAIL|Xr/H|drift|closure|DIVERG|error:|fatal' "$f" | tail -8)
+        lines=$(grep -E '^\[(6a|6b|7a|7b|7c|8|J|wake|parity|rank|tail|orient|synth|wind|opt|verify|plume|must)\]|GATE|PASS|FAIL|Xr/H|drift|closure|DIVERG|error:|fatal' "$f" | tail -8)
         [ -n "$lines" ] && { echo "-- $(basename "$f" .log)"; echo "$lines"; }
       done
       # a step that failed: its log's last lines (the step's own FAIL report)
@@ -544,11 +577,11 @@ do_clean() {
 
 # the gates' deciding numbers, CPU next to GPU
 do_compare() {
-  for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b gate8 wake showcase parity; do
+  for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b plume plume_prodD gate8 wake showcase parity; do
     for side in cpu gpu hrr gpu/hrr gpu_sp gpu_sp/hrr; do
       local L="$WORK_CPU/$side/logs/$g.log"; [ $side = cpu ] && L="$WORK_CPU/logs/$g.log"
       [ -f "$L" ] || continue
-      grep -E '^\[(6a|6b|7a|7c|7b|8|J|wake)\]|drift|Xr/H|closure|PASS|FAIL' "$L" | tail -6 | sed "s/^/$g $side: /"
+      grep -E '^\[(6a|6b|7a|7c|7b|8|J|wake|plume)\]|drift|Xr/H|closure|PASS|FAIL' "$L" | tail -6 | sed "s/^/$g $side: /"
     done
   done
   grep -H -E 'MLUPs :' "$WORK_CPU"/out_*.log "$WORK_CPU"/gpu/out_*.log "$WORK_CPU"/hrr/out_*.log "$WORK_CPU"/gpu/hrr/out_*.log \
@@ -663,6 +696,22 @@ do_gates() {
   gate gate7c sh -c "env $B CLEAR_FRAC=0.001 MAX_BURST_STEPS=9000 VD_SCALE=0 OUT_DIR=out_7c '$BIN' > out_7c.log 2>&1;
     python3 '$P/gate7_check.py' nodep out_7c"
   gate gate7b sh -c "env $B CLEAR_FRAC=0 MAX_BURST_STEPS=2400 VD_SCALE=10 ./linearity_guard --run '$BIN' geom_box lin7b"
+  do_plume
+}
+
+# Scalar transport against the exact point-source solution (tests/plume_check.py): an empty box,
+# frozen uniform 4 m/s wind, a 2 s puff from one cell 32 m up, no deposition, to 99.9 % clearance.
+# Theta of a puff is the steady field of a continuous source, known exactly for constant D. Two
+# diffusivities: resolved (D_EFF 4 m^2/s, cell Peclet 4, strict band) and the constant production
+# D (NU_EFF/Sc_t, cell Peclet ~13, loose band). Runs with the gates; seconds on a GPU.
+do_plume() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  local P="$REPO/tests" R="STEP4=1 STEP4_UNIFORM_U=4 VD_SCALE=0 SRC_CELLS=10,24,8 CLEAR_FRAC=0.001 MAX_BURST_STEPS=20000 TS_EVERY=100000 GEOM_DIR=geom_plume"
+  step geom_plume sh -c "CASE=box NX=120 NY=48 NZ=32 DEP_VD=0 OUT_DIR=geom_plume ./gen_gate6_geom"
+  gate plume sh -c "env $R D_EFF=4 OUT_DIR=out_plume '$BIN' > out_plume.log 2>&1;
+    python3 '$P/plume_check.py' geom_plume out_plume --src 10,24,8 --U 4 --band strict"
+  gate plume_prodD sh -c "env $R OUT_DIR=out_plume_prodD '$BIN' > out_plume_prodD.log 2>&1;
+    python3 '$P/plume_check.py' geom_plume out_plume_prodD --src 10,24,8 --U 4 --band loose"
 }
 
 do_city() {
@@ -721,6 +770,8 @@ case "${1:-status}" in
   speed)   do_speed ;;
   precision) do_precision ;;
   showcase) do_showcase ;;
+  plume)   do_plume ;;
+  must)    do_must ;;
   frames)  do_frames ;;
   cube_sens) do_cube_sens ;;
   cube_dx1) do_cube_dx1 ;;
