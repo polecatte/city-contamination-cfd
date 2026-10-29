@@ -73,8 +73,17 @@ Fixed scenario: 600 m × 600 m city, 20 000 people, 0.47 of them working in the 
 
 ## 4. Surrogate and search (`opt/driver.py`, BoTorch 0.18.1)
 
-- **One run = one (design, direction, inlet seed).** The seed's scatter (≈ 0.5 % in iF) is the
-  GP's noise.
+- **One run = one (design, direction, inlet seed).** The seed's scatter is the GP's noise:
+  measured 0.44 % (CPU) and 0.51 % (GPU) as max |J − mean|/mean over two seeds on the production
+  city (gate 8), i.e. a per-run σ of ~0.6–0.7 %. The likelihood's noise is floored there
+  (`SEED_NOISE_REL`, default 0.006, as a variance relative to the outcomes' spread), so the GP
+  cannot explain seed scatter as design signal however few runs it has.
+- **Rejected runs.** A finished run must pass `evaluate.run_checks` before it reaches the GP: J
+  finite and positive, mass budget closed to 1 %, the burst cleared (or capped with a tail fit
+  ≤ 15 % of J), any applied tail ≤ 15 % of J. A rejected run stays in `history.jsonl` with its
+  reasons (`valid: false`, raw J kept) and out of the fit; three in a row stop the search, since
+  that is a systematic fault, not bad luck. `verify` re-runs a rejected direction with a new
+  seed, up to three times.
 - **GP over (design, direction).**
   - k = k_d + k_d′·k_θ: Matérn-5/2 on the continuous knobs × a categorical kernel on emp_centers;
     periodic in the direction.
@@ -110,6 +119,7 @@ so other wind roses can be applied afterwards.
 | `tests/orient_check.py` | ORIENT exact, oblique faces | 7 orientations cell-for-cell exact; faces right at 0 / 22.5 / 45° |
 | `tests/builder_survey.py` | feasibility, height distribution, smoothness | 0 % infeasible; sweeps monotone apart from one-cell steps |
 | `tests/tail_replay.cpp` | early stop + tail vs a 0.1 % run | −0.04 % at 5 % |
+| `tests/test_run_checks.py` | run checks on meta_flow.txt; rejected runs in the driver | 18 checks pass |
 | oblique smoke run (22.5°, dx 8, small city) | stability, 4-face mass budget, in-solver tail | closure 3e-15; tail = fit prediction |
 
 ## 7. Weak points (status)

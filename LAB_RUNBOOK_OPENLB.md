@@ -17,7 +17,7 @@ far (4-core cloud box): `OPENLB_PHASE5_6_GATES.md`.
 
 ```bash
 git clone https://github.com/polecatte/city-contamination-cfd.git && cd city-contamination-cfd
-git checkout claude/gracious-lovelace-3wlllj
+git checkout claude/elegant-goodall-x5243h     # since 2026-10-29 (was claude/gracious-lovelace-3wlllj)
 ```
 
 ## 2. Run
@@ -57,8 +57,12 @@ time series, metadata, figures — not the large fields). That file is all I nee
 
 ## 5. Reading the summary
 
-- **gate5, gate6a, gate7a/b/c** passed here at the same operating point; a FAIL on the lab box
-  is an environment difference worth chasing before anything else.
+- **gate5, gate7a/b/c** passed here at the same operating point; a FAIL on the lab box is an
+  environment difference worth chasing before anything else.
+- **gate6a** decides at the production city face, 500 m downstream of the inlet (the guideline
+  domain's 5 H_REF buffer; `CITY_FACE_M` overrides), where the lab runs drift ~4–5 %. The compact
+  domain's 40 m face is still printed, with a warning when it is over 10 % (10.9 % on the lab):
+  runs made with `DOMAIN=compact` meet a distorted inflow.
 - **gate6b_dx4** is expected to FAIL (Xr/H ≈ 2.6 here). **gate6b_dx2** is the open question:
   Xr/H moving into 1.4–1.8 (or clearly toward it) confirms resolution as the cause.
 - **wake** checks the new 15 H downstream buffer: < 2 % reversed near-ground flow over the last
@@ -92,7 +96,8 @@ GPU=1 ./lab_openlb.sh city               # the production city, two seeds
 - **nvcc.** OpenLB 1.8 does not compile with CUDA 12.0 (Ubuntu 24.04's `nvidia-cuda-toolkit`):
   `fields.h(36): call to consteval function std::source_location::current…`. Setup uses `$NVCC`,
   else `nvcc` on PATH if ≥ 12.4, else installs CUDA 12.6 from conda-forge with micromamba (no
-  root, ~1 GB). The build is double precision, `CUDA_ARCH` from `nvidia-smi` (A4000 = 86).
+  root, ~1 GB). The build is double precision (`PRECISION=single`: a float build in its own
+  tree, §10), `CUDA_ARCH` from `nvidia-smi` (A4000 = 86).
 - **parity** must say `[parity] ALL PASS` before the gate numbers mean anything. It runs each
   case with the CPU binary and the GPU binary and compares every output. `box7` (frozen wind,
   linear) must agree to 1e-9; the three flow cases to 1e-4 (GPU rounding differs and the flow
@@ -126,7 +131,7 @@ GPU=1 ./lab_openlb.sh cube_dx1    # H100 only (>= 60 GB): the dx=1 m cube, 89 M 
 **On a different machine (the H100):** the GPU mode needs the CPU tree as the parity reference
 and for the geometries, so there:
 ```bash
-git clone -b claude/gracious-lovelace-3wlllj https://github.com/polecatte/city-contamination-cfd.git && cd city-contamination-cfd
+git clone -b claude/elegant-goodall-x5243h https://github.com/polecatte/city-contamination-cfd.git && cd city-contamination-cfd
 ./lab_openlb.sh setup                        # CPU build + geometries (~15 min)
 GPU=1 ./lab_openlb.sh setup                  # CUDA_ARCH 90 read from nvidia-smi
 GPU=1 ./lab_openlb.sh parity                 # must say ALL PASS on this GPU too
@@ -192,3 +197,61 @@ tmux new -s cpu '~/cfd_gpu/lab_openlb.sh pathways; \
 The ranking runs use the current BGK model (MODEL default) because HRR is not validated yet;
 the CPU queue's cube runs say whether HRR fixes the wake. Detach from tmux with Ctrl-b d,
 reattach with `tmux attach -t gpu`. Progress: `ls ~/olb_lab/gpu/done | grep -c rank_quick`.
+
+## 10. GPU speed-up, float build, plume and MUST (2026-10-29)
+
+What changed and why: `OPENLB_PHASE8_GPU.md` §6. The lab repo has to move to the branch that
+now carries everything (it holds the OpenLB pipeline merged with the forward_city work):
+
+```bash
+cd ~/cfd_gpu && git fetch origin && git checkout claude/elegant-goodall-x5243h && git pull
+```
+
+Then, in this order (each line resumable; `send` at any point collects what has run):
+
+```bash
+L=~/cfd_gpu/lab_openlb.sh
+$L setup                                   # rebuilds the CPU app (OpenLB core kept), ~5 min
+$L parity_cpu                              # CPU operators vs host loops: must be bitwise (~10 min)
+GPU=1 $L setup                             # rebuilds the GPU app (double)
+GPU=1 $L parity                            # GPU vs CPU: must say [parity] ALL PASS (~15 min)
+GPU=1 $L speed                             # double: MLUPS, burst ms/step, stage split (~10 min)
+GPU=1 PRECISION=single $L setup            # float tree under ~/olb_lab/gpu_sp, ~20 min (OpenLB core in float)
+GPU=1 PRECISION=single $L speed            # float: the same numbers
+GPU=1 PRECISION=single $L gates            # 5, 6a, 6b dx4/dx2, 7a/b/c, plume, in float
+GPU=1 $L precision                         # float vs double: 3 designs x (2 double seeds + 1 float), dx 8: a few hours
+GPU=1 $L plume                             # the plume test on the double build too (minutes)
+$L send
+```
+
+- **A compile error** in either GPU build shows in `send` under `build_app` (the code was not
+  compiled in the cloud container; this is its first compile). Send it as is.
+- **parity_cpu / parity** first: the WALE stencil is now chosen at start-up rather than every
+  step (must be bitwise on CPU), and WALE's powers go through sqrt (round-off; parity
+  tolerances unchanged).
+- **speed** prints `spin-up: … MLUPS` and `burst: … ms/step` and, per stage, ms/step and share.
+  The double build is expected near the ~100 MLUPS of October; the float build several times
+  that if the step was FP64-bound as analysed. The stage split says what to optimise next.
+- **precision** prints a table per run (iF, budget closure, stop, ms/step) and the verdict:
+  each design's float−double difference against the double build's own seed-to-seed noise,
+  the mean offset, the ranking, the wall-time speed-up. Use the float build for production
+  only if it says `PRECISION PASS` *and* the float gates match the double ones (6a/6b within
+  their seed spread, 7a/b/c and plume pass).
+- **plume** (also inside `gates`): a one-cell puff in a frozen 4 m/s wind against the exact
+  point-source solution. `mass` is 1.000 if transport conserves mass; `sigma_y/z` within 5 %
+  says the lattice applies the diffusivity it is told; `centre` is worst next to the source.
+  The production-D case uses wider bands (cell Péclet 13).
+- **FRESH=1** reruns gates already marked done, e.g. `FRESH=1 GPU=1 $L gates` after a code
+  change; the long city and ranking steps keep their markers (delete those by hand).
+- **MODEL=hrr** works with all of the above (`MODEL=hrr GPU=1 PRECISION=single $L setup`, …).
+
+**MUST** (Mock Urban Setting Test, the COST 732 container-array case) is ready to run once the
+data is on the box: `MUST_DIR=~/must GPU=1 $L must`. The folder needs `containers.txt` (one
+container per line: `xc yc length width height angle_deg`, metres), `must.env` (the case:
+`OBST_ROT` = minus the direction the wind blows toward in the data's frame, `DX`, the inlet
+`U_INLET ABL_ZREF ABL_Z0 ABL_LTURB`, the source `SRC_X SRC_Y SRC_Z`, and the normalisations
+`MUST_UREF_POINT MUST_UREF_OBS MUST_CREF_U`) and `obs_flow.csv` (`x,y,z,u,v[,w]`) and/or
+`obs_conc.csv` (`x,y,z,c` as C* = cUH²/Q). Scored by `tests/must_score.py`: velocity hit rate
+(q ≥ 0.66, COST 732 / VDI 3783-9), concentration FB, NMSE, FAC2, NAD (Hanna & Chang 2012 urban
+acceptance). DX 0.5 m gives 5 cells per container height (~10 M cells, fine on the A4000 in
+float); 0.25 m (10 cells, the guideline) needs a large GPU.

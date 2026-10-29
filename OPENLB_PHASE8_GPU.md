@@ -1,9 +1,12 @@
 # OpenLB port — Phase 8: the GPU build
 
-Date: 2026-09-29. Branch `claude/gracious-lovelace-3wlllj`. Status: **compiles for CUDA and is
-verified on CPU; not yet run on a GPU** (the cloud container has none). The lab box's A4000 is
-the first GPU it will touch; `GPU=1 ./lab_openlb.sh parity` is the test that decides it
-(`LAB_RUNBOOK_OPENLB.md` §7).
+Date: 2026-09-29, updated 2026-10-29. Status: **runs on the lab's RTX A4000** (§5): gates 5, 6a,
+6b (dx 4 and 2), 7b, 8, the wake check and the production city ran on the GPU build with the
+same gate numbers as the CPU build, at ~100 MLUPS (BGK + WALE, double) against 11–19 MLUPS on
+the lab CPU. `GPU=1 ./lab_openlb.sh parity` has **not** been recorded yet and is the first thing
+to run on the current code (§6 changed the WALE arithmetic). §6 is the speed-up: an opt-in
+float lattice and exact reductions of the FP64 work, with the tests that decide whether the
+float build may be used.
 
 ## 1. What changed
 
@@ -96,8 +99,8 @@ a stale field, a missed cell, a wrong parameter — shows up as O(1e-2) or worse
    found`; `cuobjdump --list-elf` shows only an empty sm_52 image). It would fail at the first
    kernel launch. `olbconfig.sh gpu` adds `--generate-code=arch=compute_$(CUDA_ARCH),code=sm_$(CUDA_ARCH)`
    to `LDFLAGS`; `lab_openlb.sh` checks the built binary with `cuobjdump`.
-3. The `gpu_only.mk` template is single precision; set to double (the app computes in double
-   and the CPU reference is double).
+3. The `gpu_only.mk` template is single precision; `olbconfig.sh gpu` sets double by default
+   (the CPU reference is double), float with `PRECISION=single` (§6).
 4. A non-system CUDA gets an rpath, so the binary loads its own `libcudart`, not the distro's
    older one.
 5. A namespace-scope constant table (`RW_DH`) is host memory, unreadable in a kernel; replaced
@@ -116,3 +119,72 @@ must PASS on the GPU (it compares the device-computed gradient against OpenLB's 
 If parity passes, the GPU gates and city runs follow and `./lab_openlb.sh compare` puts their
 numbers next to the CPU ones; the turbulent statistics (6a drift, 6b Xr/H, gate 8 J) should
 agree within their seed-to-seed spread rather than bitwise.
+
+## 5. Lab results (2026-10, RTX A4000, double)
+
+| | CPU build (lab, OpenMP) | GPU build |
+|---|---|---|
+| 6a drift at the compact face (40 m) | 10.9 % | 10.9 % |
+| 6b Xr/H, dx 4 / dx 2 | 2.63 / 2.31 | 2.63 / 2.31 |
+| 8 seed spread of J | 0.44 % | 0.51 % |
+| wake reversed flow, last 15 % | 0.0 % | 0.0 % |
+| throughput (Timer, MLUPS) | 11–19 | 97–102 (HRR: 38–41) |
+
+Gate 6a is now decided at the production city face (500 m, `tests/gate6_analyze.py`), where the
+lab's runs drift ~4–5 %; the 40 m compact face is reported with a warning. The identical 6a/6b
+numbers are the time means of turbulent runs, so they are the strongest evidence so far that
+the device path is right; the parity test is still the one that checks it directly.
+
+## 6. Speed-up (2026-10-29)
+
+**Where the time goes.** The A4000 runs FP64 at 1/32 of its FP32 rate (~0.6 vs 19.2 TFLOPS)
+with 448 GB/s of memory bandwidth. A double D3Q19 step with WALE moves ~300 B per cell, which
+bandwidth alone would allow at ~1.5 GLUPS; 100 MLUPS means the step is bound by FP64
+arithmetic, not memory: per cell and step, three `pow` (each a log/exp pair) in the WALE
+viscosity, nine divisions and up to 30 neighbour mask reads in the gradient, and the inlet's
+100 RFG modes of sin/cos on the inlet plane. Six full-lattice passes per burst step (NSE
+collide+stream, WALE velocity, WALE gradient, coupling, AD collide+stream, Θ).
+
+**Changes** (all keep the double build's behaviour except where noted):
+
+1. *WALE gradient stencil decided once.* Which difference `WaleGradOp` takes along each axis
+   (8th-order, central, one-sided, zero) depends only on the static fluid flags, so
+   `DeviceNSE::init` decides it (`stencilRule`) and stores it in `UF_MASK` bits 8–16. The
+   operator reads one mask instead of up to 30 and each neighbour velocity once. Same branch,
+   same arithmetic: bitwise identical (the CPU STRICT parity test must stay at 0).
+2. *WALE powers through sqrt.* `x^2.5 = x² √x`, `x^1.25 = x √√x`, `x^1.5 = x √x` instead of
+   `pow`. Changes the results by round-off only: `tests/wale_verify/pow_sqrt_check.cpp`, 182 k
+   random gradients, ω_eff agrees to 3e-16 (double) and 1.6e-7 (float). Both paths share the
+   collision, so CPU parity is unaffected; the GPU-vs-CPU tolerances are unchanged.
+3. *Float lattice, opt-in.* `typedef FLOATING_POINT_TYPE T` (was `double`); `PRECISION=single
+   ./olbconfig.sh gpu`, or `GPU=1 PRECISION=single ./lab_openlb.sh setup`, builds a float tree
+   under `$WORK/gpu_sp`. Accuracy rests on OpenLB storing populations shifted by their weights
+   (f − t_i), which keeps a float lattice close to double (Lehmann et al. 2022, *Phys. Rev. E*
+   106, 015308). What must not be float stays double: Θ, deposition, the face fluxes and the
+   time-mean sums are `TYPED_FIELD_BASE<double>` fields (a float Θ would round away its ~1e5
+   small increments), and every host sum is double. The scalar is resolved to ~1e-7 absolute
+   in float (C = Σf̃ + 1), so Q_RATE stays ~1 (J does not depend on it; a warning fires below
+   0.1). Default stays double: the CPU reference and the parity test are double.
+4. *Measurement.* `STAGE_TIMING=1` prints wall time per stage (device synchronised around each);
+   every run prints spin-up MLUPS and burst ms/step and writes `precision`, `spinup_wall_s`,
+   `burst_wall_s` to its meta files. `lab_openlb.sh speed` runs 2000 + 2000 steps of the
+   production city with stage timing, per build.
+
+**Not done, deliberately.** Per-field host pulls at report steps: the populations live in the
+descriptor's own storage, which a per-field context switch can silently skip, so reports keep
+the whole-lattice pull (one per 100 burst steps, `CLEAR_EVERY`); `speed` shows its share.
+Fusing the WALE velocity pass into the coupling would save one pass in the burst but lags the
+gradient by a step on the inlet plane; worth it only if `speed` says that pass matters.
+
+**What decides whether the float build is used** (`LAB_RUNBOOK_OPENLB.md`):
+- `GPU=1 ./lab_openlb.sh parity` (double) — the device path, after changes 1–2.
+- `GPU=1 PRECISION=single ./lab_openlb.sh gates` — 5, 6a, 6b, 7a/b/c and the plume test in float.
+- `GPU=1 ./lab_openlb.sh precision` — three designs at dx 8: double at two inlet seeds, float at
+  one. A float run is another turbulent realisation after a few flow-throughs, so it is judged
+  against the double build's own seed noise: each design within 3√2 σ, no systematic offset
+  beyond 2√2 σ/√n, float budget closure < 1e-3 (`tests/precision_report.py`). It also prints
+  the speed-up per design.
+- `speed` for both builds.
+
+None of this was compiled here (no OpenLB build in the cloud container); the lab build is the
+compile check, and `send` collects the build errors if there are any.

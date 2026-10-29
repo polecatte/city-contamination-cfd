@@ -1,5 +1,20 @@
 # OpenLB port — status audit & lab-machine verification plan
 
+> **Update 2026-10-29: the three silent defects S1–S3 (§2.2) are fixed**, and each now has a
+> test that would catch it coming back:
+> - **S1** (`getOrigin()` in metres): every block loop takes its offset from
+>   `bridge::blockOffset` (`geometry_loader.h`, `getMotherCuboid().getLatticeR(getOrigin())`).
+>   Gate 5 (OpenLB's per-material voxel counts identical to Stage A's) passes.
+> - **S2** (deposition velocity in m/s): the per-step removal is `v_d·dt/dx` summed over
+>   deposition faces (`step4::Ops::init`). Gate 7c checks the deposited fraction against the
+>   analytic reference (25 % band; the 80× error cannot pass).
+> - **S3** (ω_AD placeholder): ω_AD is derived from D_eff and applied (`step4::prepare`); with
+>   `D_LOCAL=1` it is per cell from the WALE eddy viscosity. `lab_openlb.sh plume`
+>   (`tests/plume_check.py`) checks the plume width against the exact point-source solution,
+>   so a 10 % error in the applied diffusivity fails.
+>
+> Text below is the original audit, kept as the record of what was wrong.
+
 > **Update 2026-09-27:** Phases 5–7 have been run. Results, the four silent defects the
 > first runs exposed, the G1 decision (a custom rough-wall floor plus a top shear stress),
 > and the operating-point trade-off Gate 6b forces are in

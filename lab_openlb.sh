@@ -12,6 +12,8 @@
 #
 #   GPU=1 ./lab_openlb.sh setup|gates|city|all|status   # the same, on the GPU build
 #   GPU=1 ./lab_openlb.sh parity    # GPU vs CPU build on short cases (tests/device_parity.sh)
+#   ./lab_openlb.sh parity_cpu      # CPU build: operators vs host loops, bitwise (single thread)
+#   FRESH=1 ./lab_openlb.sh gates   # rerun gates that are already marked done (after a code change)
 #   GPU=1 PRECISION=single ./lab_openlb.sh setup|gates|city|...   # the float-lattice GPU build:
 #             its own OpenLB tree and outputs under $WORK/gpu_sp (consumer GPUs: FP64 at 1/32 rate)
 #   [PRECISION=single] [MODEL=hrr] GPU=1 ./lab_openlb.sh speed   # throughput of this build: spin-up
@@ -137,7 +139,9 @@ gate() {
   local name="$1"; shift
   # GATES="gate6a gate6b_dx4" runs only the gates named
   if [ -n "${GATES:-}" ] && [[ " $GATES " != *" $name "* ]]; then return 0; fi
-  if done_ "$name"; then say "skip $name (done)"; return 0; fi
+  # FRESH=1 reruns gates that already have a marker (after a code change); builds and the
+  # long city / ranking steps keep theirs
+  if [ "${FRESH:-0}" != 1 ] && done_ "$name"; then say "skip $name (done)"; return 0; fi
   say "gate $name"
   local rc=0
   ( cd "$WORK" && "$@" ) > "$WORK/logs/$name.log" 2>&1 || rc=$?
@@ -201,6 +205,16 @@ do_parity() {
   [ -x "$CPU_BIN" ] || { echo "no CPU build at $CPU_BIN: run '$0 setup' first"; exit 1; }
   gate parity env REF="$CPU_BIN" TEST="$BIN" "$REPO/tests/device_parity.sh" "$WORK_CPU" "$WORK/parity"
   grep -E '^\[parity\]|rel.diff|worst' "$WORK/logs/parity.log" | sed 's/^/     /'
+}
+
+# CPU build, operator path vs host loops: must agree to the last bit (single thread; see
+# tests/device_parity.sh). Checks the operators' transcription, e.g. the WALE stencil rules
+# precomputed at init, without a GPU.
+do_parity_cpu() {
+  [ -x "$CPU_BIN" ] || { echo "no CPU build at $CPU_BIN: run '$0 setup' first"; exit 1; }
+  gate parity_cpu env STRICT=1 REF="env OMP_NUM_THREADS=1 HOST_OPS=1 $CPU_BIN" TEST="env OMP_NUM_THREADS=1 HOST_OPS=0 $CPU_BIN" \
+    "$REPO/tests/device_parity.sh" "$WORK_CPU" "$WORK_CPU/parity_cpu"
+  grep -E '^\[parity\]|rel.diff|worst' "$WORK/logs/parity_cpu.log" | sed 's/^/     /'
 }
 
 # Throughput of this build on the production city (geom_prod): SPEED_STEPS spin-up steps, then as
@@ -577,7 +591,7 @@ do_clean() {
 
 # the gates' deciding numbers, CPU next to GPU
 do_compare() {
-  for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b plume plume_prodD gate8 wake showcase parity; do
+  for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b plume plume_prodD gate8 wake showcase parity parity_cpu; do
     for side in cpu gpu hrr gpu/hrr gpu_sp gpu_sp/hrr; do
       local L="$WORK_CPU/$side/logs/$g.log"; [ $side = cpu ] && L="$WORK_CPU/logs/$g.log"
       [ -f "$L" ] || continue
@@ -767,6 +781,7 @@ case "${1:-status}" in
   city)    do_city ;;
   package) [ "${GPU:-0}" = 1 ] && { WORK="$WORK_CPU"; SUMMARY="$WORK/summary.txt"; }; do_package ;;
   parity)  do_parity ;;
+  parity_cpu) do_parity_cpu ;;
   speed)   do_speed ;;
   precision) do_precision ;;
   showcase) do_showcase ;;
