@@ -41,8 +41,12 @@ struct WaleCorrectedImpl {
       const V s  = V(0.5) * (g[i][j] + g[j][i]);
       sdsd += sd * sd; ss += s * s;
     }
-    const V den = util::pow(ss, V(2.5)) + util::pow(sdsd, V(1.25));
-    V tauTurb = (den > V(0)) ? V(3) * cw * cw * util::pow(sdsd, V(1.5)) / den : V(0);
+    // x^2.5, x^1.25, x^1.5 through sqrt: pow is a log/exp pair, the costliest call in the
+    // collision and on consumer GPUs (FP64 at 1/32 rate) the main cost of WALE. Same values
+    // to a few ulp; ss, sdsd >= 0.
+    const V rs = util::sqrt(ss), rd = util::sqrt(sdsd);
+    const V den = ss * ss * rs + sdsd * util::sqrt(rd);
+    V tauTurb = (den > V(0)) ? V(3) * cw * cw * (sdsd * rd) / den : V(0);
     if (!(tauTurb > V(0))) tauTurb = 0;              // also catches NaN
     return V(1) / (V(1) / omega + tauTurb);
   }

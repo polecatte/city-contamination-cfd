@@ -32,7 +32,7 @@ using namespace olb;
 struct UF_MASK  : public descriptors::FIELD_BASE<1> { };   // bit-packed per-cell flags, see below
 struct UF_VBUF  : public descriptors::FIELD_BASE<3> { };   // lattice velocity for the WALE stencil
 struct RW_SAVE  : public descriptors::FIELD_BASE<4> { };   // rough-wall snapshot of up-going slots
-struct TM_SUM   : public descriptors::FIELD_BASE<6> { };   // time mean: sum u (3), sum u^2 (3), m/s
+struct TM_SUM   : public descriptors::TYPED_FIELD_BASE<double,6> { };   // time mean: sum u (3), sum u^2 (3), m/s
 struct RFG_MODE : public descriptors::FIELD_BASE<10> { };  // one inlet Fourier mode (array element)
 
 // UF_MASK bits
@@ -42,7 +42,23 @@ enum : int {
   MASK_WIDE_Y = 4,
   MASK_WIDE_Z = 8,
   MASK_RW0    = 16,       // rough-wall partner valid for horizontal direction d (4 bits)
+  MASK_STENCIL_SHIFT = 8, // WaleGradOp's difference rule along axis j: 3 bits at 8 + 3j
 };
+// The rule depends only on the (static) fluid flags, so DeviceNSE::init decides it once
+// (stencilRule) instead of WaleGradOp re-reading up to 30 neighbour masks per cell per step.
+// Largest mask < 2^17: exact in a float field too.
+enum : int { STENCIL_ZERO = 0, STENCIL_FWD = 1, STENCIL_BWD = 2, STENCIL_CENTRAL = 3, STENCIL_WIDE = 4 };
+
+// VeloGradRefresh's choice along axis j for a cell with flags mk; fluid(s) = "the cell s steps
+// along +j carries fluid" (padding reads as no fluid). Host side, DeviceNSE::init.
+template <typename FLUID>
+int stencilRule(int mk, int j, FLUID fluid) {
+  bool wide = mk & (MASK_WIDE_X << j);
+  for (int st = 1; st <= 4 && wide; ++st)
+    if (!fluid(st) || !fluid(-st)) wide = false;
+  const bool fp = fluid(1), fn = fluid(-1);
+  return wide ? STENCIL_WIDE : (fp && fn) ? STENCIL_CENTRAL : fp ? STENCIL_FWD : fn ? STENCIL_BWD : STENCIL_ZERO;
+}
 
 // ── parameters ──
 struct P_TIME    : public descriptors::FIELD_BASE<1> { };  // inlet: physical time
@@ -168,29 +184,30 @@ struct WaleGradOp {                      // pass 2: differences into VELO_GRAD o
   void apply(CELL& cell) any_platform {
     using V = typename CELL::value_t;
     const int mk = maskOf<void>(cell.template getField<UF_MASK>());
-    auto U  = [&](int ox, int oy, int oz, int i) -> V {
-      return cell.neighbor({ox,oy,oz}).template getField<UF_VBUF>()[i]; };
-    auto F  = [&](int ox, int oy, int oz) -> bool {
-      return maskOf<void>(cell.neighbor({ox,oy,oz}).template getField<UF_MASK>()) & MASK_FLUID; };
+    // u at s steps along +j, all three components in one read
+    auto Uv = [&](int j, int s) {
+      return cell.neighbor({s*(j==0), s*(j==1), s*(j==2)}).template getField<UF_VBUF>(); };
     const auto u0 = cell.template getField<UF_VBUF>();
     Vector<V,9> g;
     for (int j = 0; j < 3; ++j) {
-      const int e[3] = { j==0, j==1, j==2 };
-      bool wide = mk & (MASK_WIDE_X << j);
-      for (int st = 1; st <= 4 && wide; ++st)
-        if (!F(st*e[0],st*e[1],st*e[2]) || !F(-st*e[0],-st*e[1],-st*e[2])) wide = false;
-      const bool fp = F(e[0],e[1],e[2]), fn = F(-e[0],-e[1],-e[2]);
-      for (int i = 0; i < 3; ++i) {
-        V d = 0;
-        if (wide)
-          d = (V(672)*(U(e[0],e[1],e[2],i)-U(-e[0],-e[1],-e[2],i))
-             + V(168)*(U(-2*e[0],-2*e[1],-2*e[2],i)-U(2*e[0],2*e[1],2*e[2],i))
-             + V(32)*(U(3*e[0],3*e[1],3*e[2],i)-U(-3*e[0],-3*e[1],-3*e[2],i))
-             + V(3)*(U(-4*e[0],-4*e[1],-4*e[2],i)-U(4*e[0],4*e[1],4*e[2],i))) / V(840);
-        else if (fp && fn) d = V(0.5)*(U(e[0],e[1],e[2],i)-U(-e[0],-e[1],-e[2],i));
-        else if (fp)       d = U(e[0],e[1],e[2],i)-u0[i];
-        else if (fn)       d = u0[i]-U(-e[0],-e[1],-e[2],i);
-        g[3*i+j] = d;
+      const int rule = (mk >> (MASK_STENCIL_SHIFT + 3*j)) & 7;     // stencilRule, set at init
+      if (rule == STENCIL_WIDE) {
+        const auto p1 = Uv(j,1), n1 = Uv(j,-1), p2 = Uv(j,2), n2 = Uv(j,-2);
+        const auto p3 = Uv(j,3), n3 = Uv(j,-3), p4 = Uv(j,4), n4 = Uv(j,-4);
+        for (int i = 0; i < 3; ++i)
+          g[3*i+j] = (V(672)*(p1[i]-n1[i]) + V(168)*(n2[i]-p2[i])
+                    + V(32)*(p3[i]-n3[i]) + V(3)*(n4[i]-p4[i])) / V(840);
+      } else if (rule == STENCIL_CENTRAL) {
+        const auto p1 = Uv(j,1), n1 = Uv(j,-1);
+        for (int i = 0; i < 3; ++i) g[3*i+j] = V(0.5)*(p1[i]-n1[i]);
+      } else if (rule == STENCIL_FWD) {
+        const auto p1 = Uv(j,1);
+        for (int i = 0; i < 3; ++i) g[3*i+j] = p1[i]-u0[i];
+      } else if (rule == STENCIL_BWD) {
+        const auto n1 = Uv(j,-1);
+        for (int i = 0; i < 3; ++i) g[3*i+j] = u0[i]-n1[i];
+      } else {
+        for (int i = 0; i < 3; ++i) g[3*i+j] = V(0);
       }
     }
     cell.template setField<descriptors::VELO_GRAD>(g);
@@ -280,10 +297,13 @@ struct TMeanOp {
 // ══════════════════════════ Step 4 (advection-diffusion lattice) ═══════════════════════════
 struct AD_SEL   : public descriptors::FIELD_BASE<1> { };  // bit0: Omega source; bits1..: flux code
 struct AD_RATE  : public descriptors::FIELD_BASE<1> { };  // deposition fraction per step (S2)
-struct AD_THETA : public descriptors::FIELD_BASE<1> { };  // Theta = sum C dt  [lattice C * s]
-struct AD_DEP   : public descriptors::FIELD_BASE<1> { };  // deposited mass
-struct AD_FLUX  : public descriptors::FIELD_BASE<1> { };  // this cell's share of the CV x-face flux
-struct AD_FLUXY : public descriptors::FIELD_BASE<1> { };  // ... and of the y-face flux (oblique wind)
+// The running sums are double whatever the lattice precision: Theta adds ~1e5 increments per
+// cell, which a float accumulator would round away once Theta >> C dt (-DFLOATING_POINT_TYPE=float
+// builds, olbconfig.sh PRECISION=single). In a double build these are the same as FIELD_BASE.
+struct AD_THETA : public descriptors::TYPED_FIELD_BASE<double,1> { };  // Theta = sum C dt  [lattice C * s]
+struct AD_DEP   : public descriptors::TYPED_FIELD_BASE<double,1> { };  // deposited mass
+struct AD_FLUX  : public descriptors::TYPED_FIELD_BASE<double,1> { };  // this cell's share of the CV x-face flux
+struct AD_FLUXY : public descriptors::TYPED_FIELD_BASE<double,1> { };  // ... and of the y-face flux (oblique wind)
 
 struct P_Q     : public descriptors::FIELD_BASE<1> { };
 struct P_DT    : public descriptors::FIELD_BASE<1> { };

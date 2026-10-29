@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """test_run_checks.py — evaluate.run_checks and the driver's handling of rejected runs.
 
-    python3 tests/test_run_checks.py              (numpy only for 1-2; 3 also needs requirements-opt.txt)
+    python3 tests/test_run_checks.py              (numpy for 1-2; 3 also needs scipy)
 
 1. run_checks on meta_flow.txt contents: a clean clearance stop, a tail stop and a capped run
    with a small tail fit pass; a capped run without a tail fit, a tail fit over 15 % of J, an
@@ -10,6 +10,7 @@
 2. intake_fraction reads stop_reason (a text value) from meta_flow.txt.
 3. the driver: a rejected run stays in the history but out of the GP (History.ok), and three
    rejected runs in a row stop the search with a RuntimeError instead of spending the budget.
+   The runs fail inside the Sobol start (n_init), before any GP is fitted, so torch is not needed.
 """
 import os, sys, tempfile, argparse
 import numpy as np
@@ -63,13 +64,13 @@ with tempfile.TemporaryDirectory() as d:
 
 print("3. driver: rejected runs")
 try:
-    import torch  # noqa: F401
+    import scipy  # noqa: F401  (the Sobol start; the GP, and torch, come after n_init)
     from opt import driver
-    have_torch = True
+    have_driver = True
 except ImportError:
-    have_torch = False
-    print("  (skipped: torch/botorch not installed)")
-if have_torch:
+    have_driver = False
+    print("  (skipped: scipy not installed)")
+if have_driver:
     from opt.evaluate import SyntheticEvaluator
 
     class Flaky(SyntheticEvaluator):

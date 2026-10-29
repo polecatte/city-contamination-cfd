@@ -4,6 +4,7 @@
 #   ./olbconfig.sh cpu     # serial CPU_SISD, g++     (Phases 1-4: port + geometry gates)
 #   ./olbconfig.sh cpu-mt  # OpenMP CPU_SISD, g++     (Phases 5-7: many flow-through runs)
 #   ./olbconfig.sh gpu     # single-GPU CUDA, nvcc    (Phase 8)
+#   PRECISION=single ./olbconfig.sh gpu   # the same with a float lattice (default double)
 #   ./olbconfig.sh show    # print the active config
 #   ./olbconfig.sh list    # list the templates this release ships
 #
@@ -157,9 +158,17 @@ case "$MODE" in
       exit 1
     fi
 
-    # urban_flow computes in double (typedef double T) and the CPU reference is double, so
-    # the library is built double too; the shipped template says float.
-    setvar "$CFG" FLOATING_POINT_TYPE 'double'
+    # urban_flow's lattice type follows FLOATING_POINT_TYPE (typedef FLOATING_POINT_TYPE T).
+    # Default double, as the CPU reference, so the GPU-vs-CPU parity test compares like with
+    # like; the shipped template says float. PRECISION=single keeps float: consumer GPUs run
+    # FP64 at 1/32 of the FP32 rate (RTX A4000). Theta, deposition and the face fluxes are
+    # double fields either way (urban_ops.h); lab_openlb.sh precision checks a float build.
+    case "${PRECISION:-double}" in
+      double)       setvar "$CFG" FLOATING_POINT_TYPE 'double' ;;
+      single|float) setvar "$CFG" FLOATING_POINT_TYPE 'float' ;;
+      *) echo "ERROR: PRECISION must be double or single (got '$PRECISION')" >&2; exit 1 ;;
+    esac
+    echo "FLOATING_POINT_TYPE := $(grep -E '^FLOATING_POINT_TYPE' "$CFG" | awk '{print $3}')"
     # nvcc: $NVCC when given (e.g. a conda-forge CUDA 12.6, see lab_openlb.sh), else PATH.
     # CUDA 12.0 cannot compile OpenLB 1.8 at all (fields.h: consteval source_location).
     if [ -n "${NVCC:-}" ]; then setvar "$CFG" CXX "$NVCC"; setvar "$CFG" CC "$NVCC"; fi

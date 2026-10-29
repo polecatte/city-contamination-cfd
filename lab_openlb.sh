@@ -10,6 +10,12 @@
 #
 #   GPU=1 ./lab_openlb.sh setup|gates|city|all|status   # the same, on the GPU build
 #   GPU=1 ./lab_openlb.sh parity    # GPU vs CPU build on short cases (tests/device_parity.sh)
+#   GPU=1 PRECISION=single ./lab_openlb.sh setup|gates|city|...   # the float-lattice GPU build:
+#             its own OpenLB tree and outputs under $WORK/gpu_sp (consumer GPUs: FP64 at 1/32 rate)
+#   [PRECISION=single] [MODEL=hrr] GPU=1 ./lab_openlb.sh speed   # throughput of this build: spin-up
+#             MLUPS, burst ms/step and the per-stage split (STAGE_TIMING), on the production city
+#   [MODEL=hrr] GPU=1 ./lab_openlb.sh precision   # float build vs double build: 3 designs at dx 8,
+#             J against the inlet-seed noise, budget closure, speed-up (needs both GPU builds)
 #   ./lab_openlb.sh compare         # CPU / GPU / HRR gate numbers side by side
 #   ./lab_openlb.sh send            # everything to send back: one small text file + a logs tarball
 #   [CONFIRM=1] ./lab_openlb.sh clean   # disk full? shows what fills it; removes only regenerable files
@@ -43,6 +49,9 @@
 #             geometries shared with the CPU runs. Needs an NVIDIA driver; nvcc >= 12.4 is
 #             taken from PATH or $NVCC, else CUDA 12.6 is installed from conda-forge into
 #             $WORK/cuda126 (no root). CUDA_ARCH defaults to nvidia-smi's compute capability.
+#   PRECISION double (default) or single, with GPU=1: single builds OpenLB and the app with
+#             FLOATING_POINT_TYPE float in $WORK/gpu_sp (Theta, deposition and fluxes stay
+#             double). The CPU reference and the parity test are double; `precision` checks float.
 #
 # Every per-step operator (inlet, WALE gradient, rough wall, top stress, time mean, Step-4
 # flux/inject/deposit/theta/settle) exists twice: host loops (the CPU reference, default on
@@ -65,10 +74,16 @@ WORK_CPU="$WORK"
 export TMPDIR="${LAB_TMPDIR:-$WORK_CPU/tmp}"
 mkdir -p "$TMPDIR"
 CPU_BIN="$WORK_CPU/release-1.8.1/examples/urban/urban_flow/urban_flow"
-if [ "${GPU:-0}" = 1 ]; then
+PRECISION="${PRECISION:-double}"
+case "$PRECISION" in double) ;; single|float) PRECISION=single ;; *) echo "PRECISION must be double or single"; exit 2 ;; esac
+if [ "${GPU:-0}" = 1 ] && [ "$PRECISION" = single ]; then
+  WORK="$WORK_CPU/gpu_sp"
+  OLB_ROOT="${OLB_ROOT_GPU_SP:-$WORK/release-1.8.1}"
+elif [ "${GPU:-0}" = 1 ]; then
   WORK="$WORK_CPU/gpu"
   OLB_ROOT="${OLB_ROOT_GPU:-$WORK/release-1.8.1}"
 else
+  [ "$PRECISION" = single ] && { echo "PRECISION=single is a GPU build option (GPU=1); the CPU reference stays double"; exit 2; }
   OLB_ROOT="${OLB_ROOT:-$WORK/release-1.8.1}"
 fi
 APP="$OLB_ROOT/examples/urban/urban_flow"
@@ -179,10 +194,58 @@ cuda_toolchain() {
 # GPU build vs CPU build on four short cases that execute every operator (see the script).
 do_parity() {
   [ "${GPU:-0}" = 1 ] || { echo "parity compares the GPU build against the CPU one: run it as GPU=1 $0 parity"; exit 2; }
+  [ "$PRECISION" = double ] || { echo "parity is double against double (the CPU reference); the float build is checked by 'GPU=1 $0 precision'"; exit 2; }
   [ -x "$BIN" ] || { echo "run 'GPU=1 $0 setup' first"; exit 1; }
   [ -x "$CPU_BIN" ] || { echo "no CPU build at $CPU_BIN: run '$0 setup' first"; exit 1; }
   gate parity env REF="$CPU_BIN" TEST="$BIN" "$REPO/tests/device_parity.sh" "$WORK_CPU" "$WORK/parity"
   grep -E '^\[parity\]|rel.diff|worst' "$WORK/logs/parity.log" | sed 's/^/     /'
+}
+
+# Throughput of this build on the production city (geom_prod): SPEED_STEPS spin-up steps, then as
+# many burst steps on the not-yet-developed flow (a timing run, not a result), STAGE_TIMING=1 for
+# the per-stage split. Run it once per build and compare:
+#   GPU=1 ./lab_openlb.sh speed ; GPU=1 PRECISION=single ./lab_openlb.sh speed   (and MODEL=hrr)
+do_speed() {
+  [ -x "$BIN" ] || { echo "run '$0 setup' first"; exit 1; }
+  local n="${SPEED_STEPS:-2000}" tag="speed_${MODEL}"
+  rm -f "$WORK/done/$tag"                                    # a measurement: always rerun
+  step "$tag" sh -c "STAGE_TIMING=1 STEP4=1 D_LOCAL=1 MAX_STEPS=$n MAX_BURST_STEPS=$n CLEAR_FRAC=0 CHECK_EVERY=$n TS_EVERY=$n GEOM_DIR=geom_prod OUT_DIR=out_$tag '$BIN' > out_$tag.log 2>&1"
+  rm -f "$WORK/out_$tag"/*.f32
+  local lab="${WORK#$WORK_CPU}"; lab="${lab#/}"
+  { echo "== $tag: ${lab:-cpu} build ($PRECISION) on $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+    grep -E 'MLUPS|ms/step|STAGE_TIMING' "$WORK/out_$tag.log"; } | tee "$WORK/$tag.txt" | sed 's/^/     /'
+}
+
+# Float vs double GPU build on the quick ranking configuration (RANK_DX, default 8; guideline
+# domain, D_LOCAL=1, tail stop, physics from MODEL): designs PREC_DESIGNS (default base core
+# flat), the double build at inlet seeds 1000 and 2000, the float build at 1000. A float run is
+# another turbulent realisation after a few flow-throughs, so the double seed pair measures the
+# noise the float-double difference is judged against (tests/precision_report.py: J, closure,
+# stop, wall time, verdict). The gates for the float build: GPU=1 PRECISION=single $0 gates.
+do_precision() {
+  [ "${GPU:-0}" = 1 ] || { echo "precision compares the two GPU builds: GPU=1 $0 precision"; exit 2; }
+  local app=urban_flow; [ "$MODEL" = hrr ] && app=urban_hrr
+  local DP="${OLB_ROOT_GPU:-$WORK_CPU/gpu/release-1.8.1}/examples/urban/$app/urban_flow"
+  local SP="${OLB_ROOT_GPU_SP:-$WORK_CPU/gpu_sp/release-1.8.1}/examples/urban/$app/urban_flow"
+  [ -x "$DP" ] || { echo "no double GPU build at $DP: MODEL=$MODEL GPU=1 $0 setup"; exit 1; }
+  [ -x "$SP" ] || { echo "no float GPU build at $SP: MODEL=$MODEL GPU=1 PRECISION=single $0 setup"; exit 1; }
+  local dx="${RANK_DX:-8}" gen cfg n e v spec p s bin line M
+  case "$dx" in 4) gen=./gen_openlb_geom ;; 8) gen=./gen_openlb_geom8 ;; *) echo "RANK_DX must be 4 or 8"; exit 2 ;; esac
+  cfg="prec_${MODEL}_dx$dx"; M="$WORK/${cfg}_manifest.txt"
+  say "precision: float $SP vs double $DP, designs ${PREC_DESIGNS:-base core flat}, dx $dx"
+  for n in ${PREC_DESIGNS:-base core flat}; do
+    e=""; for v in "${RANK_DESIGNS[@]}"; do [ "${v%%|*}" = "$n" ] && e="${v#*|}"; done
+    step "${cfg}_geom_$n" sh -c "env $e OUT_DIR=${cfg}_geom_$n $gen"
+    for spec in "double 1000 $DP" "double 2000 $DP" "single 1000 $SP"; do
+      read -r p s bin <<< "$spec"
+      need_space "$WORK" 1 "a precision run"
+      step "${cfg}_${n}_${p}_s$s" sh -c "env D_LOCAL=1 TAIL=1 STEP4=1 ABL_SEED=$s GEOM_DIR=${cfg}_geom_$n OUT_DIR=${cfg}_${n}_${p}_s$s CHECK_EVERY=2000 TS_EVERY=200 '$bin' > ${cfg}_${n}_${p}_s$s.log 2>&1"
+      rm -f "$WORK/${cfg}_${n}_${p}_s$s/umean_full.f32" "$WORK/${cfg}_${n}_${p}_s$s/uavg.f32"
+      line="$p $n $s $WORK/${cfg}_geom_$n $WORK/${cfg}_${n}_${p}_s$s"
+      grep -qxF "$line" "$M" 2>/dev/null || echo "$line" >> "$M"
+    done
+  done
+  python3 "$REPO/tests/precision_report.py" "$M" | tee "$WORK_CPU/precision_report_$MODEL.txt"
 }
 
 # A small city through the whole pipeline (geometry -> live flow -> burst to 99 % clearance ->
@@ -350,6 +413,7 @@ do_opt_setup() {
   step opt_reqs  "$E/bin/pip" install -q -r "$REPO/requirements-opt.txt"
   "$E/bin/python" -W ignore "$REPO/tests/test_wind_surrogate.py"
   "$E/bin/python" -W ignore "$REPO/tests/test_driver_synth.py" "$WORK_CPU/opt_synth" | grep '^\[synth\]' 
+  "$E/bin/python" -W ignore "$REPO/tests/test_run_checks.py" | tail -6     # run checks + rejected runs in the driver
   say "optimizer env ready: $E/bin/python"
 }
 
@@ -397,7 +461,7 @@ do_send() {
     echo "== lab results $ts on $(hostname); repo commit $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null)"
     command -v nvidia-smi >/dev/null && nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader 2>&1 | head -2 | sed 's/^/GPU: /'
     df -Ph /tmp "$TMPDIR" "$WORK_CPU" 2>/dev/null | awk 'NR>1{print "disk: " $6 " " $4 " free of " $2}' | sort -u
-    for d in "$WORK_CPU" "$WORK_CPU/gpu" "$WORK_CPU/hrr" "$WORK_CPU/gpu/hrr"; do
+    for d in "$WORK_CPU" "$WORK_CPU/gpu" "$WORK_CPU/hrr" "$WORK_CPU/gpu/hrr" "$WORK_CPU/gpu_sp" "$WORK_CPU/gpu_sp/hrr"; do
       [ -d "$d/logs" ] || continue
       lab="${d#$WORK_CPU}"; lab="${lab#/}"; lab="${lab:-cpu}"
       echo; echo "======== $lab ($d)"
@@ -418,8 +482,9 @@ do_send() {
         case "$(basename "$f")" in build_*) continue ;; esac
         echo "-- tail of $(basename "$f")"; tail -n 12 "$f"; done
       grep -h -E 'MLUPs :' "$d"/out_*.log "$d"/city_*.log "$d"/rank_*.log 2>/dev/null | sed 's/^/throughput /' | head -12
+      for f in "$d"/speed_*.txt; do [ -f "$f" ] && { echo "-- $(basename "$f" .txt)"; cat "$f"; }; done
     done
-    for f in rank_report.txt wind_report.txt pathways.txt; do
+    for f in rank_report.txt wind_report.txt pathways.txt precision_report_wale.txt precision_report_hrr.txt; do
       [ -f "$WORK_CPU/$f" ] && { echo; echo "======== $f"; cat "$WORK_CPU/$f"; }
     done
     for f in "$WORK_CPU"/opt_*/report.json "$WORK_CPU"/*/opt_*/report.json "$WORK_CPU"/opt_*/verified.json "$WORK_CPU"/*/opt_*/verified.json; do
@@ -429,7 +494,8 @@ do_send() {
   } > "$out" 2>&1
   exit 0 )
   ( cd "$WORK_CPU" && shopt -s nullglob && \
-    files=( "$(basename "$out")" logs gpu/logs hrr/logs gpu/hrr/logs */summary.txt summary.txt rank_report.txt \
+    files=( "$(basename "$out")" logs gpu/logs hrr/logs gpu/hrr/logs gpu_sp/logs gpu_sp/hrr/logs */summary.txt summary.txt rank_report.txt \
+            precision_report_*.txt */speed_*.txt */*/speed_*.txt */prec_*/meta*.txt */*/prec_*/meta*.txt \
             */rank_manifest.txt rank_manifest.txt */*/rank_*/meta_flow.txt */rank_*/meta_flow.txt rank_*/meta_flow.txt \
             */*/rank_*/exposure_timeseries.csv */rank_*/exposure_timeseries.csv rank_*/exposure_timeseries.csv \
             opt_*/report.json opt_*/verified.json opt_*/history.jsonl */opt_*/report.json */opt_*/verified.json */opt_*/history.jsonl ) && \
@@ -452,7 +518,7 @@ do_clean() {
   say "largest items in $HOME:"
   du -sh "$HOME"/* "$HOME"/.[!.]* 2>/dev/null | sort -h | tail -12 | sed 's/^/     /'
   say "largest items in $WORK_CPU:"
-  du -sh "$WORK_CPU"/* "$WORK_CPU"/gpu/* "$WORK_CPU"/hrr/* "$WORK_CPU"/gpu/hrr/* 2>/dev/null | sort -h | tail -12 | sed 's/^/     /'
+  du -sh "$WORK_CPU"/* "$WORK_CPU"/gpu/* "$WORK_CPU"/hrr/* "$WORK_CPU"/gpu/hrr/* "$WORK_CPU"/gpu_sp/* 2>/dev/null | sort -h | tail -12 | sed 's/^/     /'
   local list=( "$WORK_CPU"/mamba/pkgs "$TMPDIR"/* "$HOME"/.cache/pip )
   while IFS= read -r f; do list+=("$f"); done < <(find "$WORK_CPU" -type f \( -name umean_full.f32 -o -name uavg.f32 \) \
                                                   -not -path '*/release-1.8.1/*' 2>/dev/null)
@@ -479,13 +545,14 @@ do_clean() {
 # the gates' deciding numbers, CPU next to GPU
 do_compare() {
   for g in gate6a gate6b_dx4 gate6b_dx2 gate6b_dx1 cube_gm0 cube_ti12 cube_cw20 gate7a gate7c gate7b gate8 wake showcase parity; do
-    for side in cpu gpu hrr gpu/hrr; do
+    for side in cpu gpu hrr gpu/hrr gpu_sp gpu_sp/hrr; do
       local L="$WORK_CPU/$side/logs/$g.log"; [ $side = cpu ] && L="$WORK_CPU/logs/$g.log"
       [ -f "$L" ] || continue
       grep -E '^\[(6a|6b|7a|7c|7b|8|J|wake)\]|drift|Xr/H|closure|PASS|FAIL' "$L" | tail -6 | sed "s/^/$g $side: /"
     done
   done
-  grep -H -E 'MLUPs :' "$WORK_CPU"/out_*.log "$WORK_CPU"/gpu/out_*.log "$WORK_CPU"/hrr/out_*.log "$WORK_CPU"/gpu/hrr/out_*.log 2>/dev/null \
+  grep -H -E 'MLUPs :' "$WORK_CPU"/out_*.log "$WORK_CPU"/gpu/out_*.log "$WORK_CPU"/hrr/out_*.log "$WORK_CPU"/gpu/hrr/out_*.log \
+       "$WORK_CPU"/gpu_sp/out_*.log "$WORK_CPU"/gpu_sp/hrr/out_*.log 2>/dev/null \
     | sed "s|$WORK_CPU/||" | head -24 || true
 }
 
@@ -520,7 +587,7 @@ do_setup() {
     # nvidia-smi's error text as CUDA_ARCH; and the GPU tree is shared by MODEL=wale and hrr.
     rm -f "$WORK/done/olb_config"
     step olb_config env OLB_ROOT="$OLB_ROOT" NVCC="$NVCC_USED" CUDA_LIBDIR="${CUDA_LIBDIR:-}" \
-         CUDA_HOST_CXX="${CUDA_HOST_CXX:-}" CUDA_ARCH="${CUDA_ARCH:-}" "$REPO/olbconfig.sh" gpu
+         CUDA_HOST_CXX="${CUDA_HOST_CXX:-}" CUDA_ARCH="${CUDA_ARCH:-}" PRECISION="$PRECISION" "$REPO/olbconfig.sh" gpu
     grep -E '^(CXX|CUDA_ARCH|FLOATING_POINT_TYPE) ' "$OLB_ROOT/config.mk" | sed 's/^/     /'
     grep -qE '^CUDA_ARCH[[:space:]]*:?=[[:space:]]*[0-9]{2,3}[[:space:]]*$' "$OLB_ROOT/config.mk" \
       || { say "config.mk has no numeric CUDA_ARCH (see above): fix the driver or set CUDA_ARCH=86/90"; exit 1; }
@@ -651,6 +718,8 @@ case "${1:-status}" in
   city)    do_city ;;
   package) [ "${GPU:-0}" = 1 ] && { WORK="$WORK_CPU"; SUMMARY="$WORK/summary.txt"; }; do_package ;;
   parity)  do_parity ;;
+  speed)   do_speed ;;
+  precision) do_precision ;;
   showcase) do_showcase ;;
   frames)  do_frames ;;
   cube_sens) do_cube_sens ;;

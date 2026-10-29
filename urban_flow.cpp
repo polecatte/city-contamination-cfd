@@ -54,10 +54,19 @@
 #include <vector>
 #include <cmath>
 #include <array>
+#include <limits>
+#include <chrono>
+#include <iomanip>
 
 using namespace olb;
 using namespace olb::descriptors;
-typedef double T;
+// Lattice precision = the OpenLB build's FLOATING_POINT_TYPE (config.mk): double for the CPU
+// reference and the default GPU build, float with `PRECISION=single ./olbconfig.sh gpu`
+// (consumer GPUs run FP64 at 1/32 of FP32). OpenLB stores populations shifted by the weights
+// (f - t_i), which is what keeps a float lattice accurate (Lehmann et al. 2022, PRE 106,
+// 015308). Host sums, Theta, deposition and the face fluxes stay double in either build.
+typedef FLOATING_POINT_TYPE T;
+static constexpr bool SINGLE_PRECISION = sizeof(T) < sizeof(double);
 
 // ── LES collision selection (C6) ──  -DCOLLISION_MODEL=0|1|2|3  (default 0 = WALE)
 //   3 = WALE + hybrid recursive regularized (HRR; Jacob, Malaspinas & Sagaut 2018,
@@ -762,26 +771,36 @@ struct DeviceNSE {
         block.template getField<descriptors::LOCATION>();
         // per-cell flags and zeroed buffers over the padded block (padding must read as
         // "no fluid, u = 0", exactly what VeloGradRefresh assumes for material 0)
-        std::vector<int> rwBits((size_t)(nx+2*pad)*(ny+2*pad)*(nz+2*pad), 0);
+        if (pad < 1) throw std::runtime_error("device operators need a block padding of at least 1");
+        std::vector<int> mask((size_t)(nx+2*pad)*(ny+2*pad)*(nz+2*pad), 0);   // UF_MASK, padding = 0
         auto P = [&](int x,int y,int z){ return ((size_t)(x+pad)*(ny+2*pad)+(y+pad))*(nz+2*pad)+(z+pad); };
+        auto core = [&](int x,int y,int z){ return x>=0 && x<nx && y>=0 && y<ny && z>=0 && z<nz; };
         if (rw) for (auto& L : rw->layers) for (size_t k=0; k<L.x.size(); ++k)
-            for (int d=0; d<4; ++d) if (L.partner[4*k+d] >= 0) rwBits[P(L.x[k],L.y[k],L.z)] |= (MASK_RW0 << d);
-        const Vector<T,3> z3(0,0,0); const Vector<T,4> z4(0,0,0,0); const Vector<T,6> z6(0,0,0,0,0,0);
+            for (int d=0; d<4; ++d) if (L.partner[4*k+d] >= 0) mask[P(L.x[k],L.y[k],L.z)] |= (MASK_RW0 << d);
+        for (int x=0; x<nx; ++x) for (int y=0; y<ny; ++y) for (int z=0; z<nz; ++z) {
+            int& mk = mask[P(x,y,z)];
+            if (VeloGradRefresh::carriesFluid(bg.get({x,y,z}))) mk |= MASK_FLUID;
+            const int c[3]={x,y,z}, n[3]={nx,ny,nz};
+            for (int j=0; j<3; ++j) if (c[j]-4 >= -1 && c[j]+4 < n[j]+1) mk |= (MASK_WIDE_X << j);
+        }
+        // WaleGradOp's difference rule per axis, from the fluid flags just set; every cell it
+        // looks at lies in [-1, n] along j (MASK_WIDE_X's index condition), inside the padding
+        for (int x=0; x<nx; ++x) for (int y=0; y<ny; ++y) for (int z=0; z<nz; ++z) {
+            int rules = 0;
+            for (int j=0; j<3; ++j) {
+                auto fluid = [&](int s){ return (mask[P(x+s*(j==0), y+s*(j==1), z+s*(j==2))] & MASK_FLUID) != 0; };
+                rules |= stencilRule(mask[P(x,y,z)], j, fluid) << (MASK_STENCIL_SHIFT + 3*j);
+            }
+            mask[P(x,y,z)] |= rules;
+        }
+        const Vector<T,3> z3(0,0,0); const Vector<T,4> z4(0,0,0,0); const Vector<double,6> z6(0,0,0,0,0,0);
         for (int x=-pad; x<nx+pad; ++x) for (int y=-pad; y<ny+pad; ++y) for (int z=-pad; z<nz+pad; ++z) {
             auto cell = block.get(x,y,z);
-            const bool core = x>=0 && x<nx && y>=0 && y<ny && z>=0 && z<nz;
-            int mk = 0;
-            if (core) {
-                if (VeloGradRefresh::carriesFluid(bg.get({x,y,z}))) mk |= MASK_FLUID;
-                const int c[3]={x,y,z}, n[3]={nx,ny,nz};
-                for (int j=0; j<3; ++j) if (c[j]-4 >= -1 && c[j]+4 < n[j]+1) mk |= (MASK_WIDE_X << j);
-                mk |= rwBits[P(x,y,z)];
-                if (bg.get({x,y,z}) == MAT_INLET) {
-                    Vector<T,3> physR; bg.getPhysR(physR, LatticeR<3>{x,y,z});
-                    cell.template setField<descriptors::LOCATION>(physR);
-                }
+            if (core(x,y,z) && bg.get({x,y,z}) == MAT_INLET) {
+                Vector<T,3> physR; bg.getPhysR(physR, LatticeR<3>{x,y,z});
+                cell.template setField<descriptors::LOCATION>(physR);
             }
-            cell.template setField<UF_MASK>((T)mk);
+            cell.template setField<UF_MASK>((T)mask[P(x,y,z)]);
             cell.template setField<UF_VBUF>(z3);
             cell.template setField<RW_SAVE>(z4);
             cell.template setField<TM_SUM>(z6);
@@ -1243,11 +1262,11 @@ struct DeviceAD {
             if (m==MAT_FLUID||m==MAT_POROUS||m==MAT_SPONGE) { all += C;
                 if (hasW) wt += (double)ops.w[B.ag[k]] * c.template getField<urbanops::AD_THETA>(); }
             const int X = B.gx0+B.ax[k], Y = B.gy0+B.ay[k];
-            const T dp = c.template getField<urbanops::AD_DEP>();
+            const double dp = c.template getField<urbanops::AD_DEP>();
             if (dp != 0) { if (ops.inCV(X,Y)) dc += dp; else dq += dp; }
-            const T fl = c.template getField<urbanops::AD_FLUX>();
+            const double fl = c.template getField<urbanops::AD_FLUX>();
             if (fl != 0) { if (X >= ops.xHi) fd += fl; else fu += fl; }
-            if (ops.yOpen) { const T fy = c.template getField<urbanops::AD_FLUXY>();
+            if (ops.yOpen) { const double fy = c.template getField<urbanops::AD_FLUXY>();
                              if (fy != 0) { if (Y >= ops.yHi) fd += fy; else fu += fy; } }
         }
         airCV=cv; airAll=all; depCV=dc; depOut=dq; outDown=fd; outUp=fu; wTheta=wt;
@@ -1268,6 +1287,43 @@ struct DeviceAD {
 static void writeField5(const std::string& fn,const std::vector<float>& d,int nx,int ny,int nz,double dx){
     FILE* f=fopen(fn.c_str(),"wb"); if(!f)return; int h[5]={nx,ny,nz,(int)std::lround(dx*1000.0),1};
     fwrite(h,sizeof(int),5,f); fwrite(d.data(),sizeof(float),d.size(),f); fclose(f);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// StageClock — STAGE_TIMING=1: wall time per stage of the time step, with the device
+// synchronised around each stage so a kernel is charged to the stage that launched it. The
+// syncs serialise the step, so the timed total runs a little above an untimed one; the shares
+// are what it is for (where a GPU step goes before anything is tuned). Off: f() and nothing else.
+// ─────────────────────────────────────────────────────────────────────────────
+struct StageClock {
+    bool on = false;
+    std::vector<std::pair<std::string,double>> acc;          // stage, seconds (first-use order)
+    static void sync() {
+#ifdef PLATFORM_GPU_CUDA
+        gpu::cuda::device::synchronize();
+#endif
+    }
+    template <typename F> void run(const char* stage, F&& f) {
+        if (!on) { f(); return; }
+        sync(); const auto a = std::chrono::steady_clock::now();
+        f();
+        sync(); const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+        for (auto& p : acc) if (p.first == stage) { p.second += s; return; }
+        acc.emplace_back(stage, s);
+    }
+    void report(OstreamManager& out, const char* phase, long steps) {
+        if (!on || steps <= 0) return;
+        double tot = 0; for (auto& p : acc) tot += p.second;
+        out << "STAGE_TIMING " << phase << ": " << steps << " steps, " << 1e3*tot/steps << " ms/step timed" << std::endl;
+        for (auto& p : acc)
+            out << "  " << std::left << std::setw(28) << p.first << std::right << std::setw(9) << std::fixed
+                << std::setprecision(3) << 1e3*p.second/steps << " ms/step " << std::setw(6) << std::setprecision(1)
+                << (tot > 0 ? 100*p.second/tot : 0.0) << " %" << std::defaultfloat << std::setprecision(6) << std::endl;
+        acc.clear();
+    }
+};
+static double secondsSince(std::chrono::steady_clock::time_point a) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1328,7 +1384,8 @@ int main(int argc, char* argv[]) {
     clout << "operating point: tau=" << TAU << "  nu_eff=" << NU_EFF << " m^2/s"
           << "  dt=" << converter.getPhysDeltaT() << " s  uLB=" << converter.getCharLatticeVelocity()
           << "  Re_eff(charL)=" << U_INLET*charL/NU_EFF << std::endl;
-    if (std::fabs(converter.getPhysDeltaX() - (T)dx) > 1e-9*dx) {
+    // (dx is a whole number of mm, but the converter computes charL/resolution in T)
+    if (std::fabs(converter.getPhysDeltaX() - (T)dx) > std::max(1e-9, 64.0*std::numeric_limits<T>::epsilon())*dx) {
         clout << "converter dx " << converter.getPhysDeltaX() << " != map dx " << dx
               << " -- the lattice would not be 1:1 with the material map" << std::endl;
         return 4;
@@ -1453,27 +1510,30 @@ int main(int argc, char* argv[]) {
     // Whole-lattice pull for host-side reads (guard scan, checks, export). A no-op on CPU.
     auto pullNSE = [&]{ sLattice.setProcessingContext(ProcessingContext::Evaluation); };
 
+    StageClock clk; clk.on = envi("STAGE_TIMING", 0) != 0;   // per-stage wall time (StageClock)
     int floorIT = 0;                                         // step counter for the ramp
     auto floorStep = [&]{
         const T r = bridge::AblVelocityF3D<T,DESCRIPTOR,UnitConverter<T,DESCRIPTOR>>::smoothstep(
                         rampSteps>0 ? (T)floorIT/(T)rampSteps : T(1));
         const T us = ustarLB*r;
-        if (HOST_OPS) {
-            if (GROUND_MODEL==1) roughWall.apply(sLattice);
-            if (TOP_STRESS) topStress.apply(sLattice, us);
-        } else dev.floor(sLattice, us*us);                 // TopStress::apply: du = u*_lb^2
+        clk.run("floor (rough wall, top)", [&]{
+            if (HOST_OPS) {
+                if (GROUND_MODEL==1) roughWall.apply(sLattice);
+                if (TOP_STRESS) topStress.apply(sLattice, us);
+            } else dev.floor(sLattice, us*us);             // TopStress::apply: du = u*_lb^2
+        });
         ++floorIT;
     };
     // inlet + WALE gradient, before each collide
     auto preCollide = [&](int iStep, int ramp_steps) {
         if (HOST_OPS) {
-            setBoundaryValues(sLattice, converter, superGeometry, iStep, ramp_steps);
-            refreshWALE();
+            clk.run("inlet", [&]{ setBoundaryValues(sLattice, converter, superGeometry, iStep, ramp_steps); });
+            clk.run("WALE gradient", [&]{ refreshWALE(); });
         } else {
-            dev.inlet(sLattice, converter.getPhysTime(iStep),
+            clk.run("inlet", [&]{ dev.inlet(sLattice, converter.getPhysTime(iStep),
                       bridge::AblVelocityF3D<T,DESCRIPTOR,UnitConverter<T,DESCRIPTOR>>::smoothstep(
-                          ramp_steps>0 ? (T)iStep/(T)ramp_steps : T(1)));
-            dev.waleGrad(sLattice);
+                          ramp_steps>0 ? (T)iStep/(T)ramp_steps : T(1))); });
+            clk.run("WALE gradient", [&]{ dev.waleGrad(sLattice); });
         }
     };
 
@@ -1481,7 +1541,7 @@ int main(int argc, char* argv[]) {
     T peakU = 0;
     util::Timer<T> timer(MAX_STEPS, superGeometry.getStatistics().getNvoxel());
     timer.start();
-
+    const auto spinT0 = std::chrono::steady_clock::now();
 
     for (int iT=0; iT<MAX_STEPS; ++iT) {
         preCollide(iT, rampSteps);                                              // C3 + WALE
@@ -1510,24 +1570,25 @@ int main(int argc, char* argv[]) {
             }
             clout << "WALE_GRAD_CHECK at iT=" << iT << ": " << n << " cells, max|grad|=" << maxAbs
                   << " max|diff vs OpenLB functor|=" << maxDiff
-                  << (maxDiff <= 1e-9*std::max(maxAbs,T(1e-30)) + 1e-15 ? "  [PASS]" : "  [FAIL]") << std::endl;
+                  << (maxDiff <= std::max(1e-9, 100.0*std::numeric_limits<T>::epsilon())*std::max(maxAbs,T(1e-30)) + 1e-15
+                      ? "  [PASS]" : "  [FAIL]") << std::endl;
         }
 #endif
-        sLattice.collideAndStream();                                            // CONFIRM 1.8
+        clk.run("NSE collide+stream", [&]{ sLattice.collideAndStream(); });     // CONFIRM 1.8
         floorStep();                                                            // C2
-        if (iT>=avgStart && (iT-avgStart)%AVG_EVERY==0) {
+        if (iT>=avgStart && (iT-avgStart)%AVG_EVERY==0) clk.run("time mean", [&]{
             if (HOST_OPS) tmean.sample(sLattice, superGeometry, cvel);
             else { dev.sample(sLattice); ++tmean.nSamples; }
-        }
+        });
 
         if (ADM_EVERY>0 && iT%ADM_EVERY==0) {                                   // C6 optional ADM filter
             // CONFIRM 1.8: SuperLatticeADM3D<T,DESCRIPTOR> admF(sLattice, adm_sigma, adm_order);
             //             admF.execute(superGeometry, MAT_FLUID);   // approximate deconvolution
         }
         if (iT%CHECK==0) {
-            T maxU = 0;
-            pullNSE();
-            if (!healthy(sLattice, superGeometry, &maxU)) { return 2; }         // C4 abort on divergence
+            T maxU = 0; bool ok = true;
+            clk.run("check (pull + scan)", [&]{ pullNSE(); ok = healthy(sLattice, superGeometry, &maxU); });
+            if (!ok) { return 2; }                                              // C4 abort on divergence
             peakU = std::max(peakU, maxU);
             timer.update(iT); timer.printStep();
             clout << "iT=" << iT << " t=" << converter.getPhysTime(iT) << "s maxU_lb=" << maxU
@@ -1535,9 +1596,15 @@ int main(int argc, char* argv[]) {
                         rampSteps>0?(T)iT/(T)rampSteps:T(1)) << std::endl;
         }
     }
+    const double spinWall = secondsSince(spinT0);
     pullNSE();
     { T maxU = 0; if (!healthy(sLattice, superGeometry, &maxU)) return 2; peakU = std::max(peakU, maxU); }
     timer.stop(); timer.printSummary();
+    if (MAX_STEPS > 0)
+        clout << "spin-up: " << MAX_STEPS << " steps in " << spinWall << " s = " << 1e3*spinWall/MAX_STEPS << " ms/step, "
+              << 1e-6*(double)nx*ny*nz*MAX_STEPS/spinWall << " MLUPS (all " << (size_t)nx*ny*nz << " lattice cells, "
+              << (SINGLE_PRECISION ? "float" : "double") << ")" << std::endl;
+    clk.report(clout, "spin-up", MAX_STEPS);
     clout << "peak lattice |u| over run = " << peakU << " (Mach " << peakU*std::sqrt(3.0) << ")" << std::endl;
     if (AVG_FT>0 && !HOST_OPS) dev.fetchMean(sLattice, superGeometry, tmean, tmean.nSamples);
     if (AVG_FT>0) { tmean.write(OUT+"/uavg.f32", dx);
@@ -1555,6 +1622,7 @@ int main(int argc, char* argv[]) {
         fprintf(mf, "# written by urban_flow (OpenLB)\nU_inlet_ms %.6g\nvelocity_units ms\n", (double)U_INLET);
         fprintf(mf, "grid %d %d %d\ndx_m %.4f\ndt_s %.6g\ntau %.6g\nnu_eff_m2s %.6g\nabl_seed %d\n",
                 nx, ny, nz, dx, (double)converter.getPhysDeltaT(), (double)TAU, (double)NU_EFF, envi("ABL_SEED",1000));
+        fprintf(mf, "precision %s\nspinup_steps %d\nspinup_wall_s %.3f\n", SINGLE_PRECISION ? "float" : "double", MAX_STEPS, spinWall);
         fclose(mf);
     }
 
@@ -1670,6 +1738,11 @@ int main(int argc, char* argv[]) {
 
     const T   PULSE_S  = envd("PULSE_S", 2.0);
     const T   Q_RATE   = envd("Q_RATE", 1.0);               // ΔC per Ω cell per step (lattice)
+    // J = <w,Θ>/emitted does not depend on Q_RATE (linear scalar), but a float lattice resolves C
+    // only to ~1e-7 absolute (C = Σ f~ + 1 with f~ ≈ -t_i), so the plume must sit well above that.
+    if (SINGLE_PRECISION && Q_RATE < 0.1)
+        cl4 << "WARNING: float lattice with Q_RATE=" << Q_RATE << ": keep Q_RATE ~ 1, C is resolved "
+               "only to ~1e-7 absolute in single precision" << std::endl;
     const T   CLEAR    = envd("CLEAR_FRAC", 0.01);          // 0 = run all MAX_BURST_STEPS
     const int MAXB     = envi("MAX_BURST_STEPS", 20*stepsPerFT);
     const int TS_EVERY = envi("TS_EVERY", 200);
@@ -1751,27 +1824,32 @@ int main(int argc, char* argv[]) {
 
     // Totals, the clearance test and the NaN check are evaluated at check steps (every
     // CLEAR_EVERY, every TS_EVERY and the last step); the time series is written at TS_EVERY.
+    const auto burstT0 = std::chrono::steady_clock::now();
     for (int iB=0; iB<MAXB; ++iB) {
         if (!uniform) {
             preCollide(MAX_STEPS+iB, 0);                                              // inlet stays live
-            sLattice.collideAndStream();                                              // NSE (live)
+            clk.run("NSE collide+stream", [&]{ sLattice.collideAndStream(); });       // NSE (live)
             floorStep();
-            coupling.execute();                                                       // u (+ D) -> AD
+            clk.run("coupling (u, D -> AD)", [&]{ coupling.execute(); });             // u (+ D) -> AD
             if (iB == 0) dStats("at release");
-            if (HOST_OPS) ops.settle(adLattice, wsLB); else dad.settleStep(adLattice); // −w_s ẑ
+            if (wsLB > 0) clk.run("settling", [&]{                                    // −w_s ẑ
+                if (HOST_OPS) ops.settle(adLattice, wsLB); else dad.settleStep(adLattice); });
         }
-        adLattice.collideAndStream();
+        clk.run("AD collide+stream", [&]{ adLattice.collideAndStream(); });
         const bool pulseOn = (iB*dt) < PULSE_S;
-        if (HOST_OPS) {
-            double fd=0, fu=0; ops.faceFlux(adLattice, fd, fu); outDown+=fd; outUp+=fu;
-            if (pulseOn) emit += ops.inject(adLattice, Q_RATE, emitOut);
-            depCV += ops.deposit(adLattice, depOut);
-            airCV = ops.accumulate(adLattice, superGeometry, dt, airAll);
-            wTheta = ops.wTheta;
-        } else dad.step(adLattice, pulseOn, Q_RATE, emit, emitOut);
+        clk.run("AD flux/inject/deposit/theta", [&]{
+            if (HOST_OPS) {
+                double fd=0, fu=0; ops.faceFlux(adLattice, fd, fu); outDown+=fd; outUp+=fu;
+                if (pulseOn) emit += ops.inject(adLattice, Q_RATE, emitOut);
+                depCV += ops.deposit(adLattice, depOut);
+                airCV = ops.accumulate(adLattice, superGeometry, dt, airAll);
+                wTheta = ops.wTheta;
+            } else dad.step(adLattice, pulseOn, Q_RATE, emit, emitOut);
+        });
         const bool report = (iB%TS_EVERY==0) || (iB==MAXB-1);
         if (!report && iB%CLEAR_EVERY!=0) continue;
-        if (!HOST_OPS) dad.report(adLattice, superGeometry, ops, airCV, airAll, depCV, depOut, outDown, outUp, wTheta);
+        if (!HOST_OPS) clk.run("AD report (pull + sums)", [&]{
+            dad.report(adLattice, superGeometry, ops, airCV, airAll, depCV, depOut, outDown, outUp, wTheta); });
         peakAir = std::max(peakAir, airCV);
         const double resid = emit>0 ? (emit-(depCV+airCV+outDown+outUp))/emit : 0.0;
         if (!std::isfinite(airCV)) { OstreamManager c(std::cout,"DIVERGED"); c<<"AD non-finite at burst step "<<iB<<std::endl; if(ts)fclose(ts); return 2; }
@@ -1792,6 +1870,10 @@ int main(int argc, char* argv[]) {
             << " airborne_frac=" << ((emit+emitOut)>0 ? airAll/(emit+emitOut) : 0.0) << " J=" << Jt << std::endl;
         if (stop) { endStep=iB+1; stopReason = tailStop ? "tail" : "clearance"; break; }
     }
+    const double burstWall = secondsSince(burstT0);
+    cl4 << "burst: " << endStep << " steps in " << burstWall << " s = " << 1e3*burstWall/std::max(1, endStep)
+        << " ms/step (" << (uniform ? "scalar only" : "flow + scalar") << ", " << (SINGLE_PRECISION ? "float" : "double") << ")" << std::endl;
+    clk.report(cl4, "burst", endStep);
     if (ts) fclose(ts);
     if (!uniform) dStats("at the end");
     if (!HOST_OPS) dad.fetch(adLattice, ops);
@@ -1823,6 +1905,7 @@ int main(int argc, char* argv[]) {
         fprintf(mf,"grid %d %d %d\ndx_m %.4f\nomega_cells %ld\n",nx,ny,nz,dx,ops.nSrc);
         fprintf(mf,"burst_steps %d\ndt_s %.6g\nD_eff_m2s %.6g\ntau_AD %.6g\n",endStep,(double)dt,(double)D_EFF,(double)(1/omegaAD));
         fprintf(mf,"burst_cap %d\nstop_reason %s\n",MAXB,stopReason);
+        fprintf(mf,"precision %s\nspinup_wall_s %.3f\nburst_wall_s %.3f\n",SINGLE_PRECISION?"float":"double",spinWall,burstWall);
         fprintf(mf,"D_local %d\nSc_t %.4g\ntau_AD_min %.6g\n",(int)D_LOCAL,(double)SC_T,(double)TAU_AD_MIN);
         if (TAIL) fprintf(mf,"tail_applied %d\ntail_early_stop %d\ntail_k_per_s %.6g\ntail_r2 %.6f\ntail_n %d\ntail_span %.4f\n"
                              "tail_air_frac_at_stop %.6g\ntail_J_part %.6e\ntail_fit_frac %.6f\n",

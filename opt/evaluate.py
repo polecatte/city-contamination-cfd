@@ -151,7 +151,8 @@ class CFDEvaluator:
             why = run_checks(J, m)
             res.update({"J": J, "iF_ppm": iF, "burst_steps": m.get("burst_steps"),
                         "budget_closure": m.get("budget_closure"), "tail_J_part": m.get("tail_J_part", 0.0),
-                        "stop_reason": m.get("stop_reason"), "valid": not why, "reject": why})
+                        "stop_reason": m.get("stop_reason"), "precision": m.get("precision", "double"),
+                        "valid": not why, "reject": why})
             if why:                                     # keep the numbers for diagnosis, out of the GP
                 res.update({"J_raw": J, "iF_raw_ppm": iF, "J": None, "iF_ppm": None})
             for fn in os.listdir(out):                      # drop what the optimizer never reads
