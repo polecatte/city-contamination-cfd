@@ -252,3 +252,21 @@ inflow ramp (0.035 m/s at mid-fetch; 0.025 % of the developed 4 m/s). On the CPU
 build runs at the same speed as double (abl 19 vs 21 s); the gain is a GPU matter (FP64 at 1/32
 rate). The statistical test of the float flow is gate 6a in both precisions (below) and, on the
 lab GPU, `lab_openlb.sh precision`.
+
+**Gate 6a in both precisions** (CPU, 4 flow-throughs, mean over the last 2, 2 threads each):
+
+| | double | float |
+|---|---|---|
+| drift at the production city face (500 m) | **4.4 % PASS** | 4.4 % PASS |
+| drift at the compact-domain face (40 m) | 11.4 % (warning) | 11.4 % |
+| ¼ L / ½ L / ¾ L | 6.8 / 5.1 / 4.1 % | 6.8 / 5.1 / 4.1 % |
+| I_u at the cube position, z = 40 m | 14.1 % | 14.1 % |
+| peak \|u\|_lb | 0.0906337 | 0.090634 |
+| CPU throughput | 7.75 MLUPS | 8.64 MLUPS |
+
+Field by field the time means differ by at most 1.7e-5 of the maximum (1.6e-4 m/s) and the
+variances by 6e-5. On the empty fetch the turbulence is the seeded inflow's, so the two runs do
+not decorrelate; behind obstacles they will (chaos), and there the comparison is statistical
+(`lab_openlb.sh precision`). This is also the first run of the re-scored gate 6a: 4.4 % at the
+city face (PASS); the lab's October 40 m figure (10.9 %) moved to 11.4 % with the sqrt form of
+WALE's powers, a different realisation of the same statistics.
