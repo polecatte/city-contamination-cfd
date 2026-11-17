@@ -167,6 +167,11 @@ static void carve_sponge(bridge::GridField<int32_t>& m, double wind_deg, int nSp
 // ─────────────────────────────────────────────────────────────────────────────
 // (C1) Mach / CFL / relaxation preflight — pure converter arithmetic, no lattice yet.
 // ─────────────────────────────────────────────────────────────────────────────
+// x >= floor, with a few ulp of T of slack (floors are decimal, see preflight)
+static bool atLeast(double x, double floor) {
+    return x >= floor * (1 - 8 * std::numeric_limits<T>::epsilon());
+}
+
 static bool preflight(UnitConverter<T,DESCRIPTOR> const& c) {
     OstreamManager clout(std::cout,"preflight");
     const T uLB  = c.getCharLatticeVelocity();                 // CONFIRM 1.8 accessor
@@ -179,12 +184,14 @@ static bool preflight(UnitConverter<T,DESCRIPTOR> const& c) {
     // sat at tau = 0.5000001 and passed it by 1.4e-7 while carrying effectively zero
     // viscosity. BGK/WALE with no resolved SGS contribution (the flow is at rest when the
     // inlet ramp starts, and WALE's nu_t vanishes in pure shear) needs a real floor.
+    // The floors are decimal: in a float build TAU=0.505 is 0.50499999523, so they are compared
+    // with a few float ulp of slack (in double the slack is ~1e-15, i.e. unchanged).
 #if COLLISION_MODEL==3
     // HRR filters the non-hydrodynamic content that destabilises BGK near tau = 1/2, so the
     // floor is far lower; the turbulence model, not the base viscosity, then sets dissipation.
-    need(tau >= 0.50001,            "relaxation tau >= 0.50001 (HRR)");
+    need(atLeast(tau, 0.50001),     "relaxation tau >= 0.50001 (HRR)");
 #else
-    need(tau >= 0.505,              "relaxation tau >= 0.505 (non-vanishing base viscosity)");
+    need(atLeast(tau, 0.505),       "relaxation tau >= 0.505 (non-vanishing base viscosity)");
 #endif
     need(Ma  < 0.1,                 "inlet Mach < 0.1 (safe low-compressibility regime)");
     need(uLB < 0.1,                 "lattice velocity < 0.1 (CFL / stability margin)");
@@ -1664,7 +1671,7 @@ int main(int argc, char* argv[]) {
     const T D_EFF   = envd("D_EFF", D_MOL + NU_EFF/SC_T);
     const T omegaAD = converter.template getLatticeRelaxationFrequencyFromDiffusivity<AD_DESCRIPTOR>(D_EFF);
     cl4 << "D_eff=" << D_EFF << " m^2/s -> D_lb=" << D_EFF*dt/(dx*dx) << ", tau_AD=" << 1/omegaAD << std::endl;
-    if (1/omegaAD < 0.505) cl4 << "WARNING: tau_AD < 0.505" << std::endl;
+    if (!atLeast(1/omegaAD, 0.505)) cl4 << "WARNING: tau_AD < 0.505" << std::endl;
 
     step4::ADLat adLattice(superGeometry);
     // D_LOCAL=1: per-cell D(x) = D_mol + (nu_0 + nu_t(x))/Sc_t from the WALE eddy viscosity,
@@ -1725,7 +1732,7 @@ int main(int argc, char* argv[]) {
                 const double tau = 1 / om;
 #endif
                 const double D = (tau - 0.5) / inv * toPhys;
-                sum += D; mx = std::max(mx, D); ++n; if (tau <= TAU_AD_MIN * (1 + 1e-9)) ++nFloor;
+                sum += D; mx = std::max(mx, D); ++n; if (tau <= TAU_AD_MIN * (1 + std::max(1e-9, 8.0 * std::numeric_limits<T>::epsilon()))) ++nFloor;
             }
         }
         cl4 << "D_LOCAL " << when << ": mean D " << (n ? sum / n : 0) << " m^2/s, max " << mx
@@ -1737,12 +1744,15 @@ int main(int argc, char* argv[]) {
     const T wsLB = converter.getLatticeVelocity(envd("W_SETTLE", 0.0));
 
     const T   PULSE_S  = envd("PULSE_S", 2.0);
-    const T   Q_RATE   = envd("Q_RATE", 1.0);               // ΔC per Ω cell per step (lattice)
-    // J = <w,Θ>/emitted does not depend on Q_RATE (linear scalar), but a float lattice resolves C
-    // only to ~1e-7 absolute (C = Σ f~ + 1 with f~ ≈ -t_i), so the plume must sit well above that.
-    if (SINGLE_PRECISION && Q_RATE < 0.1)
-        cl4 << "WARNING: float lattice with Q_RATE=" << Q_RATE << ": keep Q_RATE ~ 1, C is resolved "
-               "only to ~1e-7 absolute in single precision" << std::endl;
+    // ΔC per Ω cell per step (lattice). J = <w,Θ>/emitted does not depend on it (linear scalar),
+    // but a float lattice resolves C only to ~1e-7 absolute (C = Σ f~ + 1 with f~ ≈ -t_i): at
+    // Q_RATE 1 a one-cell puff's plume sat at that floor (box, 2026-11-17: never cleared, plume
+    // widths 13-100 % off, linearity 2e-1 pointwise). At 1e4 the float plume and gates match
+    // double, so a float build defaults to 1e4.
+    const T   Q_RATE   = envd("Q_RATE", SINGLE_PRECISION ? 1e4 : 1.0);
+    if (SINGLE_PRECISION && Q_RATE < 1e3)
+        cl4 << "WARNING: float lattice with Q_RATE=" << Q_RATE << ": keep Q_RATE >= 1e3 (default 1e4); C is "
+               "resolved only to ~1e-7 absolute in single precision" << std::endl;
     const T   CLEAR    = envd("CLEAR_FRAC", 0.01);          // 0 = run all MAX_BURST_STEPS
     const int MAXB     = envi("MAX_BURST_STEPS", 20*stepsPerFT);
     const int TS_EVERY = envi("TS_EVERY", 200);

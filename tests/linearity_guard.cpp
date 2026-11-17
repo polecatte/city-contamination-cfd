@@ -53,7 +53,20 @@
 static double TOL_L2   = 1e-3;
 static double TOL_PT   = 1e-3;
 // Cells below this fraction of max|Θ_ab| are excluded from the POINTWISE statistic only.
+// A float build (meta_flow.txt "precision float") resolves a cell to ~1e-7 of its brightest
+// neighbours, so there the cut is 1e-5: measured on the box, float (Q_RATE 1e4) is linear to
+// 9e-5 pointwise above 1e-5 of the peak and to 1.2e-3 above 1e-6; double to 2.3e-5 above 1e-6.
 static double SIG_FRAC = 1e-6;
+static const double SIG_FRAC_FLOAT = 1e-5;
+
+static bool floatRun(const std::string& dir) {
+    FILE* f = fopen((dir+"/meta_flow.txt").c_str(), "r");
+    if (!f) return false;
+    char line[512], val[64]; bool fl = false;
+    while (fgets(line,sizeof line,f)) if (sscanf(line,"precision %63s",val)==1 && !strcmp(val,"float")) fl = true;
+    fclose(f);
+    return fl;
+}
 
 struct Stats { double l2rel, maxrel; long nsig; int worst[3]; };
 
@@ -196,7 +209,8 @@ static int runSolver(const std::string& bin, const std::string& geom,
 
 int main(int argc, char** argv) {
     if (const char* e=getenv("LIN_TOL"))     { TOL_L2=TOL_PT=atof(e); }
-    if (const char* e=getenv("LIN_SIGFRAC")) { SIG_FRAC=atof(e); }
+    const bool sigFromEnv = getenv("LIN_SIGFRAC") != nullptr;
+    if (sigFromEnv) SIG_FRAC = atof(getenv("LIN_SIGFRAC"));
 
     if (argc>=2 && !strcmp(argv[1],"--selftest")) return selftest();
 
@@ -241,6 +255,10 @@ int main(int argc, char** argv) {
 
     printf("\n=== LINEARITY GUARD (plan §6.2 / Gate 7b) ===\n");
     printf("   grid %dx%dx%d dx=%.3f m\n", AB.nx,AB.ny,AB.nz,AB.dx);
+    if (!sigFromEnv && floatRun(dAB)) {
+        SIG_FRAC = SIG_FRAC_FLOAT;
+        printf("   float lattice: pointwise statistic over cells above %.0e of the peak\n", SIG_FRAC);
+    }
     reportBudget(dA); reportBudget(dB); reportBudget(dAB);
 
     const Stats st = compare(A.data,B.data,AB.data,AB.nx,AB.ny,AB.nz);

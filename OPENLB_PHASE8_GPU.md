@@ -162,9 +162,10 @@ collide+stream, WALE velocity, WALE gradient, coupling, AD collide+stream, Θ).
    (f − t_i), which keeps a float lattice close to double (Lehmann et al. 2022, *Phys. Rev. E*
    106, 015308). What must not be float stays double: Θ, deposition, the face fluxes and the
    time-mean sums are `TYPED_FIELD_BASE<double>` fields (a float Θ would round away its ~1e5
-   small increments), and every host sum is double. The scalar is resolved to ~1e-7 absolute
-   in float (C = Σf̃ + 1), so Q_RATE stays ~1 (J does not depend on it; a warning fires below
-   0.1). Default stays double: the CPU reference and the parity test are double.
+   small increments), and every host sum is double. The scalar is resolved to only ~1e-7
+   absolute in float (C = Σf̃ + 1), which at Q_RATE 1 broke the scalar gates (§7); a float
+   build therefore defaults to Q_RATE 1e4, which J does not depend on. Default stays double:
+   the CPU reference and the parity test are double.
 4. *Measurement.* `STAGE_TIMING=1` prints wall time per stage (device synchronised around each);
    every run prints spin-up MLUPS and burst ms/step and writes `precision`, `spinup_wall_s`,
    `burst_wall_s` to its meta files. `lab_openlb.sh speed` runs 2000 + 2000 steps of the
@@ -188,3 +189,48 @@ gradient by a step on the inlet plane; worth it only if `speed` says that pass m
 
 None of this was compiled here (no OpenLB build in the cloud container); the lab build is the
 compile check, and `send` collects the build errors if there are any.
+
+## 7. CPU verification of §6 in the cloud container (2026-11-17)
+
+OpenLB 1.8.1 built here for the CPU (OpenMP, g++ 13.3, 4 cores), once in double through
+`lab_openlb.sh setup` and once with `FLOATING_POINT_TYPE float`. First compile of the §6 code:
+both precisions compile cleanly (only the three pre-existing indentation warnings).
+
+**Double build:**
+- `parity_cpu` (operators vs host loops, single thread, STRICT 1e-12): **ALL PASS, every output
+  identical to the last bit** in all four cases (abl, cube with time mean, box7, boxlive). The
+  precomputed WALE stencil rules reproduce the per-step decision exactly; the WALE gradient
+  check against OpenLB's functor passes with difference 0.
+- Gates 7a / 7b / 7c: PASS with the lab's October numbers to every printed digit (7a emitted 756 =
+  deposited 5.69666 + airborne 0.745761 + drained 749.558, closure 1.4e-11; 7c −10.4 %; 7b L2
+  3.4e-8, pointwise 2.3e-5).
+- Plume (`tests/plume_check.py` on OpenLB): strict PASS (mass 0.0 %, widths 0.1 / 0.4 %, centre
+  10.7 %), production D PASS (mass 0.1 %, widths 0.0 / 0.5 %, centre 26.0 %): the same as the
+  numpy D3Q7 calibration.
+- Throughput, single thread: 3.2–4.6 MLUPS (abl / cube, operators vs host loops).
+
+**Float build — two defects found and fixed:**
+1. *Preflight refused τ = 0.505*: in float 0.505 is 0.50499999523, below the double literal.
+   The decimal floors (0.505, 0.50001, the τ_AD warning) are now compared with a few float ulp
+   of slack (`atLeast`); in double the slack is ~1e-15, so double runs are unchanged
+   (7a re-run: Θ byte-identical).
+2. *The scalar fails at Q_RATE 1.* A one-cell puff (plume test, 7b) puts most of the plume
+   near C ~ 1e-7, where float cannot resolve C = Σf̃ + 1: the puff never cleared (an airborne
+   residue of ~0.1 % of the release stayed until the step cap), plume widths were 13 % (strict)
+   and 101 % (production D) off, budget closure 2 %, and 7b's worst cell was 230 % off. J does
+   not depend on Q_RATE, so a float build now defaults to **Q_RATE 1e4**. Measured:
+
+   | float build | Q_RATE 1 | Q_RATE 1e4 (default) | Q_RATE 1e6 | double |
+   |---|---|---|---|---|
+   | plume strict: widths / clears at step | 13 % / never | 0.4 % / 4230 | 0.4 % / 4230 | 0.4 % / 4230 |
+   | plume production D: widths / closure | 101 % / 2.1e-2 | 0.5 % / 2.7e-8 | 0.5 % / 6.3e-7 | 0.5 % / 8.2e-12 |
+   | 7a closure / stop step | 2.0e-4 / – | 1.3e-5 / 1524 | 1.5e-5 / 1524 | 1.4e-11 / 1524 |
+   | 7b field L2 | 1.1e-4 | 6.3e-7 | 3.9e-7 | 3.4e-8 |
+   | 7b worst cell, above 1e-6 / 1e-5 of peak | 2.3 / 0.22 | 1.2e-3 / 9.1e-5 | 2.2e-3 / 2.8e-4 | 2.3e-5 / 1.2e-6 |
+
+   Above 1e-6 of the peak, float's worst cell stays at ~1e-3 whatever Q_RATE is: a faint cell
+   inherits rounding from neighbours 1e4–1e6 times brighter. `tests/linearity_guard.cpp` reads
+   `precision float` from meta_flow.txt and then counts pointwise only cells above 1e-5 of the
+   peak (double keeps 1e-6); it still fails the Q_RATE 1 float run (22 %).
+   With the default, every float scalar gate passes: 7a closure 1.3e-5, 7c, deposition −10.4 %,
+   7b 9.1e-5, plume strict and production D identical to double.
