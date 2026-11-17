@@ -234,3 +234,21 @@ both precisions compile cleanly (only the three pre-existing indentation warning
    peak (double keeps 1e-6); it still fails the Q_RATE 1 float run (22 %).
    With the default, every float scalar gate passes: 7a closure 1.3e-5, 7c, deposition −10.4 %,
    7b 9.1e-5, plume strict and production D identical to double.
+
+**Float vs double flow, short runs** (`tests/device_parity.sh`, REF double, TEST float, both
+Q_RATE 1e4, 4 threads): the flow fields differ by more than the double-vs-double tolerance (as
+any float build must), and what exposure depends on does not:
+
+| case | live field | time mean | peak \|u\| | Θ, deposition | budget terms |
+|---|---|---|---|---|---|
+| abl, 400 steps from rest | 6.7e-3 | – | 0 | – | – |
+| cube, 600 steps | 9.0e-3 | 1.6e-3 | 2.8e-4 | – | – |
+| boxlive, 300 + 600 steps, live scalar | 1.2e-4 | – | 8.8e-6 | 1.3e-5 | ≤ 1.8e-5 |
+
+(relative to the field's maximum). In abl the difference is uniform over the domain, ≤ 1e-3 m/s
+(1.2e-4 m/s rms), with the inlet plane equal to 3e-8: the accumulated rounding of ρ = 1 + δρ
+(resolved to ~6e-8) in the pressure gradient, large here only because 400 steps is 7 % into the
+inflow ramp (0.035 m/s at mid-fetch; 0.025 % of the developed 4 m/s). On the CPU the float
+build runs at the same speed as double (abl 19 vs 21 s); the gain is a GPU matter (FP64 at 1/32
+rate). The statistical test of the float flow is gate 6a in both precisions (below) and, on the
+lab GPU, `lab_openlb.sh precision`.
